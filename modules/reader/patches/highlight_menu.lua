@@ -95,13 +95,11 @@ local function apply()
 
         local buttons = {{
             {
-                icon = "lookup.highlight",
-                enabled = self.hold_pos ~= nil,
-                callback = function()
-                    self:saveHighlight(true)
-                    self:onClose()
-                end,
-            },
+            icon = "lookup.search",
+            callback = function()
+                self:onHighlightSearch()
+            end,
+        },
         }}
 
         if show_wikipedia() then
@@ -141,11 +139,13 @@ local function apply()
         end
 
         table.insert(buttons[1], {
-            icon = "lookup.search",
-            callback = function()
-                self:onHighlightSearch()
-            end,
-        })
+                icon = "lookup.highlight",
+                enabled = self.hold_pos ~= nil,
+                callback = function()
+                    self:saveHighlight(true)
+                    self:onClose()
+                end,
+            })
 
         -- Optionally include unrecognised third-party buttons.
         if allow_unknown() and self._highlight_buttons then
