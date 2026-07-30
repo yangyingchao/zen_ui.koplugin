@@ -95,23 +95,14 @@ local function apply()
 
         local buttons = {{
             {
-            icon = "lookup.search",
-            callback = function()
-                self:onHighlightSearch()
-            end,
-        },
-        }}
-
-        if show_wikipedia() then
-            table.insert(buttons[1], {
-                icon = "lookup.wikipedia",
+                icon = "lookup.highlight",
+                enabled = self.hold_pos ~= nil,
                 callback = function()
-                    UIManager:scheduleIn(0.1, function()
-                        self:lookupWikipedia()
-                    end)
+                    self:saveHighlight(true)
+                    self:onClose()
                 end,
-            })
-        end
+            },
+        }}
 
         table.insert(buttons[1], {
             icon = "lookup.dictionary",
@@ -120,23 +111,13 @@ local function apply()
                 self:onClose()
             end,
         })
+
         table.insert(buttons[1], {
-            icon = "lookup.translate",
+            icon = "lookup.search",
             callback = function()
-                self:translate(index)
+                self:onHighlightSearch()
             end,
         })
-
-        if show_ai_assistant() then
-            local ai_btn = find_ai_button(self, index)
-            if ai_btn then
-                table.insert(buttons[1], {
-                    icon = "lookup.ai",
-                    enabled = ai_btn.enabled ~= false,
-                    callback = ai_btn.callback,
-                })
-            end
-        end
 
         table.insert(buttons[1], {
                 icon = "lookup.highlight",
