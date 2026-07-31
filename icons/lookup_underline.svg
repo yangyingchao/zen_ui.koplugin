@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="800px" height="800px" viewBox="0 0 24 24" version="1.1" xmlns="http://www.w3.org/2000/svg">
+    <title>underline</title>
+    <g fill="#000000" fill-rule="evenodd">
+        <rect x="5"    y="2"    width="2"  height="15" rx="1"/>
+        <rect x="17"   y="2"    width="2"  height="15" rx="1"/>
+        <rect x="5"    y="15"   width="14" height="2"  rx="1"/>
+        <rect x="3"    y="19"   width="18" height="2"  rx="1"/>
+    </g>
+</svg>

@@ -120,6 +120,24 @@ local function apply()
         })
 
         table.insert(buttons[1], {
+            icon = "lookup.underline",
+            enabled = self.hold_pos ~= nil,
+            callback = function()
+                local orig_drawer = self.view.highlight.saved_drawer
+                local orig_color = self.view.highlight.saved_color
+                self.view.highlight.saved_drawer = "underscore"
+                self.view.highlight.saved_color = "gray"
+                local ok, err = pcall(function() self:saveHighlight(true) end)
+                self.view.highlight.saved_drawer = orig_drawer
+                self.view.highlight.saved_color = orig_color
+                self:onClose()
+                if not ok then
+                    logger.err("underline save failed: " .. tostring(err))
+                end
+            end,
+        })
+
+        table.insert(buttons[1], {
                 icon = "lookup.highlight",
                 enabled = self.hold_pos ~= nil,
                 callback = function()

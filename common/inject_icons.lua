@@ -37,5 +37,6 @@ if _plugin_root then
         ["lookup.search"]       = "lookup_search.svg",
         ["lookup.translate"]    = "lookup_translate.svg",
         ["lookup.wikipedia"]    = "lookup_wikipedia.svg",
+        ["lookup.underline"]    = "lookup_underline.svg",
     }, true)
 end
