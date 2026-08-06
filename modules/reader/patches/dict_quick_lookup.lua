@@ -141,6 +141,11 @@ local function apply()
             -- Build Zen icon row: highlight, [vocab], [wikipedia], translate, search.
             local icon_row = {}
 
+            -- Close button, for left hand
+            if by_id["close"] then
+                table.insert(icon_row, icon_btn(by_id["close"], ICON_MAP.close))
+            end
+
             -- Highlight button with toggle behavior.
             local h = by_id["highlight"]
             if h then
@@ -162,7 +167,7 @@ local function apply()
                 table.insert(icon_row, icon_btn(by_id["search"], ICON_MAP.search))
             end
 
-            -- Close.
+            -- Close button, for right hand
             if by_id["close"] then
                 table.insert(icon_row, icon_btn(by_id["close"], ICON_MAP.close))
             end

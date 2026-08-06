@@ -36,7 +36,7 @@ if [[ -e "${DST_DIR}" ]]; then
     (
         cd "${DST_DIR}"
         for fn in *; do
-            cp -aRfv "${SRC_DIR}/${fn}" .
+            rsync -Pavh  "${SRC_DIR}/${fn}" .
         done
     )
 else
