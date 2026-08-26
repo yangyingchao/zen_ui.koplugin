@@ -1,4 +1,4 @@
--- Zen UI: Icon-only DictQuickLookup buttons
+-- ZenOS: Icon-only DictQuickLookup buttons
 -- Replaces the dictionary popup's text button row with a compact icon row.
 -- Supports both old KOReader (DictButtonsReady event) and new KOReader
 -- (buildButtonLayout override). When "show other items" is enabled,
@@ -7,6 +7,7 @@
 local function apply()
     local DictQuickLookup = require("ui/widget/dictquicklookup")
     local logger = require("common/zen_logger").new("dict_quick_lookup")
+    local LookupPluginItems = require("modules/reader/lookup_plugin_items")
     local _ = require("gettext")
 
     local _plugin_ref = rawget(_G, "__ZEN_UI_PLUGIN")
@@ -18,11 +19,10 @@ local function apply()
         return type(features) == "table" and features.dict_quick_lookup == true
     end
 
-    local function allow_unknown()
-        local cfg = _plugin_ref
-            and _plugin_ref.config
-            and _plugin_ref.config.highlight_lookup
-        return type(cfg) == "table" and cfg.allow_unknown_items == true
+    local function show_other_button(button)
+        local setting = LookupPluginItems.settingForDictButton(button)
+        return LookupPluginItems.shouldShow(
+            _plugin_ref and _plugin_ref.config, setting)
     end
 
     -- IDs we handle explicitly; everything else is "unknown".
@@ -132,7 +132,7 @@ local function apply()
                 for _j, btn in ipairs(row) do
                     if btn.id and KNOWN_IDS[btn.id] then
                         by_id[btn.id] = btn
-                    elseif btn.id then
+                    elseif show_other_button(btn) then
                         table.insert(unknown, btn)
                     end
                 end
@@ -179,21 +179,19 @@ local function apply()
                 table.insert(result, icon_row)
             end
 
-            -- Preserve unknown buttons as text rows when enabled.
-            if allow_unknown() then
-                for _i, btn in ipairs(unknown) do
-                    if btn.id ~= "vocabulary" then
-                        -- Put each unknown in its own row.
-                        local found = false
-                        for _j, row in ipairs(result) do
-                            for _k, rb in ipairs(row) do
-                                if rb.id == btn.id then found = true; break end
-                            end
-                            if found then break end
+            -- Preserve companion-plugin and opted-in unknown buttons as text rows.
+            for _i, btn in ipairs(unknown) do
+                if btn ~= vocab_btn and btn.id ~= "vocabulary" then
+                    -- Put each unknown in its own row.
+                    local found = false
+                    for _j, row in ipairs(result) do
+                        for _k, rb in ipairs(row) do
+                            if rb.id and rb.id == btn.id then found = true; break end
                         end
-                        if not found then
-                            table.insert(result, { btn })
-                        end
+                        if found then break end
+                    end
+                    if not found then
+                        table.insert(result, { btn })
                     end
                 end
             end

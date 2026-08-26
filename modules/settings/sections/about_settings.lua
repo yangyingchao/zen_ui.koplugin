@@ -19,7 +19,7 @@ function M.build(ctx)
 
     table.insert(items, {
         text_func = function()
-            return _("Zen UI: ") .. utils.get_plugin_version(plugin)
+            return _("ZenOS: ") .. utils.get_plugin_version(plugin)
         end,
         keep_menu_open = true,
     })
@@ -67,6 +67,10 @@ function M.build(ctx)
                     config = ctx.config,
                 }),
                 on_close = function()
+                    if type(ctx.config._meta) ~= "table" then ctx.config._meta = {} end
+                    ctx.config._meta.quickstart_completed = true
+                    ctx.config._meta.quickstart_menu_tour_pending = true
+                    plugin:saveConfig()
                     UIManager:nextTick(function()
                         local reinject = _G.__ZEN_UI_REINJECT_FM_NAVBAR
                         if type(reinject) == "function" then reinject() end
@@ -75,6 +79,10 @@ function M.build(ctx)
                         if fm and type(fm._updateStatusBar) == "function" then
                             fm:_updateStatusBar()
                         end
+                        UIManager:scheduleIn(0.35, function()
+                            local ok_tour, tour = pcall(require, "common/quickstart/menu_tour")
+                            if ok_tour then tour.start(plugin) end
+                        end)
                     end)
                 end,
             })
@@ -99,7 +107,6 @@ function M.build(ctx)
     IconItem.decorate(items[3], icons.settings_setup)
     IconItem.decorate(items[4], icons.settings_bug)
     IconItem.decorate(items[5], icons.settings_advanced)
-    IconItem.decorate(items[6], icons.update)
 
     return items
 end
