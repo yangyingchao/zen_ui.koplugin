@@ -30,7 +30,7 @@ esac
 [[ -z "${DST_DIR}" ]] && die "Failed to detect destination directory for $(uname)\n"
 [[ -e "${DST_DIR}" ]] || die "Destination director does not exist: ${DST_DIR}"
 
-DST_DIR="${DST_DIR}/zen_ui.koplugin/"
+DST_DIR="${DST_DIR}/zenos.koplugin/"
 
 if [[ -e "${DST_DIR}" ]]; then
     (
