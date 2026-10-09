@@ -20,6 +20,7 @@ return {
     select       = "\u{F0489}",  -- mdi-cursor-default-click
     new_folder   = "\u{F0B9D}",  -- mdi-folder-plus
     folder_open  = "\u{F07C}",   -- mdi-folder-open
+    archive      = "\u{F19C}",
     connect      = "\u{F0337}",  -- mdi-link-variant
 
     -- view modes (context_menu.lua)
@@ -54,16 +55,20 @@ return {
     filename     = "\u{F0224}",
     authors      = "\u{F0013}",  -- mdi-account
     series       = "\u{F0436}",  -- mdi-library-books
+    language     = "\u{F05CA}",  -- mdi-translate
     history      = "\u{F02DA}",  -- mdi-history
     keywords     = "\u{F12F7}",  -- mdi-tag-multiple
 
     -- details / info (context_menu.lua / opds.lua)
-    details      = "\u{F05A}",  -- mdi-information
+    details      = "\u{F02FD}", -- same information icon as About
     edit         = "\u{F090C}",  -- mdi-pencil
     label        = "\u{F04F9}",
     icon         = "\u{F02F5}",
+    custom_icons = "\u{EFA8}",
     plugin       = "\u{F06A5}",
     action       = "\u{F140B}",
+    more         = "\u{F01D8}",  -- mdi-dots-horizontal
+    more_vertical = "\u{F01D9}",  -- mdi-dots-vertical
     settings       = "\u{F0493}",
 
     -- network / sync (opds.lua)
@@ -92,23 +97,28 @@ return {
     settings_library  = "\u{F125F}",
     settings_home     = "\u{F02DE}",
     settings_reader   = "\u{F14F7}",
-    settings_about    = "\u{F064E}",
+    vocabulary        = "\u{F1349}",
+    settings_about    = "\u{F02FD}",
     widgets           = "\u{F072C}",
-    settings_global   = "\u{F484}",
+    settings_global   = "\u{F0574}",
     settings_status   = "\u{F12F0}",
+    battery           = "\u{F0080}",
     reader_themes     = "\u{F03D8}",
     settings_folders  = "\u{F0256}",
     settings_covers   = "\u{F168B}",  -- mdi-view-module
     settings_scroll   = "\u{F0BB8}",
     settings_layout   = "\u{F0758}",
     settings_background = "\u{F0E09}",
+    settings_menu_blur = "\u{F00B5}",
     settings_home_folder = "\u{F10B6}",
     settings_navbar   = "\u{F10A9}",
     navbar_tabs       = "\u{F0837}",
     navbar_styling    = "\u{F03D8}",
     settings_stats    = "\u{F012A}",
+    calendar          = "\u{F073}",  -- nf-fa-calendar
     settings_opds     = "\u{F0B7D}",
     settings_sleep    = "\u{F04B2}",
+    keyboard          = "\u{F030C}",  -- mdi-keyboard
     schedule_brightness = "\u{F0599}",
     schedule_night    = "\u{F0594}",  -- mdi-weather-night
     schedule_warmth   = "\u{F0510}",
@@ -140,6 +150,10 @@ return {
     arrow_right  = "\u{F0142}",  -- mdi-chevron-right
     go           = "\u{F124}",   -- nf-fa-location-arrow
     open_menu    = "\u{F073D}",  -- mdi-menu-open
+    double_tap   = "\u{F073C}",
     koreader_menu = "\u{F035C}",  -- mdi-menu
+    koreader_file_browser = "\u{F0AB6}",
+    koreader_navigation = "\u{F0B64}",
+    koreader_typesetting = "\u{F09EE}",
     bullet       = "\u{2022}",   -- bullet point
 }

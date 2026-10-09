@@ -8,6 +8,7 @@ local T = require("ffi/util").template
 local UIManager = require("ui/uimanager")
 local utils = require("modules/settings/zen_settings_utils")
 local icon_utils = require("common/utils")
+local plugin_root = require("common/plugin_root")
 local paths = require("common/paths")
 local icons = require("common/inline_icon_map")
 local IconItem = require("common/ui/icon_menu_item")
@@ -16,6 +17,7 @@ local PluginScan = require("modules/menu/app_launcher/plugin_scan")
 local DispatcherMenu = require("common/dispatcher_menu")
 local ButtonModel = require("common/nav_button_model")
 local Destination = require("common/library_destination")
+local Kindle = require("modules/filebrowser/patches/kindle_virtual_library")
 
 local M = {}
 
@@ -115,26 +117,37 @@ function M.build(ctx)
     -- Color helpers
     -- -------------------------------------------------------------------------
 
-    local function ensure_navbar_color()
-        local c = config.navbar.active_tab_color
-        if type(c) ~= "table" then
-            c = { 0x33, 0x99, 0xFF }
-            config.navbar.active_tab_color = c
+    local function navbar_color_item(label, key, default, enabled_func, opacity_key)
+        local function color_hex()
+            local c = config.navbar[key]
+            if type(c) ~= "table" then c = default end
+            return string.format("#%02X%02X%02X",
+                math.max(0, math.min(255, tonumber(c[1]) or default[1])),
+                math.max(0, math.min(255, tonumber(c[2]) or default[2])),
+                math.max(0, math.min(255, tonumber(c[3]) or default[3])))
         end
-        c[1] = tonumber(c[1]) or 0x33
-        c[2] = tonumber(c[2]) or 0x99
-        c[3] = tonumber(c[3]) or 0xFF
-        c[1] = math.max(0, math.min(255, c[1]))
-        c[2] = math.max(0, math.min(255, c[2]))
-        c[3] = math.max(0, math.min(255, c[3]))
-        return c
-    end
-
-    local function set_navbar_color(r, g, b)
-        config.navbar.active_tab_color = {
-            math.max(0, math.min(255, tonumber(r) or 0)),
-            math.max(0, math.min(255, tonumber(g) or 0)),
-            math.max(0, math.min(255, tonumber(b) or 0)),
+        return {
+            text_func = function() return label .. ": " .. color_hex() end,
+            enabled_func = enabled_func,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                local ColorWheelWidget = require("common/ui/color_wheel_widget")
+                UIManager:show(ColorWheelWidget:new{
+                    title_text = label,
+                    hex = color_hex(),
+                    opacity = opacity_key and (config.navbar[opacity_key] or 60) or nil,
+                    callback = function(hex, opacity)
+                        config.navbar[key] = {
+                            tonumber(hex:sub(2, 3), 16),
+                            tonumber(hex:sub(4, 5), 16),
+                            tonumber(hex:sub(6, 7), 16),
+                        }
+                        if opacity_key then config.navbar[opacity_key] = opacity end
+                        save_and_defer_navbar_refresh()
+                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                    end,
+                }, "full")
+            end,
         }
     end
 
@@ -163,6 +176,7 @@ function M.build(ctx)
     local navbar_tab_items = {
         { id = "books",       text = _("Library")      },
         { id = "folder",      text_func = get_folder_tab_label },
+        { id = "kindle",      text = _("Kindle Library") },
         { id = "manga",       text = _("Manga")         },
         { id = "news",        text = _("News")          },
         { id = "continue",    text = _("Continue")      },
@@ -183,6 +197,13 @@ function M.build(ctx)
         { id = "page_right",  text = _("Next page")     },
         { id = "menu",        text = _("Menu")          },
     }
+    local archive_available = paths.getArchiveDir() ~= nil
+    if archive_available then
+        table.insert(navbar_tab_items, 2, {
+            id = "archive",
+            text = _("Archive"),
+        })
+    end
 
     if config.navbar.show_tabs.books == nil then
         config.navbar.show_tabs.books = true
@@ -199,9 +220,12 @@ function M.build(ctx)
     end
 
     local default_tab_ids = {
-        "books", "folder", "manga", "news", "history", "favorites",
+        "books", "folder", "kindle", "manga", "news", "history", "favorites",
         "collections", "authors", "series", "languages", "home", "tags", "to_be_read",
     }
+    if archive_available then
+        table.insert(default_tab_ids, 2, "archive")
+    end
 
     local function get_builtin_tab_label(tab_id)
         local tab = tab_item_by_id[tab_id]
@@ -236,10 +260,15 @@ function M.build(ctx)
         return tab_item_by_id[id] ~= nil or is_known_custom_tab(id)
     end
 
+    local function is_tab_available(id)
+        return id ~= "kindle" or Kindle.isAvailable()
+    end
+
     local function countEnabledTabs()
         local count = 0
         for _i, id in ipairs(config.navbar.tab_order) do
-            if config.navbar.show_tabs[id] == true and is_known_tab(id) then
+            if config.navbar.show_tabs[id] == true and is_known_tab(id)
+                    and is_tab_available(id) then
                 count = count + 1
             end
         end
@@ -290,6 +319,7 @@ function M.build(ctx)
     local build_ct_sub_items
     local build_builtin_tab_items
     local addTagTab
+    local addStatusTab
 
     local function is_draft_tab(ct)
         return type(ct) == "table" and type(ct._zen_draft_commit) == "function"
@@ -299,6 +329,9 @@ function M.build(ctx)
         if ct.label and ct.label ~= "" then return ct.label end
         if ct.type == "tag" then
             return ct.tag or _("Tag")
+        end
+        if ct.type == "status" then
+            return ButtonModel.statusLabel(ct.status) or _("Custom")
         end
         if ct.type == "folder" then
             return Destination.folderLabel(ct.folder)
@@ -363,10 +396,24 @@ function M.build(ctx)
         end
         local picker_items = {}
         for _i, tab in ipairs(navbar_tab_items) do
-            if not selected[tab.id] then
+            if not selected[tab.id] and is_tab_available(tab.id) then
                 picker_items[#picker_items + 1] = {
                     id = tab.id,
                     text = tab.id == "tags" and _("All tags") or get_tab_item_text(tab),
+                }
+            end
+        end
+        local selected_status = {}
+        for _i, tab in ipairs(config.navbar.custom_tabs or {}) do
+            if selected[tab.id] and tab.type == "status" then
+                selected_status[tab.status] = true
+            end
+        end
+        for _i, status in ipairs(ButtonModel.statuses()) do
+            if not selected_status[status.key] then
+                picker_items[#picker_items + 1] = {
+                    text = status.label,
+                    status = status,
                 }
             end
         end
@@ -377,6 +424,10 @@ function M.build(ctx)
             items = picker_items,
             back_hold_callback = touch_menu and touch_menu.backToSettingsRoot,
             on_select = function(item)
+                if item.status then
+                    addStatusTab(touch_menu, item.status)
+                    return
+                end
                 ensureTabOrder(item.id)
                 config.navbar.show_tabs[item.id] = countEnabledTabs() < navbar_max_tabs
                 save_and_defer_navbar_refresh()
@@ -575,6 +626,19 @@ function M.build(ctx)
         end, touch_menu)
     end
 
+    addStatusTab = function(touch_menu, item)
+        if not item then return end
+        local ct = {
+            type = "status",
+            status = item.key,
+            label = item.label,
+            label_auto = true,
+            icon = "library",
+        }
+        commitCustomTab(ct)
+        openCustomTabSettings(touch_menu, ct)
+    end
+
     local function addFolderTab(touch_menu)
         Destination.chooseFolder(function(path)
             local ct = {
@@ -744,10 +808,10 @@ function M.build(ctx)
                     chooseKoreaderMenuTab(ct, touch_menu)
                 end,
             }, icons.open_menu))
-        elseif ok_disp then
+        elseif ct.type == "action" and ok_disp then
             local dispatch_items = {}
             local caller = {}
-            Dispatcher:addSubMenu(caller, dispatch_items, ct, "action")
+            DispatcherMenu.addSubMenu(Dispatcher, caller, dispatch_items, ct, "action")
             wrap_dispatch_callbacks(dispatch_items, caller, function(touch_menu)
                 sync_ct_action_label(ct)
                 if is_draft_tab(ct) then
@@ -756,7 +820,7 @@ function M.build(ctx)
                     save_and_defer_navbar_refresh()
                 end
                 if touch_menu and touch_menu.updateItems then
-                    touch_menu:updateItems(1)
+                    touch_menu:updateItems()
                 end
             end)
             table.insert(items, IconItem.decorate({
@@ -812,8 +876,11 @@ function M.build(ctx)
                                 if txt and txt ~= "" then
                                     ct.label = txt
                                     ct.label_auto = false
-                                elseif ct.type == "tag" or ct.type == "folder" then
+                                elseif ct.type == "tag" or ct.type == "status"
+                                        or ct.type == "folder" then
                                     ct.label = ct.type == "tag" and ct.tag
+                                        or ct.type == "status"
+                                            and ButtonModel.statusLabel(ct.status)
                                         or Destination.folderLabel(ct.folder)
                                     ct.label_auto = true
                                 else
@@ -877,19 +944,21 @@ function M.build(ctx)
     local function build_default_tab_items()
         local items = {}
         for _i, tab_id in ipairs(default_tab_ids) do
-            local tid = tab_id
-            local label = get_default_tab_label(tid)
-            items[#items + 1] = {
-                text = label,
-                radio = true,
-                checked_func = function()
-                    return (config.navbar.default_tab or "books") == tid
-                end,
-                callback = function()
-                    config.navbar.default_tab = tid
-                    save_and_apply_navbar()
-                end,
-            }
+            if is_tab_available(tab_id) then
+                local tid = tab_id
+                local label = get_default_tab_label(tid)
+                items[#items + 1] = {
+                    text = label,
+                    radio = true,
+                    checked_func = function()
+                        return (config.navbar.default_tab or "books") == tid
+                    end,
+                    callback = function()
+                        config.navbar.default_tab = tid
+                        save_and_apply_navbar()
+                    end,
+                }
+            end
         end
         if type(config.navbar.custom_tabs) == "table" then
             for _i, ct in ipairs(config.navbar.custom_tabs) do
@@ -1172,6 +1241,22 @@ function M.build(ctx)
         }
     end
 
+    local function build_kindle_tab_items()
+        return {{
+            text = _("Hide Kindle Library folder"),
+            checked_func = function()
+                return type(config.kindle) == "table"
+                    and config.kindle.hide_library_folder == true
+            end,
+            callback = function()
+                if type(config.kindle) ~= "table" then config.kindle = {} end
+                config.kindle.hide_library_folder =
+                    config.kindle.hide_library_folder ~= true
+                save_and_reflow_navbar()
+            end,
+        }}
+    end
+
     local function build_news_tab_items()
         return {
             {
@@ -1198,6 +1283,23 @@ function M.build(ctx)
         }
     end
 
+    local function build_tbr_tab_items()
+        return { IconItem.decorate({
+            text = _("Order"),
+            _zen_settings_submenu = true,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                require("common/tbr_index").showOrder({
+                    plugin = ctx.plugin,
+                    settings_resume = touchmenu_instance
+                        and touchmenu_instance._zen_settings_resume,
+                    on_change = settings_apply
+                        and settings_apply.refresh_tbr_on_menu_close,
+                })
+            end,
+        }, icons.sort) }
+    end
+
     build_builtin_tab_items = function(id)
         local items = {}
         if id == "home" then
@@ -1206,10 +1308,14 @@ function M.build(ctx)
             items = build_books_tab_items()
         elseif id == "folder" then
             items = build_folder_tab_items()
+        elseif id == "kindle" then
+            items = build_kindle_tab_items()
         elseif id == "manga" then
             items = build_manga_tab_items()
         elseif id == "news" then
             items = build_news_tab_items()
+        elseif id == "to_be_read" then
+            items = build_tbr_tab_items()
         end
         items[#items + 1] = IconItem.decorate({
             text = _("Delete"),
@@ -1294,48 +1400,50 @@ function M.build(ctx)
         end
         sort_items = build_sort_items()
 
+        local add_items = {
+            IconItem.decorate({
+                text = _("Tab"),
+                keep_menu_open = true,
+                callback = addBuiltinTab,
+            }, icons.settings_navbar),
+            IconItem.decorate({
+                text = _("Action"),
+                keep_menu_open = true,
+                callback = addActionTab,
+            }, icons.action),
+            IconItem.decorate({
+                text = _("Folder"),
+                keep_menu_open = true,
+                callback = addFolderTab,
+            }, icons.settings_folders),
+            IconItem.decorate({
+                text = _("Specific tag"),
+                keep_menu_open = true,
+                callback = addTagTab,
+            }, icons.keywords),
+            IconItem.decorate({
+                text = _("Control"),
+                keep_menu_open = true,
+                callback = addQuickSettingTab,
+            }, icons.settings_quick),
+            IconItem.decorate({
+                text = _("Plugin Menu"),
+                keep_menu_open = true,
+                callback = addPluginTab,
+            }, icons.plugin),
+            {
+                text = _("KOReader menu"),
+                icon_file = plugin_root .. "/icons/koreader.png",
+                keep_menu_open = true,
+                callback = addKoreaderMenuTab,
+            },
+        }
         ZenArrangeList.show{
             title = _("Tabs"),
             item_table = sort_items,
             add_title = _("Add"),
             hide_footer_cancel = true,
-            add_item_table = {
-                IconItem.decorate({
-                    text = _("Tab"),
-                    keep_menu_open = true,
-                    callback = addBuiltinTab,
-                }, icons.settings_navbar),
-                IconItem.decorate({
-                    text = _("Action"),
-                    keep_menu_open = true,
-                    callback = addActionTab,
-                }, icons.action),
-                IconItem.decorate({
-                    text = _("Folder"),
-                    keep_menu_open = true,
-                    callback = addFolderTab,
-                }, icons.settings_folders),
-                IconItem.decorate({
-                    text = _("Specific tag"),
-                    keep_menu_open = true,
-                    callback = addTagTab,
-                }, icons.keywords),
-                IconItem.decorate({
-                    text = _("Control"),
-                    keep_menu_open = true,
-                    callback = addQuickSettingTab,
-                }, icons.settings_quick),
-                IconItem.decorate({
-                    text = _("Plugin Menu"),
-                    keep_menu_open = true,
-                    callback = addPluginTab,
-                }, icons.plugin),
-                IconItem.decorate({
-                    text = _("KOReader menu"),
-                    keep_menu_open = true,
-                    callback = addKoreaderMenuTab,
-                }, icons.open_menu),
-            },
+            add_item_table = add_items,
             callback = function()
                 local new_order = {}
                 local ordered = {}
@@ -1515,22 +1623,43 @@ function M.build(ctx)
                         sub_item_table = {
                             {
                                 text = _("Underline"),
-                                checked_func = function() return config.navbar.active_tab_underline == true end,
-                                callback = function()
-                                    config.navbar.active_tab_underline = config.navbar.active_tab_underline ~= true
-                                    save_and_apply("navbar")
+                                radio = true,
+                                checked_func = function()
+                                    return config.navbar.active_tab_underline ~= false
+                                        and config.navbar.active_tab_filled ~= true
                                 end,
+                                checkmark_callback = function()
+                                    config.navbar.active_tab_underline = true
+                                    config.navbar.active_tab_filled = false
+                                    save_and_apply_navbar()
+                                end,
+                                sub_item_table = {{
+                                    text = _("Underline above icon"),
+                                    checked_func = function() return config.navbar.underline_above == true end,
+                                    enabled_func = function()
+                                        return config.navbar.active_tab_underline ~= false
+                                            and config.navbar.active_tab_filled ~= true
+                                    end,
+                                    callback = function()
+                                        config.navbar.underline_above = config.navbar.underline_above ~= true
+                                        save_and_apply_navbar()
+                                    end,
+                                }},
                             },
                             {
-                                text = _("Underline above icon"),
-                                checked_func = function() return config.navbar.underline_above == true end,
-                                enabled_func = function()
-                                    return config.navbar.active_tab_underline == true
+                                text = _("Filled"),
+                                radio = true,
+                                checked_func = function() return config.navbar.active_tab_filled == true end,
+                                checkmark_callback = function()
+                                    config.navbar.active_tab_filled = true
+                                    config.navbar.active_tab_underline = false
+                                    save_and_apply_navbar()
                                 end,
-                                callback = function()
-                                    config.navbar.underline_above = config.navbar.underline_above ~= true
-                                    save_and_apply("navbar")
-                                end,
+                                sub_item_table = {
+                                    navbar_color_item(_("Outline color"), "filled_outline_color", {0xFF, 0xFF, 0xFF}),
+                                    navbar_color_item(_("Fill color"), "filled_background_color", {0x4F, 0x6F, 0x8F},
+                                        nil, "filled_background_opacity"),
+                                },
                             },
                             {
                                 text = _("Colored"),
@@ -1540,24 +1669,12 @@ function M.build(ctx)
                                     save_and_apply_navbar()
                                 end,
                             },
-                            utils.buildColorSubMenu({
-                                label        = _("Active tab color: "),
-                                get          = ensure_navbar_color,
-                                set          = function(r, g, b)
-                                    set_navbar_color(r, g, b)
-                                    save_and_apply_navbar()
-                                end,
-                                enabled_func = function()
+                            navbar_color_item(_("Active tab outline color"), "active_tab_color", {0x33, 0x99, 0xFF},
+                                function()
                                     return config.navbar.colored == true
-                                end,
-                                dialog_title = _("Active tab RGB"),
-                                presets = {
-                                    { text = _("Blue"),  r = 0x33, g = 0x99, b = 0xFF },
-                                    { text = _("Green"), r = 0x33, g = 0xAA, b = 0x55 },
-                                    { text = _("Amber"), r = 0xFF, g = 0xAA, b = 0x00 },
-                                    { text = _("Red"),   r = 0xDD, g = 0x33, b = 0x33 },
-                                },
-                            }),
+                                        and config.navbar.active_tab_underline ~= false
+                                        and config.navbar.active_tab_filled ~= true
+                                end),
                         },
                     },
                     {

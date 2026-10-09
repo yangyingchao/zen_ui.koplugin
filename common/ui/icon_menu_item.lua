@@ -56,6 +56,14 @@ function M.getSettingsRowHeight()
     return M.SETTINGS_ROW_HEIGHT
 end
 
+function M.getSettingsLeftPadding()
+    return Size.padding.large + Size.padding.fullscreen
+end
+
+function M.getSettingsIconGap()
+    return Size.padding.default
+end
+
 function M.getSettingsFace(fallback)
     return Font:getFace("smallinfofont", M.getSettingsFontSize())
         or fallback or Font:getFace("smallinfofont")
@@ -214,20 +222,22 @@ local function rebuild_touch_menu_item(row)
 end
 
 local function settings_control_widget(item, enabled)
-    if type(item.checked_func) == "function" then
+    if type(item.checked_func) == "function" or item.checked ~= nil then
+        local function checked()
+            if type(item.checked_func) == "function" then return not not item.checked_func() end
+            return not not item.checked
+        end
         if item.radio == true then
             return RadioMark:new{
                 checkable = true,
-                checked = item.checked_func() == true,
+                checked = checked(),
                 enabled = enabled,
             }
         end
         return ZenToggle:new{
             width = M.SETTINGS_TOGGLE_WIDTH,
             height = M.SETTINGS_TOGGLE_HEIGHT,
-            value_func = function()
-                return item.checked_func() == true
-            end,
+            value_func = checked,
         }
     end
 end
@@ -236,6 +246,12 @@ local function settings_icon_widget(item, height, face)
     if item.icon_glyph then
         return M.makeState(item.icon_glyph, M.SETTINGS_ICON_WIDTH, height,
             M.getSettingsIconFace(face))
+    elseif item.icon_file then
+        local size = M.getSettingsIconFace(face).size
+        return CenterContainer:new{
+            dimen = Geom:new{ w = M.SETTINGS_ICON_WIDTH, h = height },
+            IconWidget:new{ file = item.icon_file, width = size, height = size },
+        }
     end
 end
 
@@ -249,24 +265,46 @@ local function rebuild_settings_menu_item(row)
     end
     local visual_enabled = enabled and item.dim ~= true
     local face = M.getItemFace(item, row.face)
-    local left_padding = Size.padding.large + Size.padding.fullscreen
+    local left_padding = M.getSettingsLeftPadding()
     local right_padding = Size.padding.large + Size.padding.default
     local icon_widget = settings_icon_widget(item, row.dimen.h, face)
     local control_widget = settings_control_widget(item, visual_enabled)
-    local left_icon_w = M.SETTINGS_ICON_WIDTH + Size.padding.default
+    local icon_gap = M.getSettingsIconGap()
+    local left_icon_w = M.SETTINGS_ICON_WIDTH + icon_gap
     local right_controls = HorizontalGroup:new{ align = "center" }
     if control_widget then
         table.insert(right_controls, control_widget)
         table.insert(right_controls, HorizontalSpan:new{ width = Size.padding.large })
     end
+    local mandatory = type(item.mandatory_func) == "function"
+        and item.mandatory_func() or item.mandatory
+    if mandatory then
+        table.insert(right_controls, TextWidget:new{
+            text = tostring(mandatory),
+            max_width = math.floor(row.dimen.w * 0.4),
+            face = face,
+            fgcolor = visual_enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
+        })
+        if item._zen_has_submenu then
+            table.insert(right_controls, HorizontalSpan:new{ width = Size.padding.large })
+        end
+    end
     if item._zen_has_submenu then
-        table.insert(right_controls, IconWidget:new{
-            icon = item._zen_caret_icon or "chevron.right",
+        local caret = item._zen_caret_icon or "chevron.right"
+        local caret_options = {
             width = M.SETTINGS_CARET_SIZE,
             height = M.SETTINGS_CARET_SIZE,
+        }
+        if caret:find("/", 1, true) then
+            caret_options.file = caret
+        else
+            caret_options.icon = caret
+        end
+        table.insert(right_controls, IconWidget:new(caret_options))
+    elseif control_widget or mandatory then
+        table.insert(right_controls, HorizontalSpan:new{
+            width = M.SETTINGS_CARET_SIZE + (mandatory and Size.padding.large or 0),
         })
-    elseif control_widget then
-        table.insert(right_controls, HorizontalSpan:new{ width = M.SETTINGS_CARET_SIZE })
     end
     table.insert(right_controls, HorizontalSpan:new{ width = right_padding })
     local right_controls_w = right_controls:getSize().w
@@ -284,7 +322,7 @@ local function rebuild_settings_menu_item(row)
         item._zen_settings_control_bounds = nil
     end
     local text_w = math.max(1, row.dimen.w - left_padding - left_icon_w
-        - right_controls_w - Size.padding.default)
+        - right_controls_w - icon_gap)
     local text = item._zen_display_text
         or (type(item.text_func) == "function" and item.text_func() or item.text)
         or ""
@@ -295,6 +333,7 @@ local function rebuild_settings_menu_item(row)
         max_width = text_w,
         fgcolor = visual_enabled and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
         face = face,
+        bold = item._zen_primary_bold == true,
         padding = has_breadcrumb and 0 or nil,
     }
     row.text_truncated = text_widget:isTruncated()
@@ -316,7 +355,8 @@ local function rebuild_settings_menu_item(row)
         table.insert(text_group, TextWidget:new{
             text = item._zen_settings_breadcrumb,
             max_width = text_w,
-            fgcolor = Blitbuffer.COLOR_DARK_GRAY,
+            fgcolor = visual_enabled and item._zen_value_black == true
+                and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_DARK_GRAY,
             face = Font:getFace("xx_smallinfofont"),
             padding = 0,
         })
@@ -327,17 +367,21 @@ local function rebuild_settings_menu_item(row)
         HorizontalSpan:new{ width = left_padding },
     }
     table.insert(left_items, icon_widget or HorizontalSpan:new{ width = M.SETTINGS_ICON_WIDTH })
-    table.insert(left_items, HorizontalSpan:new{ width = Size.padding.default })
+    table.insert(left_items, HorizontalSpan:new{ width = icon_gap })
     table.insert(left_items, text_group)
+    local custom_content = type(item._zen_settings_content_func) == "function"
+        and item._zen_settings_content_func(
+            row.dimen.w - right_controls_w, row.dimen.h, face, visual_enabled)
+    if custom_content and type(text_group.free) == "function" then text_group:free() end
     local left = LeftContainer:new{
         dimen = Geom:new{ w = row.dimen.w, h = row.dimen.h },
-        HorizontalGroup:new(left_items),
+        custom_content or HorizontalGroup:new(left_items),
     }
     local content = OverlapGroup:new{
         dimen = Geom:new{ w = row.dimen.w, h = row.dimen.h },
         left,
     }
-    if control_widget or item._zen_has_submenu then
+    if control_widget or item._zen_has_submenu or mandatory then
         table.insert(content, RightContainer:new{
             dimen = Geom:new{ w = row.dimen.w, h = row.dimen.h },
             right_controls,
@@ -354,7 +398,9 @@ local function rebuild_settings_menu_item(row)
         focus_inner_border = true,
         content,
     }
-    M.enableFullRowFocus(row.item_frame)
+    if item._zen_focus_border_only ~= true then
+        M.enableFullRowFocus(row.item_frame)
+    end
     row._zen_settings_divider = LineWidget:new{
         dimen = Geom:new{ w = row.dimen.w, h = Size.line.thin },
         background = Blitbuffer.COLOR_LIGHT_GRAY,

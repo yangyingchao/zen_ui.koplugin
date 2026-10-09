@@ -38,6 +38,7 @@ local show_submenu
 local repopulate
 local plus_icon_path
 local cancel_item_drag_hold
+local pending_callback_resume_path
 local DRAG_UNFOCUS_DELAY = 0.1
 local ITEM_DRAG_HOLD_DELAY = 0.25
 
@@ -84,11 +85,11 @@ local function item_is_enabled(item)
 end
 
 local function toggle_sort_item(sort_widget, item)
-    if not (sort_widget and item and item.checked_func and item.callback) then
+    if not (sort_widget and item and item.checked_func) then
         return false
     end
     if not item_is_enabled(item) then return false end
-    item:callback()
+    if not ArrangeState.toggleItem(item) then return false end
     if sort_widget.marked and sort_widget.marked > 0 then
         sort_widget.marked = 0
     end
@@ -291,7 +292,7 @@ local function rebuild_icon_row(row)
         if item.radio == true then
             row.checkmark_widget = RadioMark:new{
                 checkable = true,
-                checked = item_checked == true,
+                checked = not not item_checked,
                 enabled = not item_disabled,
             }
         else
@@ -308,6 +309,7 @@ local function rebuild_icon_row(row)
     local right_padding = Size.padding.default
     local icon_w = IconItem.SETTINGS_ICON_WIDTH
     local arrange_enabled = row.show_parent._zen_arrange_enabled == true
+        and item.arrange_pinned_last ~= true
     local content_w = row.width - left_padding - right_padding
     local item_has_submenu = type(item.sub_item_table) == "table"
         or type(item.sub_item_table_func) == "function"
@@ -364,9 +366,20 @@ local function rebuild_icon_row(row)
     local row_items = {
         align = "center",
     }
-    table.insert(row_items, not arrange_enabled and item.icon_glyph
-        and IconItem.makeState(item.icon_glyph, icon_w, row.height, icon_face)
-        or HorizontalSpan:new{ width = icon_w })
+    local icon_state
+    if not arrange_enabled and item.icon_file then
+        icon_state = CenterContainer:new{
+            dimen = Geom:new{ w = icon_w, h = row.height },
+            IconWidget:new{
+                file = item.icon_file,
+                width = icon_face.size,
+                height = icon_face.size,
+            },
+        }
+    elseif not arrange_enabled and item.icon_glyph then
+        icon_state = IconItem.makeState(item.icon_glyph, icon_w, row.height, icon_face)
+    end
+    table.insert(row_items, icon_state or HorizontalSpan:new{ width = icon_w })
     table.insert(row_items, HorizontalSpan:new{ width = icon_gap })
     row._zen_settings_style = {
         row_height = row.height,
@@ -921,14 +934,22 @@ end
 
 local function open_resume_item(sort_widget, item, resume_path)
     if open_submenu_for_item(sort_widget, item, resume_path, true) then return true end
-    if #resume_path > 0 or item._zen_settings_submenu ~= true then return false end
+    if item._zen_settings_submenu ~= true then return false end
     local callback = item.callback
     if type(callback) ~= "function" and type(item.callback_func) == "function" then
         callback = item.callback_func()
     end
     if type(callback) ~= "function" then return false end
+    local previous_resume_path = pending_callback_resume_path
+    if #resume_path > 0 then
+        pending_callback_resume_path = {}
+        for _i, key in ipairs(resume_path) do
+            pending_callback_resume_path[#pending_callback_resume_path + 1] = key
+        end
+    end
     sort_widget.invisible = false
     callback(sort_widget._zen_menu_proxy)
+    pending_callback_resume_path = previous_resume_path
     return true
 end
 
@@ -1001,15 +1022,15 @@ local function activate_keyboard_target(sort_widget)
 end
 
 local function move_arrange_item(sort_widget, target)
-    if not (sort_widget and type(target) == "number"
-            and ArrangeState.moveTableItem(
-                sort_widget.item_table, sort_widget.marked, target
-            )) then
+    if not (sort_widget and type(target) == "number") then return false end
+    local moved, actual_target = ArrangeState.moveTableItem(
+        sort_widget.item_table, sort_widget.marked, target)
+    if not moved then
         return false
     end
-    sort_widget.marked = target
+    sort_widget.marked = actual_target
     sort_widget._zen_arrange_order_dirty = true
-    sort_widget.show_page = math.ceil(target / sort_widget.items_per_page)
+    sort_widget.show_page = math.ceil(actual_target / sort_widget.items_per_page)
     sort_widget:_populateItems()
     return true
 end
@@ -1231,7 +1252,7 @@ local function start_touch_drag(sort_widget, pos, handle_only)
     for _row_i, row in ipairs(sort_widget.main_content or {}) do
         local matches = handle_only and is_arrange_handle_tap(row, pos)
             or not handle_only and is_arrange_row_tap(row, pos)
-        if row.index and matches then
+        if row.index and row.item and row.item.arrange_pinned_last ~= true and matches then
             cancel_item_drag_hold(sort_widget)
             cancel_drag_unfocus(sort_widget)
             local first = (sort_widget.show_page - 1) * sort_widget.items_per_page + 1
@@ -1612,9 +1633,7 @@ install_submenu_tap_handlers = function(sort_widget)
                     return true
                 end
                 if item.checked_func and ges and is_toggle_tap(row, ges.pos) then
-                    if item.callback then
-                        item:callback()
-                    end
+                    ArrangeState.toggleItem(item)
                     if not row.show_parent._zen_menu_mode then
                         repopulate(row.show_parent)
                     end
@@ -1649,9 +1668,7 @@ install_root_tap_handlers = function(sort_widget)
                     ges and is_toggle_tap(row, ges.pos)
                 )
                 if action == "toggle" then
-                    if item.callback then
-                        item:callback()
-                    end
+                    ArrangeState.toggleItem(item)
                     if not row.show_parent._zen_menu_mode then
                         repopulate(row.show_parent)
                     end
@@ -1673,6 +1690,8 @@ end
 
 function M.show(opts)
     opts = opts or {}
+    local callback_resume_path = pending_callback_resume_path
+    pending_callback_resume_path = nil
     local arrange_enabled = opts.allow_arrange ~= false
     local menu_mode = opts.menu_mode == true
     local item_table = opts.item_table or {}
@@ -1690,7 +1709,13 @@ function M.show(opts)
     end
     local resume_item
     local resume_path
-    if settings_resume and #settings_resume.path > 0 then
+    if type(callback_resume_path) == "table" and #callback_resume_path > 0 then
+        resume_path = {}
+        for _i, key in ipairs(callback_resume_path) do
+            resume_path[#resume_path + 1] = key
+        end
+        resume_item = find_resume_item(item_table, resume_path[1])
+    elseif settings_resume and #settings_resume.path > 0 then
         resume_path = {}
         for _i, key in ipairs(settings_resume.path) do
             resume_path[#resume_path + 1] = key

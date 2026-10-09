@@ -4,24 +4,29 @@ local UIManager = require("ui/uimanager")
 
 local HomePresets = require("modules/filebrowser/patches/home/home_presets")
 local HomeQuotes = require("modules/filebrowser/patches/home/home_quotes")
+local author_sort = require("common/author_sort")
 local PresetStore = require("config/preset_store")
 local Registry = require("modules/filebrowser/patches/home/components/registry")
 local library_font = require("modules/filebrowser/patches/library_font")
 local ReadingGoals = require("common/reading_goals")
 local icons = require("common/inline_icon_map")
+local plugin_root = require("common/plugin_root")
 local IconItem = require("common/ui/icon_menu_item")
 local ButtonModel = require("common/nav_button_model")
 local Destination = require("common/library_destination")
 local DispatcherMenu = require("common/dispatcher_menu")
 local NativeMenu = require("modules/menu/app_launcher/native_menu")
 local PluginScan = require("modules/menu/app_launcher/plugin_scan")
+local Kindle = require("modules/filebrowser/patches/kindle_virtual_library")
 
 local M = {}
+local MIN_GOALS_FONT_SIZE = 10
 local DEFAULT_GOALS_FONT_SIZE = 11
+local MAX_GOALS_FONT_SIZE = 16
 local DEFAULT_DATETIME_MAX_FONT_SIZE = 36
 local MAX_DATETIME_FONT_SIZE = 160
 local DEFAULT_STATS_FONT_SIZE = 16
-local DEFAULT_STATS_MAX_FONT_SIZE = 22
+local DEFAULT_STATS_MAX_FONT_SIZE = 18
 local MAX_STATS_FONT_SIZE = 64
 local DEFAULT_DATETIME_FONT_SIZES = { time = 36, date = 12 }
 local DEFAULT_STRIP_CONTROL_TEXT_STYLE = {
@@ -146,9 +151,13 @@ end
 local function ensure_featured_cfg(dcfg, module_id)
     local mcfg = ensure_module_cfg(dcfg, module_id)
     mcfg.order = nil
+    if mcfg.show_author == nil then mcfg.show_author = true end
+    if mcfg.show_series == nil then mcfg.show_series = true end
     if mcfg.show_description == nil then mcfg.show_description = true end
     if mcfg.show_progress == nil then mcfg.show_progress = true end
     if mcfg.wrap_description_text == nil then mcfg.wrap_description_text = false end
+    if mcfg.justify_description_text == nil then mcfg.justify_description_text = false end
+    if mcfg.format_description_html == nil then mcfg.format_description_html = false end
     if mcfg.interactive == nil then mcfg.interactive = true end
     if mcfg.show_status_bar == nil then mcfg.show_status_bar = false end
     if mcfg.status_bar_show_bottom_border == nil then mcfg.status_bar_show_bottom_border = true end
@@ -191,6 +200,7 @@ local function ensure_strip_cfg(dcfg)
     end
     if mcfg.show_strip_titles == nil then mcfg.show_strip_titles = false end
     if mcfg.show_badges == nil then mcfg.show_badges = false end
+    if mcfg.show_page_indicator == nil then mcfg.show_page_indicator = true end
     if mcfg.center_books == nil then mcfg.center_books = false end
     if type(mcfg.controls) ~= "table" then mcfg.controls = {} end
     if type(mcfg.controls.text_style) ~= "table" then
@@ -228,11 +238,14 @@ local function ensure_home_widget_cfg(dcfg)
     stats_triplet.font_scale = nil
     local reading_goals = ensure_module_cfg(dcfg, "reading_goals")
     local goals_font_size = tonumber(reading_goals.font_size)
-    reading_goals.font_size = goals_font_size and math.max(8, math.min(32, math.floor(goals_font_size + 0.5))) or nil
+    reading_goals.font_size = goals_font_size
+        and math.max(MIN_GOALS_FONT_SIZE,
+            math.min(MAX_GOALS_FONT_SIZE, math.floor(goals_font_size + 0.5))) or nil
     reading_goals.automatic_font_size = reading_goals.automatic_font_size ~= false
-    reading_goals.max_font_size = math.max(8, math.min(64, math.floor(
-        (tonumber(reading_goals.max_font_size) or 32) + 0.5
-    )))
+    reading_goals.max_font_size = math.max(MIN_GOALS_FONT_SIZE,
+        math.min(MAX_GOALS_FONT_SIZE, math.floor(
+            (tonumber(reading_goals.max_font_size) or MAX_GOALS_FONT_SIZE) + 0.5
+        )))
     ensure_module_cfg(dcfg, "quotes")
     ensure_strip_cfg(dcfg)
 end
@@ -252,7 +265,7 @@ local function ensure_cfg(_config)
     dcfg.rows = Registry.normalizeRows(dcfg.rows, DEFAULT_ORDER, DEFAULT_ENABLED)
 
     if dcfg.show_status_bar == nil then dcfg.show_status_bar = true end
-    dcfg.edit_mode = dcfg.edit_mode == true
+    dcfg.edit_mode = dcfg.edit_mode ~= false
     dcfg.font_size = nil
     dcfg.font_size_override = nil
 
@@ -310,8 +323,6 @@ function M.build(ctx)
     local dcfg = ensure_cfg(config)
     local capacity_units = type(Registry.capacityUnits) == "function"
         and Registry.capacityUnits() or Registry.CAPACITY_UNITS
-    local home_rebuild_pending = false
-    local home_rebuild_poll_active = false
     local schedule_home_rebuild_on_menu_close
 
     local function unique_user_preset_name(base)
@@ -351,54 +362,31 @@ function M.build(ctx)
             make_builtin_editable()
         end
         PresetStore.saveSettings("home", dcfg)
-        home_rebuild_pending = true
         schedule_home_rebuild_on_menu_close()
     end
 
-    local function is_filemanager_menu_open()
-        local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
-        if not ok_fm or not FileManager or not FileManager.instance then return false end
-        local fm = FileManager.instance
-        local menu = fm.menu
-        if not menu then return false end
-        local menu_container = menu.menu_container
-        local stack = UIManager._window_stack
-        if not stack then return false end
-        for _i, entry in ipairs(stack) do
-            local widget = entry and entry.widget
-            if widget == menu or (menu_container and widget == menu_container) then return true end
+    local function set_authors_collate(collate)
+        if not author_sort.isMode(collate) then return end
+        if type(config.group_view) ~= "table" then config.group_view = {} end
+        config.group_view.authors_collate = collate
+        if ctx.plugin and type(ctx.plugin.saveConfig) == "function" then
+            ctx.plugin:saveConfig()
         end
-        return false
+        schedule_home_rebuild_on_menu_close()
     end
 
     schedule_home_rebuild_on_menu_close = function()
-        if home_rebuild_poll_active then return end
-        home_rebuild_poll_active = true
-        local function tick()
+        local settings_apply = ctx.settings_apply
+        if not (settings_apply and settings_apply.defer_until_settings_close) then return end
+        settings_apply.defer_until_settings_close("home_rebuild", function()
             local plugin = ctx.plugin or rawget(_G, "__ZEN_UI_PLUGIN")
-            local settings_apply = ctx.settings_apply
             local home = settings_apply
                 and settings_apply.get_shared
                 and settings_apply.get_shared(plugin, "home")
-            local home_waiting = home
-                and home.hasActive
-                and home.hasActive()
-                and home.isActiveOnTop
-                and not home.isActiveOnTop()
-            if is_filemanager_menu_open() or home_waiting then
-                UIManager:scheduleIn(0.25, tick)
-                return
-            end
-            home_rebuild_poll_active = false
-            if not home_rebuild_pending then return end
-            home_rebuild_pending = false
             if home and home.rebuildActive then
-                UIManager:scheduleIn(0, function()
-                    home.rebuildActive()
-                end)
+                home.rebuildActive()
             end
-        end
-        UIManager:scheduleIn(0.25, tick)
+        end)
     end
 
     local function component_label(id)
@@ -490,16 +478,6 @@ function M.build(ctx)
         end
         return {
             {
-                text = _("Enable"),
-                checked_func = function()
-                    return mcfg.show_progress ~= false
-                end,
-                callback = function()
-                    mcfg.show_progress = mcfg.show_progress == false
-                    save_home("reinit")
-                end,
-            },
-            {
                 text_func = function()
                     return _("Left") .. ": " .. progress_label(mcfg.progress_meta.left)
                 end,
@@ -565,6 +543,7 @@ function M.build(ctx)
                 end,
             },
             {
+                _zen_search_text = _("Font"),
                 text_func = function()
                     return string.format("%s %s", _("Font:"),
                         font_label(ensure_datetime_text_style(mcfg, key).font_face))
@@ -659,12 +638,14 @@ function M.build(ctx)
                 end,
             },
             {
+                _zen_search_text = _("Time"),
                 text_func = function()
                     return _("Time") .. ": " .. datetime_style_summary(mcfg, "time")
                 end,
                 sub_item_table = build_datetime_text_style_items(mcfg, "time", _("Time")),
             },
             {
+                _zen_search_text = _("Date"),
                 text_func = function()
                     return _("Date") .. ": " .. datetime_style_summary(mcfg, "date")
                 end,
@@ -686,7 +667,7 @@ function M.build(ctx)
 
     local function build_featured_text_style_items(mcfg, key, label)
         local defaults = FEATURED_TEXT_STYLE_DEFAULTS[key]
-        return {
+        local items = {
             {
                 text_func = function()
                     local style = ensure_featured_text_style(mcfg, key)
@@ -710,6 +691,7 @@ function M.build(ctx)
                 end,
             },
             {
+                _zen_search_text = _("Font"),
                 text_func = function()
                     local style = ensure_featured_text_style(mcfg, key)
                     return string.format("%s %s", _("Font:"), font_label(style.font_face))
@@ -752,18 +734,72 @@ function M.build(ctx)
                     save_featured_text_style(touchmenu_instance)
                 end,
             },
-            {
-                text = _("Use default style"),
-                callback = function(touchmenu_instance)
-                    mcfg.text_styles[key] = {
-                        font_face = defaults.font_face,
-                        font_size = defaults.font_size,
-                        bold = defaults.bold,
-                    }
-                    save_featured_text_style(touchmenu_instance)
-                end,
-            },
         }
+        if key == "description" then
+            items[#items + 1] = {
+                text = _("Wrap description text"),
+                checked_func = function()
+                    return mcfg.wrap_description_text == true
+                end,
+                callback = function()
+                    mcfg.wrap_description_text = mcfg.wrap_description_text ~= true
+                    save_home("reinit")
+                end,
+            }
+            items[#items + 1] = {
+                text = _("Justify text"),
+                checked_func = function()
+                    return mcfg.justify_description_text == true
+                end,
+                callback = function()
+                    mcfg.justify_description_text = mcfg.justify_description_text ~= true
+                    save_home("reinit")
+                end,
+            }
+            items[#items + 1] = {
+                text = _("HTML"),
+                checked_func = function()
+                    return mcfg.format_description_html == true
+                end,
+                callback = function()
+                    mcfg.format_description_html = mcfg.format_description_html ~= true
+                    save_home("reinit")
+                end,
+            }
+        end
+        items[#items + 1] = {
+            text = _("Use default style"),
+            callback = function(touchmenu_instance)
+                mcfg.text_styles[key] = {
+                    font_face = defaults.font_face,
+                    font_size = defaults.font_size,
+                    bold = defaults.bold,
+                }
+                save_featured_text_style(touchmenu_instance)
+            end,
+        }
+        return items
+    end
+
+    local function featured_text_style_item(mcfg, key, label, show_key)
+        local item = {
+            sub_title = label,
+            _zen_search_text = label,
+            text_func = function()
+                return label .. ": " .. featured_text_style_summary(mcfg, key)
+            end,
+            sub_item_table = build_featured_text_style_items(mcfg, key, label),
+        }
+        if show_key then
+            item.checked_func = function()
+                return mcfg[show_key] ~= false
+            end
+            item.checkmark_callback = function()
+                mcfg[show_key] = mcfg[show_key] == false
+                save_home("reinit")
+            end
+        end
+        return item
     end
 
     local function build_featured_text_styles_items(mcfg)
@@ -773,41 +809,13 @@ function M.build(ctx)
                 return build_featured_text_styles_items(mcfg)
             end,
         }
-        items[#items + 1] = {
-            sub_title = _("Title"),
-            text_func = function()
-                return _("Title") .. ": " .. featured_text_style_summary(mcfg, "title")
-            end,
-            sub_item_table = build_featured_text_style_items(mcfg, "title", _("Title")),
-        }
-        items[#items + 1] = {
-            sub_title = _("Author"),
-            text_func = function()
-                return _("Author") .. ": " .. featured_text_style_summary(mcfg, "author")
-            end,
-            sub_item_table = build_featured_text_style_items(mcfg, "author", _("Author")),
-        }
-        items[#items + 1] = {
-            sub_title = _("Series"),
-            text_func = function()
-                return _("Series") .. ": " .. featured_text_style_summary(mcfg, "series")
-            end,
-            sub_item_table = build_featured_text_style_items(mcfg, "series", _("Series")),
-        }
-        items[#items + 1] = {
-            sub_title = _("Description"),
-            text_func = function()
-                return _("Description") .. ": " .. featured_text_style_summary(mcfg, "description")
-            end,
-            sub_item_table = build_featured_text_style_items(mcfg, "description", _("Description")),
-        }
-        items[#items + 1] = {
-            sub_title = _("Progress labels"),
-            text_func = function()
-                return _("Progress labels") .. ": " .. featured_text_style_summary(mcfg, "progress")
-            end,
-            sub_item_table = build_featured_text_style_items(mcfg, "progress", _("Progress labels")),
-        }
+        items[#items + 1] = featured_text_style_item(mcfg, "title", _("Title"))
+        items[#items + 1] = featured_text_style_item(mcfg, "author", _("Author"), "show_author")
+        items[#items + 1] = featured_text_style_item(mcfg, "series", _("Series"), "show_series")
+        items[#items + 1] = featured_text_style_item(
+            mcfg, "description", _("Description"), "show_description")
+        items[#items + 1] = featured_text_style_item(
+            mcfg, "progress", _("Progress labels"))
         return items
     end
 
@@ -855,21 +863,8 @@ function M.build(ctx)
         save_home("reinit")
     end
 
-    local function featured_status_bar_item(mcfg)
-        return {
-            text = _("Show top status bar"),
-            checked_func = function()
-                return mcfg.show_status_bar == true
-            end,
-            callback = function()
-                toggle_featured_status_bar(mcfg)
-            end,
-        }
-    end
-
     local function featured_status_bar_options(mcfg)
         return {
-            featured_status_bar_item(mcfg),
             {
                 text = _("Show bottom border"),
                 checked_func = function()
@@ -995,34 +990,27 @@ function M.build(ctx)
                     end)
                 end,
             },
-            {
-                text = _("Show description"),
-                checked_func = function()
-                    return mcfg.show_description ~= false
-                end,
-                callback = function()
-                    mcfg.show_description = mcfg.show_description == false
-                    save_home("reinit")
-                end,
-            },
-            {
-                text = _("Wrap description text"),
-                checked_func = function()
-                    return mcfg.wrap_description_text == true
-                end,
-                callback = function()
-                    mcfg.wrap_description_text = mcfg.wrap_description_text ~= true
-                    save_home("reinit")
-                end,
-            },
             interactive_item(mcfg),
             {
                 text = _("Top status bar"),
+                checked_func = function()
+                    return mcfg.show_status_bar == true
+                end,
+                checkmark_callback = function()
+                    toggle_featured_status_bar(mcfg)
+                end,
                 sub_item_table = featured_status_bar_options(mcfg),
             },
             featured_text_styles_item(mcfg),
             {
                 text = _("Progress"),
+                checked_func = function()
+                    return mcfg.show_progress ~= false
+                end,
+                checkmark_callback = function()
+                    mcfg.show_progress = mcfg.show_progress == false
+                    save_home("reinit")
+                end,
                 sub_item_table = build_progress_meta_items(mcfg),
             },
         }
@@ -1064,6 +1052,9 @@ function M.build(ctx)
             collections = _("Collections"), custom = _("Custom books"),
         }
         if source.kind == "tag" then return source.value or _("Specific tag") end
+        if source.kind == "status" then
+            return ButtonModel.statusLabel(source.value) or _("Recent")
+        end
         if source.kind == "folder" then return path_label(source.value) end
         return labels[source.kind] or _("Recent")
     end
@@ -1137,6 +1128,50 @@ function M.build(ctx)
         return mcfg.default_source
     end
 
+    local function tbr_order_item()
+        return IconItem.decorate({
+            text = _("Order"),
+            _zen_settings_submenu = true,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                require("common/tbr_index").showOrder({
+                    plugin = ctx.plugin,
+                    settings_resume = touchmenu_instance
+                        and touchmenu_instance._zen_settings_resume,
+                    on_change = ctx.settings_apply
+                        and ctx.settings_apply.refresh_tbr_on_menu_close,
+                })
+            end,
+        }, icons.sort)
+    end
+
+    local function authors_sort_item()
+        local items = {}
+        for _i, option in ipairs(author_sort.options(_)) do
+            local collate = option.key
+            items[#items + 1] = {
+                text = option.text,
+                radio = true,
+                checked_func = function()
+                    local group_view = type(config.group_view) == "table"
+                        and config.group_view or {}
+                    return author_sort.normalize(group_view.authors_collate) == collate
+                end,
+                callback = function() set_authors_collate(collate) end,
+            }
+        end
+        return {
+            text_func = function()
+                local group_view = type(config.group_view) == "table"
+                    and config.group_view or {}
+                local mode = author_sort.normalize(group_view.authors_collate)
+                local label = mode == "authors_last" and _("Last name") or _("First name")
+                return _("Sort by") .. ": " .. label
+            end,
+            sub_item_table = items,
+        }
+    end
+
     local function edit_strip_label(controls, entry, touchmenu_instance)
         local InputDialog = require("ui/widget/inputdialog")
         local dialog
@@ -1178,6 +1213,29 @@ function M.build(ctx)
         if memory and memory.active_id == id then dcfg.strip_memory = nil end
     end
 
+    local function kindle_folder_item()
+        return {
+            text = _("Hide Kindle Library folder"),
+            checked_func = function()
+                return type(config.kindle) == "table"
+                    and config.kindle.hide_library_folder == true
+            end,
+            callback = function()
+                if type(config.kindle) ~= "table" then config.kindle = {} end
+                config.kindle.hide_library_folder =
+                    config.kindle.hide_library_folder ~= true
+                local plugin = ctx.plugin or rawget(_G, "__ZEN_UI_PLUGIN")
+                if plugin and type(plugin.saveConfig) == "function" then
+                    plugin:saveConfig()
+                end
+                if ctx.settings_apply
+                        and ctx.settings_apply.reinit_filemanager_on_menu_close then
+                    ctx.settings_apply.reinit_filemanager_on_menu_close()
+                end
+            end,
+        }
+    end
+
     local function remove_strip_button(controls, id)
         for i, entry in ipairs(controls.custom_buttons) do
             if entry.id == id then table.remove(controls.custom_buttons, i); break end
@@ -1208,6 +1266,8 @@ function M.build(ctx)
         save_home("reinit")
     end
 
+    local commit_strip_button
+
     local function add_strip_builtin(controls, touchmenu_instance)
         if count_strip_buttons(controls) >= 7 then
             local InfoMessage = require("ui/widget/infomessage")
@@ -1218,11 +1278,24 @@ function M.build(ctx)
         for _i, id in ipairs(controls.order) do selected[id] = true end
         local items = {}
         for _i, entry in ipairs(ButtonModel.builtins()) do
-            if not selected[entry.id] then
+            if not selected[entry.id]
+                    and (type(ButtonModel.isAvailable) ~= "function"
+                        or ButtonModel.isAvailable(entry)) then
                 items[#items + 1] = {
                     text = entry.id == "tags" and _("All tags") or entry.label,
                     entry = entry,
                 }
+            end
+        end
+        local selected_status = {}
+        for _i, entry in ipairs(controls.custom_buttons) do
+            if selected[entry.id] and entry.type == "status" then
+                selected_status[entry.status] = true
+            end
+        end
+        for _i, status in ipairs(ButtonModel.statuses()) do
+            if not selected_status[status.key] then
+                items[#items + 1] = { text = status.label, status = status }
             end
         end
         table.sort(items, function(a, b) return a.text < b.text end)
@@ -1231,6 +1304,16 @@ function M.build(ctx)
             title = _("Choose tab"),
             items = items,
             on_select = function(item)
+                if item and item.status then
+                    if commit_strip_button(controls, {
+                        type = "status",
+                        status = item.status.key,
+                        label = item.status.label,
+                    }) and touchmenu_instance and touchmenu_instance.backToUpperMenu then
+                        touchmenu_instance:backToUpperMenu()
+                    end
+                    return
+                end
                 local entry = item and item.entry
                 if not entry or count_strip_buttons(controls) >= 7 then return end
                 controls.order[#controls.order + 1] = entry.id
@@ -1243,7 +1326,7 @@ function M.build(ctx)
         }
     end
 
-    local function commit_strip_button(controls, entry)
+    commit_strip_button = function(controls, entry)
         if count_strip_buttons(controls) >= 7 then
             local InfoMessage = require("ui/widget/infomessage")
             UIManager:show(InfoMessage:new{ text = _("Maximum 7 tabs allowed") })
@@ -1323,7 +1406,7 @@ function M.build(ctx)
         if not ok_dispatcher or not Dispatcher then return end
         local entry = { type = "action", action = {} }
         local items, caller = {}, {}
-        Dispatcher:addSubMenu(caller, items, entry, "action")
+        DispatcherMenu.addSubMenu(Dispatcher, caller, items, entry, "action")
         DispatcherMenu.wrap(items, caller, function()
             if entry.action and next(entry.action) then
                 local label = Dispatcher:menuTextFunc(entry.action)
@@ -1338,7 +1421,7 @@ function M.build(ctx)
 
     local function build_add_strip_button_items(mcfg)
         local controls = mcfg.controls
-        return {
+        local items = {
             IconItem.decorate({
                 text = _("Tab"),
                 keep_menu_open = true,
@@ -1384,12 +1467,14 @@ function M.build(ctx)
                 keep_menu_open = true,
                 callback = function() add_strip_plugin(controls) end,
             }, icons.plugin),
-            IconItem.decorate({
+            {
                 text = _("KOReader menu"),
+                icon_file = plugin_root .. "/icons/koreader.png",
                 keep_menu_open = true,
                 callback = function() add_strip_menu(controls) end,
-            }, icons.open_menu),
+            },
         }
+        return items
     end
 
     local function show_strip_buttons(mcfg, parent_touchmenu)
@@ -1408,9 +1493,9 @@ function M.build(ctx)
                 deferred_parent = settings_resume.deferred_parent,
             }
         else
-            settings_page.rememberStandaloneArrangeRoute({
+            settings_resume = select(2, settings_page.rememberStandaloneArrangeRoute({
                 { text = _("Home"), occurrence = 1 },
-            }, _("Widgets"), { "strip", _("Controls"), _("Tabs") })
+            }, _("Widgets"), { "strip", _("Controls"), _("Tabs") }))
         end
         local sort_items
         local function build_sort_items()
@@ -1420,7 +1505,7 @@ function M.build(ctx)
                 if entry then
                     local button_id = id
                     local button_entry = entry
-                    sort_items[#sort_items + 1] = {
+                    local sort_item = {
                         text_func = function()
                             return ButtonModel.label(controls, button_entry)
                         end,
@@ -1473,6 +1558,25 @@ function M.build(ctx)
                             },
                         },
                     }
+                    if button_entry.type == "quick_setting" then
+                        local quick = rawget(_G, "__ZEN_UI_QUICK_SETTINGS")
+                        local settings_items = quick and quick.getSettingsItems
+                            and quick.getSettingsItems(button_entry.quick_setting_id)
+                        if settings_items and #settings_items > 0 then
+                            table.insert(sort_item.sub_item_table, 2, {
+                                text = _("Control settings"),
+                                sub_item_table = settings_items,
+                            })
+                        end
+                    end
+                    if button_id == "to_be_read" then
+                        table.insert(sort_item.sub_item_table, 2, tbr_order_item())
+                    elseif button_id == "authors" then
+                        table.insert(sort_item.sub_item_table, 2, authors_sort_item())
+                    elseif button_id == "kindle" and Kindle.isAvailable() then
+                        table.insert(sort_item.sub_item_table, 2, kindle_folder_item())
+                    end
+                    sort_items[#sort_items + 1] = sort_item
                 end
             end
             return sort_items
@@ -1563,6 +1667,7 @@ function M.build(ctx)
                 end,
             },
             {
+                _zen_search_text = _("Font"),
                 text_func = function()
                     local style = ensure_strip_cfg(dcfg).controls.text_style
                     return string.format("%s %s", _("Font:"), font_label(style.font_face))
@@ -1626,18 +1731,15 @@ function M.build(ctx)
         local items = {
             {
                 text = _("Controls"),
+                checked_func = function()
+                    return mcfg.controls.enabled == true
+                end,
+                checkmark_callback = function()
+                    mcfg.controls.enabled = mcfg.controls.enabled ~= true
+                    save_home("reinit")
+                end,
                 sub_item_table_func = function()
                     return {
-                        {
-                            text = _("Show controls"),
-                            checked_func = function()
-                                return mcfg.controls.enabled == true
-                            end,
-                            callback = function()
-                                mcfg.controls.enabled = mcfg.controls.enabled ~= true
-                                save_home("reinit")
-                            end,
-                        },
                         IconItem.decorate({
                             text = _("Tabs"),
                             _zen_settings_submenu = true,
@@ -1646,14 +1748,15 @@ function M.build(ctx)
                                 show_strip_buttons(mcfg, touchmenu_instance)
                             end,
                         }, icons.navbar_tabs),
-                        {
+                        IconItem.decorate({
+                            _zen_search_text = _("Font"),
                             text_func = function()
                                 return _("Font") .. ": " .. strip_control_style_summary(mcfg)
                             end,
                             sub_item_table_func = function()
                                 return build_strip_control_font_items(mcfg)
                             end,
-                        },
+                        }, icons.title),
                         IconItem.decorate({
                             text = _("Reset to defaults"),
                             separator = true,
@@ -1689,6 +1792,14 @@ function M.build(ctx)
                 checked_func = function() return mcfg.show_badges == true end,
                 callback = function()
                     mcfg.show_badges = mcfg.show_badges ~= true
+                    save_home("reinit")
+                end,
+            },
+            {
+                text = _("Show page dots"),
+                checked_func = function() return mcfg.show_page_indicator ~= false end,
+                callback = function()
+                    mcfg.show_page_indicator = mcfg.show_page_indicator == false
                     save_home("reinit")
                 end,
             },
@@ -1746,7 +1857,9 @@ function M.build(ctx)
             })
         end
         local source = strip_default_source(mcfg)
-        if source.kind == "recent" then
+        if mcfg.controls.enabled ~= true and source.kind == "to_be_read" then
+            table.insert(items, 2, tbr_order_item())
+        elseif source.kind == "recent" then
             table.insert(items, 2, {
                 text = _("Recent filters"),
                 sub_item_table = {
@@ -2072,8 +2185,8 @@ function M.build(ctx)
                 UIManager:show(SpinWidget:new{
                     title_text = _("Reading goals font size"),
                     value = goals_cfg.font_size or DEFAULT_GOALS_FONT_SIZE,
-                    value_min = 8,
-                    value_max = 32,
+                    value_min = MIN_GOALS_FONT_SIZE,
+                    value_max = MAX_GOALS_FONT_SIZE,
                     default_value = DEFAULT_GOALS_FONT_SIZE,
                     callback = function(spin)
                         goals_cfg.font_size = spin.value
@@ -2259,18 +2372,14 @@ function M.build(ctx)
             end
             return dcfg.quotes.sources
         end
-        local function source_item(label, key, options)
-            local item = {
+        local function source_item(label, key)
+            return {
                 text = label,
                 keep_menu_open = true,
                 checked_func = function()
                     return quote_sources()[key] == true
                 end,
                 callback = function()
-                    if options and options.enabled_func
-                            and options.enabled_func() == false then
-                        return
-                    end
                     local sources = quote_sources()
                     sources[key] = sources[key] ~= true
                     if not sources.default and not sources.custom and not sources.annotations then
@@ -2279,38 +2388,68 @@ function M.build(ctx)
                     save_home("reinit")
                 end,
             }
-            if options then
-                item.enabled_func = options.enabled_func
-                item.help_text = options.help_text
-                item.dim = options.enabled_func and options.enabled_func() == false or nil
-            end
-            return item
         end
         local function quote_font_size()
             return dcfg.quotes.font_size or 12
         end
-        local custom_quotes_available = HomeQuotes.hasCustomQuotes()
-        if not custom_quotes_available then
-            local sources = quote_sources()
-            sources.custom = false
-            if not sources.default and not sources.annotations then
-                sources.default = true
+        local sources = quote_sources()
+        if type(dcfg.quotes.custom_files) ~= "table" then
+            if sources.custom == true then
+                dcfg.quotes.custom_files = { ["quotes.lua"] = true }
+            else
+                dcfg.quotes.custom_files = {}
             end
+        elseif sources.custom ~= true then
+            dcfg.quotes.custom_files = {}
+        end
+        local function custom_quote_files()
+            return dcfg.quotes.custom_files
+        end
+        local function has_selected_custom_file()
+            for filename, selected in pairs(custom_quote_files()) do
+                if filename and selected == true then return true end
+            end
+            return false
+        end
+        local function custom_quote_items()
+            local items = {}
+            for _i, filename in ipairs(HomeQuotes.listFiles(dcfg.quotes)) do
+                local quote_file = filename
+                items[#items + 1] = {
+                    text = quote_file:sub(1, -5),
+                    keep_menu_open = true,
+                    checked_func = function()
+                        return custom_quote_files()[quote_file] == true
+                    end,
+                    callback = function()
+                        local files = custom_quote_files()
+                        if files[quote_file] == true then
+                            files[quote_file] = nil
+                        else
+                            files[quote_file] = true
+                        end
+                        local selected = has_selected_custom_file()
+                        sources.custom = selected
+                        if not selected and not sources.default and not sources.annotations then
+                            sources.default = true
+                        end
+                        save_home("reinit")
+                    end,
+                }
+            end
+            return items
+        end
+        sources.custom = has_selected_custom_file()
+        if not sources.custom and not sources.default and not sources.annotations then
+            sources.default = true
         end
         local source_items = {
             source_item(_("Default quotes"), "default"),
-            source_item(_("Custom quotes"), "custom", {
-                enabled_func = HomeQuotes.hasCustomQuotes,
-                help_text = _("Add at least one quote to settings/ZenOS/quotes.lua to enable this source."),
-            }),
+            {
+                text = _("Custom quotes"),
+                sub_item_table_func = custom_quote_items,
+            },
         }
-        if not custom_quotes_available then
-            source_items[#source_items + 1] = {
-                text = _("quotes.lua is empty"),
-                enabled = false,
-                dim = true,
-            }
-        end
         source_items[#source_items + 1] =
             source_item(_("Annotations"), "annotations")
         local items = {
@@ -2457,7 +2596,7 @@ function M.build(ctx)
 
     open_widget_settings = function(id, owning_plugin)
         local settings_page = require("modules/settings/zen_settings_page")
-        local standalone_route = settings_page.rememberStandaloneArrangeRoute({
+        local standalone_route, settings_resume = settings_page.rememberStandaloneArrangeRoute({
             { text = _("Home"), occurrence = 1 },
         }, _("Widgets"), { id })
         local items = build_widget_settings_items(id)
@@ -2471,6 +2610,7 @@ function M.build(ctx)
             plugin = owning_plugin or ctx.plugin,
             allow_arrange = false,
             hide_footer_cancel = true,
+            settings_resume = settings_resume,
             back_callback = standalone_route and function()
                 settings_page.rememberStandaloneArrangeRoute({
                     { text = _("Home"), occurrence = 1 },
@@ -2512,6 +2652,9 @@ function M.build(ctx)
                 end,
                 callback = function()
                     dcfg.show_status_bar = dcfg.show_status_bar == false
+                    if dcfg.show_status_bar then
+                        dcfg.modules.featured.show_status_bar = false
+                    end
                     save_home("reinit")
                 end,
             },
@@ -2578,7 +2721,7 @@ function M.build(ctx)
     IconItem.decorate(home_items[1], icons.widgets)
     IconItem.decorate(home_items[2], icons.edit)
     IconItem.decorate(home_items[3], icons.save)
-    IconItem.decorate(home_items[4], icons.title)
+    IconItem.decorate(home_items[4], icons.settings_status)
     IconItem.decorate(home_items[5], icons.settings_status)
 
     return {

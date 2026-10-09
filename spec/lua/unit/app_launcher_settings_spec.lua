@@ -35,6 +35,18 @@ describe("app launcher settings", function()
         launcher_cfg = {
             entries = { entry },
             page_order = { "book_details", "book_switcher", "buttons" },
+            book_details_order = {
+                "read_time", "time_remaining", "pages_today",
+                "time_today", "pages", "progress",
+            },
+            book_details_enabled = {
+                read_time = true,
+                time_remaining = true,
+                pages_today = false,
+                time_today = false,
+                pages = true,
+                progress = true,
+            },
         }
 
         ZenSpec.replace("gettext", function(text) return text end)
@@ -73,7 +85,7 @@ describe("app launcher settings", function()
             ensure = function()
                 return launcher_cfg
             end,
-            display_label = function(item) return item.label end,
+            display_label = function(item) return item.label or "Row break" end,
             next_id = function() return "al_2" end,
             save = function() saves = saves + 1 end,
         })
@@ -84,6 +96,9 @@ describe("app launcher settings", function()
             scan = function() return {} end,
         })
         ZenSpec.replace("common/dispatcher_menu", {
+            addSubMenu = function(dispatcher, ...)
+                return dispatcher:addSubMenu(...)
+            end,
             wrap = function(_items, _caller, on_update)
                 dispatcher_update = on_update
             end,
@@ -93,7 +108,9 @@ describe("app launcher settings", function()
             chooseFolder = function(callback) choose_folder = callback end,
             chooseTag = function(callback) choose_tag = callback end,
         })
+        local settingsList = { reader_action = { reader = true } }
         ZenSpec.replace("dispatcher", {
+            registerAction = function() return settingsList end,
             addSubMenu = function(_self, _caller, _items, location, settings)
                 if dispatcher_action then location[settings] = dispatcher_action end
             end,
@@ -107,6 +124,7 @@ describe("app launcher settings", function()
             picker_options = options
         end)
         ZenSpec.unload("modules/settings/sections/app_launcher_settings")
+        ZenSpec.unload("modules/menu/app_launcher/action_filter")
     end)
 
     after_each(function()
@@ -134,6 +152,40 @@ describe("app launcher settings", function()
         assert.are.equal("zen_ui", entry.icon)
     end)
 
+    it("toggles reader action classification for every button type", function()
+        local section = require(
+            "modules/settings/sections/app_launcher_settings").build({
+                config = { features = { app_launcher = true } },
+                save_and_apply = function() end,
+        })
+        local refreshes = 0
+        local touch_menu = { updateItems = function() refreshes = refreshes + 1 end }
+        for _i, entry_type in ipairs({
+            "plugin", "quick_setting", "koreader_menu", "folder_shortcut", "tag", "folder", "action",
+        }) do
+            entry.type = entry_type
+            entry.reader_action = nil
+            entry.folder = "/library"
+            entry.action = { reader_action = true }
+            assert.is_true(section._zen_search_items_func()[1]._zen_search_open())
+            local reader_item
+            for _j, item in ipairs(shown_options.item_table) do
+                if item.text == "Reader action" then reader_item = item end
+            end
+            assert.is_table(reader_item)
+            local default = entry_type == "action"
+            assert.are.equal(default, reader_item.checked_func())
+            reader_item.callback(touch_menu)
+            assert.are.equal(not default, entry.reader_action)
+            assert.are.equal(not default, reader_item.checked_func())
+            reader_item.callback(touch_menu)
+            assert.are.equal(default, entry.reader_action)
+            assert.are.equal(default, reader_item.checked_func())
+        end
+        assert.are.equal(14, saves)
+        assert.are.equal(14, refreshes)
+    end)
+
     it("offers page visibility options and arranges their launcher order", function()
         local section = require(
             "modules/settings/sections/app_launcher_settings").build({
@@ -146,10 +198,34 @@ describe("app launcher settings", function()
         end
 
         assert.is_table(details)
-        assert.are.equal(1, #details.sub_item_table)
-        assert.are.equal("Enable", details.sub_item_table[1].text)
-        details.sub_item_table[1].callback()
+        assert.is_false(details.checked_func())
+        details.checkmark_callback()
         assert.is_true(launcher_cfg.show_book_details)
+        assert.are.equal(1, #details.sub_item_table)
+        assert.are.equal("Items \u{25B8}", details.sub_item_table[1].text)
+        details.sub_item_table[1].callback()
+        assert.are.equal("Book details", shown_options.title)
+        assert.are.same({
+            "Read time", "Time remaining", "Pages today",
+            "Time today", "Pages", "Progress bar",
+        }, {
+            shown_options.item_table[1].text,
+            shown_options.item_table[2].text,
+            shown_options.item_table[3].text,
+            shown_options.item_table[4].text,
+            shown_options.item_table[5].text,
+            shown_options.item_table[6].text,
+        })
+        assert.is_true(shown_options.item_table[1].checked_func())
+        shown_options.item_table[1].callback()
+        assert.is_false(launcher_cfg.book_details_enabled.read_time)
+        shown_options.item_table[1], shown_options.item_table[6]
+            = shown_options.item_table[6], shown_options.item_table[1]
+        shown_options.callback()
+        assert.are.same({
+            "progress", "time_remaining", "pages_today",
+            "time_today", "pages", "read_time",
+        }, launcher_cfg.book_details_order)
 
         local switcher
         local order_item
@@ -163,8 +239,11 @@ describe("app launcher settings", function()
             end
             if item.text == "Open menu to Launcher" then open_menu_index = _i end
         end
-        assert.are.equal(2, #switcher.sub_item_table)
-        assert.are.equal("Only show while reading", switcher.sub_item_table[2].text)
+        assert.is_false(switcher.checked_func())
+        switcher.checkmark_callback()
+        assert.is_true(launcher_cfg.show_book_switcher)
+        assert.are.equal(3, #switcher.sub_item_table)
+        assert.are.equal("Only show while reading", switcher.sub_item_table[1].text)
         assert.are.equal(order_index + 1, open_menu_index)
         assert.are.equal("sort", order_item.test_icon)
 
@@ -180,7 +259,38 @@ describe("app launcher settings", function()
         shown_options.callback()
         assert.are.same({ "buttons", "book_switcher", "book_details" },
             launcher_cfg.page_order)
-        assert.are.equal(2, saves)
+        assert.are.equal(5, saves)
+    end)
+
+    it("sets the switcher limit and defaults to hiding finished books", function()
+        local spin_options
+        local refreshes = 0
+        ZenSpec.replace("ui/widget/spinwidget", {
+            new = function(_self, options) spin_options = options return options end,
+        })
+        ZenSpec.replace("ui/uimanager", { show = function() end })
+        local section = require(
+            "modules/settings/sections/app_launcher_settings").build({
+                config = { features = { app_launcher = true } },
+                save_and_apply = function() end,
+        })
+        local items = section.sub_item_table[3].sub_item_table
+        assert.are.equal("Max books shown: 4", items[2].text_func())
+        items[2].callback({ updateItems = function() refreshes = refreshes + 1 end })
+        assert.are.equal(1, spin_options.value_min)
+        assert.are.equal(8, spin_options.value_max)
+        assert.are.equal(4, spin_options.default_value)
+        spin_options.callback({ value = 8 })
+        assert.are.equal(8, launcher_cfg.book_switcher_count)
+        assert.are.equal("Max books shown: 8", items[2].text_func())
+        assert.are.equal(1, refreshes)
+        assert.are.equal("Hide finished books", items[3].text)
+        assert.is_true(items[3].checked_func())
+        items[3].callback()
+        assert.is_false(items[3].checked_func())
+        items[3].callback()
+        assert.is_true(items[3].checked_func())
+        assert.are.equal(3, saves)
     end)
 
     it("stores an approved icon name instead of a control's plugin path", function()
@@ -332,5 +442,41 @@ describe("app launcher settings", function()
             { id = "al_4", type = "tag", tag = "Science",
                 label = "Science", label_auto = true, icon = "approved_zenfm" },
         }, { launcher_cfg.entries[2], launcher_cfg.entries[3], launcher_cfg.entries[4] })
+    end)
+
+    it("edits and clears an optional row-break title", function()
+        entry.type = "break"
+        entry.label = "Reading"
+        entry.icon = nil
+        entry.plugin = nil
+        local dialog
+        ZenSpec.replace("ui/widget/inputdialog", {
+            new = function(_self, opts)
+                opts.getInputText = function() return "" end
+                opts.onShowKeyboard = function() end
+                dialog = opts
+                return opts
+            end,
+        })
+        local UIManager = require("ui/uimanager")
+        UIManager.show = function() end
+        UIManager.close = function() end
+        local section = require(
+            "modules/settings/sections/app_launcher_settings").build({
+                config = { features = { app_launcher = true } },
+                save_and_apply = function() end,
+        })
+
+        assert.is_true(section._zen_search_items_func()[1]._zen_search_open())
+        for _i, item in ipairs(shown_options.item_table) do
+            assert.are_not.equal("Reader action", item.text)
+        end
+        local title_item = shown_options.item_table[1]
+        assert.are.equal("Title: Reading", title_item.text_func())
+        title_item.callback()
+        dialog.buttons[1][2].callback()
+
+        assert.is_nil(entry.label)
+        assert.are.equal(1, saves)
     end)
 end)

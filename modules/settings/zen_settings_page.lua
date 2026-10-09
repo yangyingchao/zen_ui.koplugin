@@ -13,7 +13,6 @@ local IconItem = require("common/ui/icon_menu_item")
 local SettingsTitleBar = require("common/ui/zen_settings_titlebar")
 local TruncatedTextMessage = require("common/ui/truncated_text_message")
 local TopMenu = require("modules/global/patches/menu_top_swipe")
-local zen_settings = require("modules/settings/zen_settings")
 
 local M = {}
 local active_page
@@ -85,10 +84,18 @@ local function item_text(item)
     return ArrangeState.stripSubmenuCaret(text)
 end
 
-local function resume_selector(items, item, text)
+local function search_item_text(item)
+    if type(item) ~= "table" then return "" end
+    local text = item._zen_search_text or item.text
+    return type(text) == "string" and text ~= ""
+        and ArrangeState.stripSubmenuCaret(text) or item_text(item)
+end
+
+local function resume_selector(items, item, text, text_for_item)
+    text_for_item = text_for_item or item_text
     local occurrence = 0
     for _i, sibling in ipairs(items or {}) do
-        if item_text(sibling) == text then occurrence = occurrence + 1 end
+        if text_for_item(sibling) == text then occurrence = occurrence + 1 end
         if sibling == item then break end
     end
     return {
@@ -108,6 +115,32 @@ local function enabled(item)
         return item.enabled_func() ~= false
     end
     return true
+end
+
+local function visible(item)
+    return type(item.show_func) ~= "function" or item.show_func()
+end
+
+local function visible_items(items)
+    if items._zen_all_items then
+        items._zen_all_items._zen_title = items._zen_title or items._zen_all_items._zen_title
+        items = items._zen_all_items
+    end
+    local filtered
+    for index, item in ipairs(items or {}) do
+        if visible(item) then
+            if filtered then filtered[#filtered + 1] = item end
+        elseif not filtered then
+            filtered = {}
+            for previous = 1, index - 1 do filtered[#filtered + 1] = items[previous] end
+        end
+    end
+    if not filtered then return items end
+    for key, value in pairs(items) do
+        if type(key) ~= "number" then filtered[key] = value end
+    end
+    filtered._zen_all_items = items
+    return filtered
 end
 
 local function item_dimen(page, item)
@@ -146,12 +179,18 @@ end
 local ZenSettingsPage = Menu:extend{}
 
 function ZenSettingsPage:_resolveSubItems(item)
-    if type(item.sub_item_table_func) == "function" then
-        local ok, items = pcall(item.sub_item_table_func, self)
-        if ok and type(items) == "table" then return items end
+    if item._zen_native_owner
+            and not require("modules/menu/app_launcher/native_menu").isSettingsOwner(item._zen_native_owner) then
+        self:closeMenu()
         return nil
     end
-    return type(item.sub_item_table) == "table" and item.sub_item_table or nil
+    if type(item.sub_item_table_func) == "function" then
+        local ok, items = pcall(item.sub_item_table_func, self)
+        if ok and type(items) == "table" then return visible_items(items) end
+        return nil
+    end
+    return type(item.sub_item_table) == "table"
+        and visible_items(item.sub_item_table) or nil
 end
 
 function ZenSettingsPage:_currentTitle()
@@ -190,7 +229,12 @@ end
 function ZenSettingsPage:_syncHeader()
     if not self.title_bar then return end
     local at_root = #self.item_table_stack == 0
-    self.title_bar:setState(self:_currentTitle(), not at_root, true)
+    self.title_bar:setState(self:_currentTitle(), not at_root, self.search_visible ~= false)
+    local action_func = self._root_items and self._root_items._zen_header_action_func
+    if type(self.title_bar.setAction) == "function" then
+        self.title_bar:setAction(at_root and type(action_func) == "function"
+            and action_func() or nil)
+    end
 end
 
 function ZenSettingsPage:_focusSearchInput()
@@ -233,7 +277,9 @@ end
 function ZenSettingsPage:init()
     self.name = "zen_settings"
     self.title = self.title or _("Settings")
-    self.item_table = self.item_table or {}
+    local initial_items = self.item_table or {}
+    self.item_table = visible_items(initial_items)
+    if self._root_items == initial_items then self._root_items = self.item_table end
     self.item_table._zen_title = self.title
     self.width = Device.screen:getWidth()
     self.height = Device.screen:getHeight()
@@ -256,7 +302,7 @@ function ZenSettingsPage:init()
         title = self.title,
         title_full_width = true,
         back_visible = false,
-        search_visible = true,
+        search_visible = self.search_visible ~= false,
         show_parent = self,
         back_callback = function() self:backToUpperMenu() end,
         back_hold_callback = function() self:backToRootMenu() end,
@@ -291,11 +337,36 @@ function ZenSettingsPage:updateItems(...)
         self.item_table_stack = self._initial_item_table_stack
         self._initial_item_table_stack = nil
     end
+    local items = self.item_table
+    if items._zen_native_owner then
+        if not require("modules/menu/app_launcher/native_menu").isSettingsOwner(items._zen_native_owner) then
+            return self:closeMenu()
+        end
+        if items._zen_refresh then
+            local refreshed = items._zen_refresh()
+            refreshed._zen_title = items._zen_title
+            self.item_table = refreshed
+        end
+        self.item_table = visible_items(self.item_table)
+    end
     self:_ensureCurrentTitle()
     self:_prepareItems()
     self:_syncHeader()
     return Menu.updateItems(self, ...)
 end
+
+function ZenSettingsPage:onNetworkConnected()
+    if self._closed or self.invisible then return end
+    for widget in UIManager:topdown_widgets_iter() do
+        if not widget.toast and not widget.invisible then
+            if widget == self then UIManager:setDirty(self, "ui", self.dimen) end
+            return
+        end
+    end
+end
+
+ZenSettingsPage.onNetworkDisconnected = ZenSettingsPage.onNetworkConnected
+ZenSettingsPage.onNetworkStateChanged = ZenSettingsPage.onNetworkConnected
 
 function ZenSettingsPage:mergeTitleBarIntoLayout()
     local title_bar = self.title_bar
@@ -333,6 +404,11 @@ function ZenSettingsPage:onTap(arg, ges_ev)
 end
 
 function ZenSettingsPage:onSwipe(arg, ges_ev)
+    if #self.item_table_stack > 0
+            and ges_ev and ges_ev.direction == "east" and ges_ev.pos
+            and ges_ev.pos.x <= self.width * 0.33 then
+        return self:backToUpperMenu()
+    end
     if Menu.onSwipe then return Menu.onSwipe(self, arg, ges_ev) end
 end
 
@@ -358,7 +434,7 @@ function ZenSettingsPage:_findResumeItem(step)
     if type(step) ~= "table" or type(step.text) ~= "string" then return nil end
     local occurrence = 0
     for _i, item in ipairs(self.item_table or {}) do
-        if item_text(item) == step.text then
+        if search_item_text(item) == step.text or item_text(item) == step.text then
             occurrence = occurrence + 1
             if occurrence == (step.occurrence or 1) then return item end
         end
@@ -397,8 +473,28 @@ function ZenSettingsPage:_openSubmenu(item, items, defer_update)
     items._zen_title = item.sub_title or item_text(item)
     self.parent_id = nil
     self.item_table = items
+    self.page = 1
+    self.itemnumber = nil
+    if type(items.open_on_menu_item_id_func) == "function" then
+        local selected_id = items.open_on_menu_item_id_func()
+        for index, child in ipairs(items) do
+            if child.menu_item_id == selected_id then
+                self.itemnumber = index
+                self.page = self:getPageNumber(index)
+                break
+            end
+        end
+    end
     if not defer_update then self:updateItems(1) end
     return true
+end
+
+function ZenSettingsPage:_invokeItem(item, callback, ...)
+    if item._zen_native_owner then
+        return require("modules/settings/koreader_settings").invoke(self, item, callback, ...)
+    end
+    callback(...)
+    return false
 end
 
 function ZenSettingsPage:onMenuSelect(item, pos)
@@ -413,9 +509,17 @@ function ZenSettingsPage:onMenuSelect(item, pos)
     if type(item.checkmark_callback) == "function" and type(pos) == "table"
             and type(pos.x) == "number" and type(bounds) == "table"
             and pos.x >= bounds.left and pos.x <= bounds.right then
-        item.checkmark_callback()
+        self:_invokeItem(item, item.checkmark_callback, self)
         self._search_index = nil
         self:updateItems()
+        return true
+    end
+
+    if item.tap_input or item.tap_input_func then
+        local handled = self:_invokeItem(item, function()
+            self:onInput(item.tap_input or item.tap_input_func())
+        end)
+        if not handled and not item.keep_menu_open then self:closeMenu() end
         return true
     end
 
@@ -428,16 +532,20 @@ function ZenSettingsPage:onMenuSelect(item, pos)
     local callback = callback_for(item)
     if type(callback) == "function" then
         arrange_open_context = { opener = self:_resumeSelector(item) }
-        callback(self)
+        local depth = #self.item_table_stack
+        local handled = self:_invokeItem(item, callback, self)
         arrange_open_context = nil
         self._search_index = nil
         if self._closed then return true end
+        if #self.item_table_stack > depth then return true end
         if item.checked ~= nil or type(item.checked_func) == "function" then
             if not item.check_callback_updates_menu and not item.check_callback_closes_menu then
                 self:updateItems()
             end
-        elseif not item.keep_menu_open then
+        elseif not item.keep_menu_open and not handled then
             self:closeMenu()
+        elseif item._zen_native_owner then
+            self:updateItems()
         end
     end
     return true
@@ -445,13 +553,25 @@ end
 
 function ZenSettingsPage:onMenuHold(item)
     if not enabled(item) then return true end
+    if item.hold_input or item.hold_input_func then
+        local handled = self:_invokeItem(item, function()
+            self:onInput(item.hold_input or item.hold_input_func())
+        end)
+        if not handled and item.hold_keep_menu_open == false then self:closeMenu() end
+        return true
+    end
     local hold_callback = type(item.hold_callback_func) == "function"
         and item.hold_callback_func() or item.hold_callback
     if type(hold_callback) == "function" then
-        if item.hold_keep_menu_open == false then self:closeMenu() end
+        if not item._zen_native_owner and item.hold_keep_menu_open == false then self:closeMenu() end
         arrange_open_context = { opener = self:_resumeSelector(item) }
-        hold_callback(self, item)
+        local depth = #self.item_table_stack
+        local handled = self:_invokeItem(item, hold_callback, self, item)
         arrange_open_context = nil
+        if item._zen_native_owner and not self._closed and #self.item_table_stack <= depth then
+            if not handled and item.hold_keep_menu_open == false then self:closeMenu()
+            else self:updateItems() end
+        end
         return true
     end
     local help_text = type(item.help_text_func) == "function"
@@ -469,7 +589,17 @@ function ZenSettingsPage:onMenuHold(item)
     return true
 end
 
+function ZenSettingsPage:_leaveNativeViews()
+    local tables = copy_array(self.item_table_stack)
+    tables[#tables + 1] = self.item_table
+    if self._search_snapshot then tables[#tables + 1] = self._search_snapshot.item_table end
+    for index = #tables, 1, -1 do
+        if tables[index]._zen_on_leave then tables[index]._zen_on_leave() end
+    end
+end
+
 function ZenSettingsPage:backToRootMenu()
+    self:_leaveNativeViews()
     self:_leaveSearch(false)
     if self.title_bar and self.title_bar.collapseSearch then
         self.title_bar:collapseSearch()
@@ -482,7 +612,7 @@ function ZenSettingsPage:backToRootMenu()
     self.item_table = self._root_items
     self.parent_id = nil
     self._pending_navigation_title = nil
-    self.itemnumber = 1
+    self.itemnumber = nil
     self.page = 1
     self:updateItems(1)
     return true
@@ -497,6 +627,7 @@ function ZenSettingsPage:backToUpperMenu(no_close)
         if not no_close then self:closeMenu() end
         return true
     end
+    local previous = self.item_table
     local parent = table.remove(self.item_table_stack)
     table.remove(self._resume_path)
     local parent_title = parent._zen_title
@@ -505,6 +636,7 @@ function ZenSettingsPage:backToUpperMenu(no_close)
     end
     parent._zen_title = parent._zen_title or parent_title
     self.item_table = parent
+    if previous._zen_on_leave then previous._zen_on_leave() end
     self.parent_id = nil
     self._pending_navigation_title = nil
     self:updateItems(1)
@@ -529,11 +661,14 @@ function ZenSettingsPage:onCloseAllMenus()
 end
 
 function ZenSettingsPage:_rememberResume()
-    if self._resume_recorded then return end
+    if self._resume_recorded or self._zen_standalone then return end
     self._resume_recorded = true
+    local items = self._search_snapshot and self._search_snapshot.item_table or self.item_table
     resume_state = {
         closed_at = os.time(),
         path = copy_resume_path(self._resume_path),
+        native_owner = items._zen_native_owner
+            and setmetatable({ items._zen_native_owner }, { __mode = "v" }) or nil,
         arrange = pending_arrange_resume and {
             opener = pending_arrange_resume.opener,
             path = copy_array(pending_arrange_resume.path),
@@ -555,9 +690,13 @@ function ZenSettingsPage:closeMenu()
     if self._closed then return true end
     self:_rememberResume()
     self._closed = true
+    self:_leaveNativeViews()
     if self._deferred_arrange_parent then
         self._deferred_arrange_parent = nil
         self.invisible = false
+    end
+    if self.title_bar and self.title_bar._cancelPendingSearch then
+        self.title_bar:_cancelPendingSearch()
     end
     if self.title_bar and self.title_bar.clearStatusRefresh then
         self.title_bar:clearStatusRefresh()
@@ -573,9 +712,14 @@ end
 
 function ZenSettingsPage:onCloseWidget()
     self:_rememberResume()
+    self._closed = true
+    self:_leaveNativeViews()
     if self._deferred_arrange_parent then
         self._deferred_arrange_parent = nil
         self.invisible = false
+    end
+    if self.title_bar and self.title_bar._cancelPendingSearch then
+        self.title_bar:_cancelPendingSearch()
     end
     if self.title_bar and self.title_bar.clearStatusRefresh then
         self.title_bar:clearStatusRefresh()
@@ -585,6 +729,37 @@ function ZenSettingsPage:onCloseWidget()
         _G.__ZEN_UI_SETTINGS_PAGE = nil
     end
     self:_flushDeferredSettingsApplies()
+    UIManager:nextTick(function()
+        local stack = UIManager._window_stack or {}
+        local top
+        for i = #stack, 1, -1 do
+            local widget = stack[i] and stack[i].widget
+            if widget and not widget.toast then top = widget; break end
+        end
+        if not top then return end
+        if top._zen_status_refresh then
+            top:_zen_status_refresh()
+        elseif top._zen_home_refresh_clock_widgets then
+            top:_zen_home_refresh_clock_widgets()
+        else
+            local FileManager = package.loaded["apps/filemanager/filemanager"]
+            local fm = FileManager and FileManager.instance
+            if fm and (top == fm or top == fm.show_parent) and fm._updateStatusBar then
+                fm:_updateStatusBar()
+            else
+                local ReaderUI = package.loaded["apps/reader/readerui"]
+                local reader = ReaderUI and ReaderUI.instance
+                if reader and (top == reader or top == reader.show_parent) then
+                    local ReaderThemes = require("common/reader_themes")
+                    if reader.document and ReaderThemes.isActive(self.plugin) then
+                        return ReaderThemes.refreshFull("all")
+                    end
+                    UIManager:setDirty(reader, "ui")
+                end
+            end
+        end
+        UIManager:setDirty("all", "full")
+    end)
     return Menu.onCloseWidget(self)
 end
 
@@ -598,8 +773,9 @@ function ZenSettingsPage:_buildSearchIndex()
         local ok, items = pcall(provider, self)
         if not ok or type(items) ~= "table" then return end
         for _i, item in ipairs(items) do
-            local label = item_text(item)
-            if label ~= "" and type(item._zen_search_open) == "function" then
+            local label = search_item_text(item)
+            if visible(item) and label ~= ""
+                    and type(item._zen_search_open) == "function" then
                 local crumbs = {}
                 for i = 2, #levels do crumbs[#crumbs + 1] = levels[i].title end
                 if not item._zen_search_breadcrumb and owner_title and owner_title ~= "" then
@@ -607,10 +783,6 @@ function ZenSettingsPage:_buildSearchIndex()
                 end
                 local breadcrumb = item._zen_search_breadcrumb or table.concat(crumbs, " › ")
                 local help_text = item.help_text
-                if type(item.help_text_func) == "function" then
-                    local help_ok, value = pcall(item.help_text_func, self)
-                    if help_ok then help_text = value end
-                end
                 index[#index + 1] = {
                     item = item,
                     label = label,
@@ -631,17 +803,15 @@ function ZenSettingsPage:_buildSearchIndex()
         seen[items] = true
         for item_index, item in ipairs(items or {}) do
             if type(item) == "table" then
-                local label = item_text(item)
+                local label = search_item_text(item)
                 if label ~= "" then
                     local crumbs = {}
                     for i = 2, #levels do crumbs[#crumbs + 1] = levels[i].title end
                     local breadcrumb = table.concat(crumbs, " › ")
                     local help_text = item.help_text
-                    if type(item.help_text_func) == "function" then
-                        local ok, value = pcall(item.help_text_func, self)
-                        if ok then help_text = value end
-                    end
-                    local sub_items = self:_resolveSubItems(item)
+                    -- ponytail: Dynamic children stay unindexed; add search-only providers where needed.
+                    local sub_items = type(item.sub_item_table_func) ~= "function"
+                        and self:_resolveSubItems(item) or nil
                     index[#index + 1] = {
                         item = item,
                         index = item_index,
@@ -661,7 +831,7 @@ function ZenSettingsPage:_buildSearchIndex()
                         child_levels[#child_levels + 1] = {
                             title = sub_items._zen_title,
                             items = sub_items,
-                            selector = resume_selector(items, item, label),
+                            selector = resume_selector(items, item, label, search_item_text),
                         }
                         walk(sub_items, child_levels, depth + 1)
                     end
@@ -685,6 +855,7 @@ function ZenSettingsPage:_searchResults(query)
             results[#results + 1] = {
                 text = entry.label,
                 icon_glyph = source.icon_glyph,
+                icon_file = source.icon_file,
                 icon_width = source.icon_width,
                 radio = source.radio,
                 checked = source.checked,
@@ -694,6 +865,7 @@ function ZenSettingsPage:_searchResults(query)
                 _zen_settings_row = true,
                 _zen_display_text = entry.label,
                 _zen_settings_breadcrumb = entry.breadcrumb,
+                _zen_settings_submenu = has_declared_submenu(source, entry.label),
                 _zen_has_submenu = entry.sub_items ~= nil or entry.open_callback ~= nil,
                 _zen_search_result = entry,
             }
@@ -758,6 +930,7 @@ function ZenSettingsPage:_openSearchResult(entry)
         entry.open_callback()
         return
     end
+    self:_leaveNativeViews()
     self:_leaveSearch(false)
     if self.title_bar and self.title_bar.collapseSearch then
         self.title_bar:collapseSearch()
@@ -809,6 +982,7 @@ local function schedule_open_path(page, path, reset_to_root)
     UIManager:nextTick(function()
         if page._closed then return end
         if reset_to_root then
+            page:_leaveNativeViews()
             page:_leaveSearch(false)
             if page.title_bar and page.title_bar.collapseSearch then
                 page.title_bar:collapseSearch()
@@ -824,16 +998,24 @@ end
 
 function M.show(plugin, opts)
     opts = opts or {}
+    local standalone = type(opts.root_items) == "table"
     if active_page and not active_page._closed then
-        schedule_open_path(active_page, opts.path, true)
-        return active_page
+        if not standalone and not active_page._zen_standalone then
+            schedule_open_path(active_page, opts.path, true)
+            return active_page
+        end
+        active_page:closeMenu()
     end
     install_modal_keyboard_dismissal()
     local resume
-    if resume_state then
+    if resume_state and not standalone then
         local age = os.time() - resume_state.closed_at
         if age >= 0 and age <= RESUME_TTL_SECONDS and not opts.path then
             resume = resume_state
+            if resume.native_owner
+                    and not require("modules/menu/app_launcher/native_menu").isSettingsOwner(resume.native_owner[1]) then
+                resume = nil
+            end
         end
         resume_state = nil
     end
@@ -841,13 +1023,17 @@ function M.show(plugin, opts)
     restoring_arrange_resume = resume and resume.arrange or nil
     arrange_open_context = nil
     I18n.refresh()
-    local root_items = zen_settings.build(plugin).sub_item_table
-    root_items._zen_title = _("Settings")
+    local root_items = opts.root_items
+        or require("modules/settings/zen_settings").build(plugin).sub_item_table
+    local title = opts.title or _("Settings")
+    root_items._zen_title = title
     local page = ZenSettingsPage:new{
-        title = _("Settings"),
+        title = title,
         item_table = root_items,
         _root_items = root_items,
         _initial_resume_path = resume and resume.path or nil,
+        _zen_standalone = standalone,
+        search_visible = not standalone,
         plugin = plugin,
     }
     if resume and resume.arrange then
@@ -876,15 +1062,24 @@ end
 
 function M.closeActive()
     local stack = UIManager._window_stack
-    if active_page and type(stack) == "table" then
+    local deepest_arrange_resume = pending_arrange_resume
+    if type(stack) == "table" then
         for index = #stack, 1, -1 do
             local widget = stack[index] and stack[index].widget
-            if widget == active_page then break end
+            if active_page and widget == active_page then break end
             if widget and type(widget._zen_arrange_close_all) == "function" then
                 widget:_zen_arrange_close_all()
-                break
+                if pending_arrange_resume and (not deepest_arrange_resume
+                        or #pending_arrange_resume.path > #deepest_arrange_resume.path) then
+                    deepest_arrange_resume = pending_arrange_resume
+                end
             end
         end
+    end
+    pending_arrange_resume = deepest_arrange_resume
+    if not active_page and resume_state and deepest_arrange_resume then
+        resume_state.closed_at = os.time()
+        resume_state.arrange = deepest_arrange_resume
     end
     if active_page then active_page:closeMenu() end
     return true
@@ -951,7 +1146,7 @@ function M.rememberStandaloneArrangeRoute(path, opener_text, arrange_path)
             path = copy_array(arrange_path),
         },
     }
-    return true
+    return true, resume_state.arrange
 end
 
 M.Page = ZenSettingsPage

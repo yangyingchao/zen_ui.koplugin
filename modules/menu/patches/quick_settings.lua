@@ -27,9 +27,9 @@ local function apply_quick_settings()
     local SharedState = require("common/shared_state")
     local SettingsTransition = require("common/settings_transition")
     local ButtonLabelWidth = require("common/ui/button_label_width")
-    local Bluetooth = require("common/bluetooth")
+    local Bluetooth = require("modules/menu/bluetooth/bluetooth")
     local build_brightness_slider = require("modules/menu/patches/brightness_slider")
-    local build_warmth_slider     = require("modules/menu/patches/warmth_slider")
+    local build_warmth_slider = require("modules/menu/patches/warmth_slider")
     local _ = require("gettext")
     local Screen = Device.screen
     local Dispatcher = require("dispatcher")
@@ -49,10 +49,11 @@ local function apply_quick_settings()
     end
 
     -- Resolve plugin icons/ dir from this file's path at apply-time.
+    local _plugin_root
     local _icons_dir
     do
-        local root = require("common/plugin_root")
-        if root then _icons_dir = root .. "/icons/" end
+        _plugin_root = require("common/plugin_root")
+        if _plugin_root then _icons_dir = _plugin_root .. "/icons/" end
     end
 
     local function is_enabled()
@@ -114,6 +115,9 @@ local function apply_quick_settings()
             notion = false,
             streak = false,
             opds = false,
+            airplanemode = false,
+            zen_settings = false,
+            launcher = false,
             filebrowser = false,
             tailscale = false,
             zenfm = false,
@@ -132,8 +136,16 @@ local function apply_quick_settings()
         show_labels = true,
         show_frontlight = true,
         show_warmth = true,
+        unified_light_slider = true,
+        gyro_label = "",
+        gyro_icon = "quick_rotate",
+        zen_settings_label = "",
+        zen_settings_icon = "zen_ui",
+        launcher_label = "",
+        launcher_icon = "app_launcher",
         rotate_action = "cycle",
         screenshot_timer_seconds = 3,
+        tailscale_toggle_wifi = false,
         custom_buttons = {},  -- array of { id, label, icon, action }
         next_custom_id = 0,
         layout_version = 2,
@@ -291,12 +303,10 @@ local function apply_quick_settings()
         return Screen.DEVICE_ROTATED_CLOCKWISE
     end
 
-    -- Returns true if a plugin slot is loaded in the active UI; fails open if no UI yet.
-    local function hasPlugin(slot)
-        local ok_f, FM = pcall(require, "apps/filemanager/filemanager")
-        local ok_r, RU = pcall(require, "apps/reader/readerui")
-        local ui = (ok_f and FM.instance) or (ok_r and RU.instance)
-        return ui == nil or ui[slot] ~= nil
+    local function hasPlugin(name)
+        local meta = zen_plugin.config and zen_plugin.config._meta
+        local installed = type(meta) == "table" and meta.installed_plugins
+        return type(installed) ~= "table" or installed[name:lower()] == true
     end
 
     local function hasAnyPlugin(slots)
@@ -382,6 +392,12 @@ local function apply_quick_settings()
         if plugin and isCallable(plugin[tailscale_plugin.toggle]) then
             return plugin
         end
+    end
+
+    local function isTailscaleRunning(plugin)
+        if not (plugin and isCallable(plugin.isRunning)) then return false end
+        local ok, running = pcall(plugin.isRunning, plugin)
+        return ok and running == true
     end
 
     local zenfm_plugin = {
@@ -478,11 +494,21 @@ local function apply_quick_settings()
         end
     end
 
-    local function refreshWifiQuickSettings(touch_menu)
+    local function refreshWifiQuickSettings(touch_menu, retries)
+        local network = NetworkMgr:isWifiOn() and NetworkMgr.getCurrentNetwork
+            and NetworkMgr:getCurrentNetwork()
+        local remaining = retries or 45
+        if NetworkMgr:isWifiOn()
+            and (not network or type(network.ssid) ~= "string" or network.ssid == "")
+            and remaining > 0
+        then
+            if not retries then refreshQuickSettings(touch_menu) end
+            UIManager:scheduleIn(1, function()
+                refreshWifiQuickSettings(touch_menu, remaining - 1)
+            end)
+            return
+        end
         refreshQuickSettings(touch_menu)
-        UIManager:scheduleIn(1, function()
-            refreshQuickSettings(touch_menu)
-        end)
     end
 
     local function isWifiConnected()
@@ -490,9 +516,10 @@ local function apply_quick_settings()
             and (type(NetworkMgr.isConnected) ~= "function" or NetworkMgr:isConnected())
     end
 
-    local function isWifiConnecting()
-        return not isWifiConnected()
-            and (NetworkMgr.pending_connection or NetworkMgr.pending_connectivity_check)
+    local function isWifiDimmed()
+        return NetworkMgr.isWifiChanging and NetworkMgr:isWifiChanging()
+            or not isWifiConnected()
+            and (NetworkMgr:isWifiOn() or NetworkMgr.pending_connection or NetworkMgr.pending_connectivity_check)
     end
 
     -- ============================================================
@@ -501,21 +528,39 @@ local function apply_quick_settings()
 
     local open_quick_setting_settings
 
+    local function resolveConfiguredIcon(name, fallback)
+        local path = utils.resolveIcon(_icons_dir, name)
+        if path then return path end
+        for _i, item in ipairs(utils.getIconPickerList(_plugin_root)) do
+            if item.name == name then return item.file end
+        end
+        return utils.resolveLocalIcon(_icons_dir, fallback)
+    end
+
     local button_defs = {
         bluetooth = {
             icon = "quick_bluetooth",
             label = _("Bluetooth"),
             visible_func = Bluetooth.isAvailable,
             active_func = Bluetooth.isEnabled,
+            dim_func = Bluetooth.isChanging,
             callback = function(touch_menu)
-                if Bluetooth.toggle() then
-                    UIManager:scheduleIn(0.5, function()
-                        Bluetooth.logState("0.5 s after control toggle")
-                        if touch_menu.item_table and touch_menu.item_table.panel then
-                            touch_menu:updateItems(1)
-                        end
-                    end)
-                end
+                Bluetooth.toggle(function(success, reason)
+                    if success then
+                        UIManager:broadcastEvent(Event:new("BluetoothStateChanged"))
+                    else
+                        local InfoMessage = require("ui/widget/infomessage")
+                        UIManager:show(InfoMessage:new{ text = reason or _("Could not change Bluetooth power.") })
+                    end
+                    if touch_menu.item_table and touch_menu.item_table.panel then
+                        touch_menu:updateItems(1)
+                    end
+                end)
+            end,
+            hold_callback = function(touch_menu)
+                return require("modules/menu/bluetooth_switcher").open(function()
+                    refreshQuickSettings(touch_menu)
+                end, false, zen_plugin)
             end,
         },
         wifi = {
@@ -531,34 +576,17 @@ local function apply_quick_settings()
                 return _("Wi-Fi")
             end,
             active_func = isWifiConnected,
-            dim_func = isWifiConnecting,
+            dim_func = isWifiDimmed,
             callback = function(touch_menu)
-                if isWifiConnecting() then return end
-                -- Explicit toggles need KOReader's scan/DHCP flow; async restore is resume-only.
-                local wifi_menu = NetworkMgr:getWifiMenuTable()
-                wifi_menu.callback({
-                    updateItems = function()
-                        refreshWifiQuickSettings(touch_menu)
-                    end,
-                })
+                local refresh = function() refreshWifiQuickSettings(touch_menu) end
+                require("modules/menu/network_switcher").toggleWifi({
+                    updateItems = refresh,
+                }, refresh, false, zen_plugin)
             end,
             hold_callback = function(touch_menu)
-                -- Long-hold: (re)connect and show the AP picker.
-                -- If Wi-Fi is currently on, turn it off first, then bring it
-                -- back up with long_press=true so the network list appears.
-                -- If already off, go straight to the long-press connect flow.
-                local function do_connect()
-                    NetworkMgr:toggleWifiOn(function()
-                        refreshWifiQuickSettings(touch_menu)
-                    end, true, true)
-                end
-                if NetworkMgr:isWifiOn() then
-                    NetworkMgr:toggleWifiOff(function()
-                        do_connect()
-                    end, true)
-                else
-                    do_connect()
-                end
+                return require("modules/menu/network_switcher").open(function()
+                    refreshWifiQuickSettings(touch_menu)
+                end, false, zen_plugin)
             end,
         },
         night = {
@@ -609,8 +637,11 @@ local function apply_quick_settings()
             end,
         },
         gyro = {
-            icon = "gyro",
-            label = _("Gyro"),
+            icon = resolveConfiguredIcon(
+                type(config.gyro_icon) == "string" and config.gyro_icon ~= ""
+                    and config.gyro_icon or "quick_rotate", "quick_rotate"),
+            label = type(config.gyro_label) == "string" and config.gyro_label ~= ""
+                and config.gyro_label or _("Autorotate"),
             visible_func = function() return Device:hasGSensor() end,
             active_func = function()
                 return G_reader_settings:nilOrFalse("input_ignore_gsensor")
@@ -784,6 +815,55 @@ local function apply_quick_settings()
                 UIManager:broadcastEvent(Event:new("ShowOPDSCatalog"))
             end,
         },
+        airplanemode = {
+            icon = utils.resolveLocalIcon(_icons_dir, "airplane"),
+            label = _("Airplane mode"),
+            visible_func = function() return hasPlugin("airplanemode") end,
+            callback = function(touch_menu)
+                touch_menu:closeMenu()
+                UIManager:nextTick(function()
+                    Dispatcher:execute({ airplanemode_toggle = true })
+                end)
+            end,
+        },
+        zen_settings = {
+            icon = resolveConfiguredIcon(
+                type(config.zen_settings_icon) == "string" and config.zen_settings_icon ~= ""
+                    and config.zen_settings_icon or "zen_ui", "zen_ui"),
+            label = type(config.zen_settings_label) == "string"
+                and config.zen_settings_label ~= ""
+                and config.zen_settings_label or _("Settings"),
+            disabled_func = function()
+                local lockdown = zen_plugin.config and zen_plugin.config.lockdown
+                local features = zen_plugin.config and zen_plugin.config.features
+                return type(lockdown) == "table" and lockdown.disable_settings_panel == true
+                    and type(features) == "table" and features.lockdown_mode == true
+            end,
+            callback = function(touch_menu)
+                UIManager:nextTick(function()
+                    touch_menu:closeMenu()
+                    require("modules/settings/zen_settings_page").show(zen_plugin)
+                end)
+            end,
+        },
+        launcher = {
+            icon = resolveConfiguredIcon(
+                type(config.launcher_icon) == "string" and config.launcher_icon ~= ""
+                    and config.launcher_icon or "app_launcher", "app_launcher"),
+            label = type(config.launcher_label) == "string" and config.launcher_label ~= ""
+                and config.launcher_label or _("Launcher"),
+            callback = function(touch_menu)
+                local open = rawget(_G, "__ZEN_UI_OPEN_APP_LAUNCHER")
+                if type(open) ~= "function" then
+                    local ok, apply = pcall(require, "modules/menu/patches/app_launcher")
+                    if ok and type(apply) == "function" then apply(zen_plugin) end
+                    open = rawget(_G, "__ZEN_UI_OPEN_APP_LAUNCHER")
+                end
+                if type(open) ~= "function" or open(touch_menu) == false then
+                    showUnavailable()
+                end
+            end,
+        },
         localsend = {
             icon = "quick_localsend",
             label = _("LocalSend"),
@@ -807,10 +887,7 @@ local function apply_quick_settings()
             label = _("Tailscale"),
             visible_func = function() return getTailscalePlugin() ~= nil end,
             active_func = function()
-                local plugin = getTailscalePlugin()
-                if not (plugin and isCallable(plugin.isRunning)) then return false end
-                local ok, running = pcall(plugin.isRunning, plugin)
-                return ok and running == true
+                return isTailscaleRunning(getTailscalePlugin())
             end,
             callback = function(touch_menu)
                 local plugin = getTailscalePlugin()
@@ -818,9 +895,25 @@ local function apply_quick_settings()
                     showUnavailable()
                     return
                 end
-                plugin:onToggleTailscale(function()
-                    refreshQuickSettings(touch_menu)
-                end)
+                local was_running = isTailscaleRunning(plugin)
+                local function refresh() refreshQuickSettings(touch_menu) end
+                local function toggle()
+                    plugin:onToggleTailscale(function()
+                        if was_running and config.tailscale_toggle_wifi == true
+                                and NetworkMgr:isWifiOn() then
+                            NetworkMgr:toggleWifiOff(refresh, true)
+                        else
+                            refresh()
+                        end
+                    end)
+                end
+                if was_running or isWifiConnected() then
+                    toggle()
+                elseif config.tailscale_toggle_wifi == true then
+                    NetworkMgr:toggleWifiOn(toggle, false, true)
+                else
+                    NetworkMgr:runWhenConnected(toggle)
+                end
             end,
         },
         zenfm = {
@@ -834,7 +927,7 @@ local function apply_quick_settings()
                     showUnavailable()
                     return
                 end
-                plugin:onToggleZenFM()
+                plugin:onToggleZenFM(touch_menu)
                 refreshQuickSettings(touch_menu)
             end,
             hold_callback = function(touch_menu)
@@ -842,7 +935,7 @@ local function apply_quick_settings()
             end,
         },
         zen = {
-            icon = "quick_zen",
+            icon = utils.resolveLocalIcon(_icons_dir, "quick_zen"),
             label = _("Zen"),
             active_func = function()
                 local features = zen_plugin.config and zen_plugin.config.features
@@ -953,12 +1046,11 @@ local function apply_quick_settings()
             end,
         },
         battery_stats = {
-            icon = "quick_battery",
+            icon = utils.resolveLocalIcon(_icons_dir, "quick_battery"),
             label = _("Battery"),
-            visible_func = function() return hasPlugin("batterystat") end,
             callback = function(touch_menu)
                 touch_menu:closeMenu()
-                UIManager:broadcastEvent(Event:new("ShowBatteryStatistics"))
+                require("modules/settings/battery_stats_menu").open(zen_plugin)
             end,
         },
         kosync = {
@@ -1195,6 +1287,16 @@ local function apply_quick_settings()
         if id == "incognito" then
             return require("modules/global/patches/incognito_mode").timeoutMenuItems(zen_plugin)
         end
+        if id == "tailscale" then
+            return {{
+                text = _("Toggle Wi-Fi with Tailscale"),
+                checked_func = function() return config.tailscale_toggle_wifi == true end,
+                callback = function()
+                    config.tailscale_toggle_wifi = config.tailscale_toggle_wifi ~= true
+                    zen_plugin:saveConfig()
+                end,
+            }}
+        end
         if id == "zenfm" then
             local plugin = getCandidatePlugin(zenfm_plugin)
             if not (plugin and isCallable(plugin.settings_menu)) then return {} end
@@ -1286,6 +1388,10 @@ local function apply_quick_settings()
         local padding = Screen:scaleBySize(10)
         local inner_width = panel_width - padding * 2
         local powerd = Device:getPowerDevice()
+        local meta = zen_plugin.config and zen_plugin.config._meta
+        local panel_config = type(meta) == "table"
+                and meta.quickstart_menu_tour_pending == true
+            and config_default or config
 
         local refs = {
             buttons = {},
@@ -1300,8 +1406,8 @@ local function apply_quick_settings()
         install_custom_button_defs()
 
         local visible_buttons = {}
-        for _i, id in ipairs(config.button_order) do
-            if config.show_buttons[id] and button_defs[id] then
+        for _i, id in ipairs(panel_config.button_order) do
+            if panel_config.show_buttons[id] and button_defs[id] then
                 local def = button_defs[id]
                 if not def.visible_func or def.visible_func() then
                     table.insert(visible_buttons, { id = id, def = def })
@@ -1382,7 +1488,7 @@ local function apply_quick_settings()
                 align = "center",
                 circle,
             }
-            if config.show_labels ~= false then
+            if panel_config.show_labels ~= false then
                 local label_max_width = ButtonLabelWidth.maxWidth(action_cell_width, label_side_padding)
                 group[#group + 1] = VerticalSpan:new{ width = Screen:scaleBySize(2) }
                 group[#group + 1] = TextWidget:new{
@@ -1409,7 +1515,7 @@ local function apply_quick_settings()
                 local dimmed   = def.dim_func      and def.dim_func()      or false
                 -- Disabled takes priority: don't show active styling on a greyed-out button.
                 local btn_widget, btn_circle = makeActionButton(
-                    def.icon, label_text, active and not disabled, disabled, dimmed
+                    def.icon, label_text, active and not disabled and not dimmed, disabled, dimmed
                 )
 
                 table.insert(refs.buttons, {
@@ -1431,35 +1537,39 @@ local function apply_quick_settings()
             end
         end
 
-        -- ----- Frontlight / warmth sliders -----
+        -- ----- Frontlight / warmth controls -----
 
         local medium_size     = Font.sizemap and Font.sizemap["ffont"] or 24
         local medium_font     = library_font.getFace(medium_size)
         local small_btn_size  = Screen:scaleBySize(14)
         local small_btn_width = Screen:scaleBySize(56)
-        local toggle_width    = Screen:scaleBySize(56)
         local slider_gap      = Screen:scaleBySize(4)
         local slider_width    = inner_width - 2 * small_btn_width - 2 * slider_gap
 
+        local has_frontlight = Device:hasFrontlight()
+        local has_warmth = Device:hasNaturalLight()
+        local use_unified = has_frontlight and has_warmth
+            and panel_config.unified_light_slider ~= false
         local slider_opts = {
             inner_width     = inner_width,
             slider_width    = slider_width,
             small_btn_width = small_btn_width,
-            toggle_width    = toggle_width,
             slider_gap      = slider_gap,
             medium_font     = medium_font,
             small_btn_size  = small_btn_size,
             powerd          = powerd,
             refs            = refs,
+            show_frontlight = has_frontlight and (use_unified or panel_config.show_frontlight),
+            show_warmth     = has_warmth and (use_unified or panel_config.show_warmth),
+            unified         = use_unified,
         }
 
-        local fl_group = VerticalGroup:new{ align = "center" }
-        if config.show_frontlight and Device:hasFrontlight() then
-            fl_group = build_brightness_slider(touch_menu, slider_opts)
+        local light_group
+        if slider_opts.show_frontlight then
+            light_group = build_brightness_slider(touch_menu, slider_opts)
         end
-
-        local warmth_group = VerticalGroup:new{ align = "center" }
-        if config.show_warmth and Device:hasNaturalLight() then
+        local warmth_group
+        if slider_opts.show_warmth and (not slider_opts.show_frontlight or not use_unified) then
             warmth_group = build_warmth_slider(touch_menu, slider_opts)
         end
 
@@ -1492,10 +1602,10 @@ local function apply_quick_settings()
             table.insert(panel, VerticalSpan:new{ width = Screen:scaleBySize(8) })
         end
 
-        if #fl_group > 0 then
-            table.insert(panel, fl_group)
+        if light_group then
+            table.insert(panel, light_group)
         end
-        if #warmth_group > 0 then
+        if warmth_group then
             table.insert(panel, warmth_group)
         end
         table.insert(panel, VerticalSpan:new{ width = Screen:scaleBySize(8) })
@@ -1514,6 +1624,16 @@ local function apply_quick_settings()
     end)
 
     local TouchMenu = require("ui/widget/touchmenu")
+
+    for _i, event_name in ipairs({
+        "onNetworkConnected", "onNetworkDisconnected", "onNetworkStateChanged", "onBluetoothStateChanged",
+    }) do
+        local original = TouchMenu[event_name]
+        TouchMenu[event_name] = function(self, ...)
+            if original then original(self, ...) end
+            refreshQuickSettings(self)
+        end
+    end
 
     -- Open launcher first when requested; otherwise Controls remains the default.
     local orig_init = TouchMenu.init

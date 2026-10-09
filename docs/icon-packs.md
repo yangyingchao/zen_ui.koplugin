@@ -1,8 +1,8 @@
 ---
 title: Custom Icon Packs
-category: Extras
+category: Interface
 summary: Install or create icon packs for ZenOS and its KOReader menu surfaces
-settingsPath: Zen Settings > Extras > Custom icon pack
+settingsPath: Zen Settings > Interface > Custom icons > Custom icon pack
 order: 65
 ---
 
@@ -23,7 +23,7 @@ A typical installation is:
 ```
 
 Copy either a pack folder or ZIP into `/koreader/icons/zen`, then restart
-KOReader or open **Zen Settings > Extras > Custom icon pack**. ZenOS validates and
+KOReader or open **Zen Settings > Interface > Custom icons > Custom icon pack**. ZenOS validates and
 unpacks ZIP files automatically. A successfully installed ZIP is deleted.
 
 If the same pack is already installed, a valid ZIP replaces it atomically. The
@@ -31,7 +31,7 @@ existing folder is restored if validation or extraction fails. Invalid ZIPs are
 kept so they can be inspected or replaced. Installation errors are shown in the
 pack submenu and written to the KOReader log.
 
-Turn on **Enable custom icons**, choose the unpacked pack, and restart KOReader.
+Turn on the **Custom icons** switch under **Zen Settings > Interface**, choose the unpacked pack, and restart KOReader.
 Packs are never selected automatically, so the bundled ZenOS and KOReader
 icons remain the default.
 
@@ -79,7 +79,8 @@ Icons must be `.svg` or `.png` files at the pack root. SVG is preferred when
 both formats exist. Use a transparent background and artwork that remains
 legible in black and white on e-ink screens. Every safely named root icon is
 loaded: it can replace a matching ZenOS or KOReader icon, or be selected for
-a Navbar or Launcher icon.
+a Navbar or Launcher icon. Use `large_chevron_up.svg` to replace the large
+up chevron in the top-menu footer.
 
 The sample ZIP also includes `ICON-LIST.md`, a human-readable catalog of every
 included icon, its exact replacement filename, and the Navbar, top-menu,
@@ -93,7 +94,7 @@ existing loose files directly under `/koreader/icons` continue to work.
 
 If a pack is removed while selected, ZenOS starts with fallback icons and
 shows the selection as unavailable. Choose another pack or **Loose icons**, or
-turn off **Enable custom icons**, then restart. A failed ZIP installation never
+turn off the **Custom icons** switch in **Interface**, then restart. A failed ZIP installation never
 removes the previously installed version.
 
 ZenOS normally recovers its own hidden `.zen-stage-<id>` and

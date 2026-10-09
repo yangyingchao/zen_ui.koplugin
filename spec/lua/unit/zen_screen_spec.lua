@@ -3,9 +3,12 @@ describe("Zen screen", function()
     local saved_modules
     local closed
     local dirty_modes
+    local dirty_regions
     local inverted
     local image_widgets
+    local scroll_widgets
     local text_widgets
+    local color_screen
 
     local module_names = {
         "gettext",
@@ -63,9 +66,12 @@ describe("Zen screen", function()
         end
         closed = 0
         dirty_modes = {}
+        dirty_regions = {}
         inverted = {}
         image_widgets = {}
+        scroll_widgets = {}
         text_widgets = {}
+        color_screen = false
 
         ZenSpec.replace("gettext", function(text) return text end)
         ZenSpec.replace("ffi/blitbuffer", {
@@ -83,6 +89,7 @@ describe("Zen screen", function()
             hasKeys = function() return true end,
             hasDPad = function() return true end,
             isTouchDevice = function() return false end,
+            hasColorScreen = function() return color_screen end,
         })
         ZenSpec.replace("device/input", {
             group = { PgFwd = "PgFwd", PgBack = "PgBack", Back = "Back" },
@@ -94,9 +101,10 @@ describe("Zen screen", function()
         ZenSpec.replace("ui/uimanager", {
             close = function() closed = closed + 1 end,
             scheduleIn = function() end,
-            setDirty = function(_self, _widget, mode)
-                if type(mode) == "function" then mode = mode() end
+            setDirty = function(_self, _widget, mode, region)
+                if type(mode) == "function" then mode, region = mode() end
                 dirty_modes[#dirty_modes + 1] = mode
+                dirty_regions[#dirty_regions + 1] = region
             end,
         })
         ZenSpec.replace("ui/widget/container/inputcontainer", InputContainer)
@@ -104,7 +112,29 @@ describe("Zen screen", function()
             image_widgets[#image_widgets + 1] = values
             return text_widget(values)
         end })
-        ZenSpec.replace("ui/widget/scrolltextwidget", { new = function(_self, values) return text_widget(values) end })
+        ZenSpec.replace("ui/widget/scrolltextwidget", {
+            updateScrollBar = function(widget, is_partial)
+                if not widget.for_measurement_only then
+                    package.loaded["ui/uimanager"]:setDirty(widget.dialog, function()
+                        return is_partial and "partial" or "ui", widget.dimen
+                    end)
+                end
+            end,
+            new = function(class, values)
+                scroll_widgets[#scroll_widgets + 1] = {
+                    for_measurement_only = values.for_measurement_only,
+                }
+                values.text_widget = { for_measurement_only = values.for_measurement_only }
+                values.updateScrollBar = values.updateScrollBar or class.updateScrollBar
+                values:updateScrollBar()
+                values = text_widget(values)
+                values.dimen = { x = 0, y = 0, w = values.width, h = values.height }
+                values.paintTo = function(widget, _bb, x, y)
+                    widget.dimen.x, widget.dimen.y = x, y
+                end
+                return values
+            end,
+        })
         ZenSpec.replace("ui/widget/textboxwidget", { new = function(_self, values) return text_widget(values) end })
         ZenSpec.replace("ui/widget/textwidget", { new = function(_self, values)
             text_widgets[#text_widgets + 1] = values
@@ -146,6 +176,48 @@ describe("Zen screen", function()
     local function new_screen(values)
         return ZenScreen:new(values or {})
     end
+
+    it("uses a flashing initial refresh on color screens", function()
+        color_screen = true
+        local screen = new_screen{ title = "ZenOS", scroll_text = "Changes" }
+        screen:onShow()
+        assert.is_true(screen.covers_fullscreen)
+        assert.are.equal("flashui", dirty_modes[#dirty_modes])
+    end)
+
+    it("suppresses the scroll widget's redundant initial refresh", function()
+        color_screen = true
+        local screen = new_screen{ title = "ZenOS", scroll_text = "Changes" }
+        screen:paintTo({ paintRect = function() end, invertRect = function() end }, 0, 0)
+
+        assert.is_true(scroll_widgets[1].for_measurement_only)
+        assert.is_false(screen._scroll_text_w.for_measurement_only)
+        assert.is_false(screen._scroll_text_w.text_widget.for_measurement_only)
+        assert.are.same({}, dirty_modes)
+    end)
+
+    it("limits color-screen changelog refreshes to the scroll container", function()
+        color_screen = true
+        local screen = new_screen{ title = "ZenOS", scroll_text = "Changes" }
+        screen:paintTo({ paintRect = function() end, invertRect = function() end }, 0, 0)
+        dirty_modes = {}
+        screen._scroll_text_w:updateScrollBar(true)
+        screen._scroll_text_w:updateScrollBar()
+
+        assert.are.same({ "partial", "ui" }, dirty_modes)
+        assert.are.same({ screen._scroll_rect, screen._scroll_rect }, dirty_regions)
+    end)
+
+    it("limits monochrome changelog refreshes to the scroll container", function()
+        local screen = new_screen{ title = "ZenOS", scroll_text = "Changes" }
+        screen:paintTo({ paintRect = function() end, invertRect = function() end }, 0, 0)
+        dirty_modes = {}
+        screen._scroll_text_w:updateScrollBar(true)
+        screen._scroll_text_w:updateScrollBar()
+
+        assert.are.same({ "partial", "ui" }, dirty_modes)
+        assert.are.same({ screen._scroll_rect, screen._scroll_rect }, dirty_regions)
+    end)
 
     it("focuses the primary action and confirms the selected button", function()
         local primary_actions = 0

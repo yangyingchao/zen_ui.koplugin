@@ -8,11 +8,15 @@ local PATCH_MODULES = {
     menu_top_swipe         = "modules/global/patches/menu_top_swipe",
     opds                   = "modules/global/patches/opds",
     cloud_storage_home     = "modules/global/patches/cloud_storage_home",
+    kindle_autosuspend_resume = "modules/global/patches/kindle_autosuspend_resume",
     kindle_network_profile_guard = "modules/global/patches/kindle_network_profile_guard",
+    kobo_bluetooth_fix     = "modules/global/patches/kobo_bluetooth_fix",
+    nonblocking_wifi       = "modules/global/patches/nonblocking_wifi",
     lockdown_mode          = "modules/global/patches/lockdown_mode",
     incognito_mode         = "modules/global/patches/incognito_mode",
     menu_font              = "modules/global/patches/menu_font",
     unified_title_style    = "modules/global/patches/unified_title_style",
+    responsive_keyboard    = "modules/global/patches/responsive_keyboard",
 }
 
 local function run_patch(logger, plugin, feature, fn)
@@ -61,6 +65,13 @@ end
 function M.init(logger, plugin)
     if initialized then return true end
 
+    if plugin.config.features.zen_keyboard ~= false then
+        local responsive_keyboard_fn = load_patch("responsive_keyboard")
+        if responsive_keyboard_fn then
+            run_patch(logger, plugin, "responsive_keyboard", responsive_keyboard_fn)
+        end
+    end
+
     local night_mode_schedule_fn = load_patch("night_mode_schedule")
     if night_mode_schedule_fn then
         run_patch(logger, plugin, "night_mode_schedule", night_mode_schedule_fn)
@@ -97,6 +108,11 @@ function M.init(logger, plugin)
         run_patch(logger, plugin, "cloud_storage_home", cloud_storage_home_fn)
     end
 
+    local kindle_autosuspend_resume_fn = load_patch("kindle_autosuspend_resume")
+    if kindle_autosuspend_resume_fn then
+        run_patch(logger, plugin, "kindle_autosuspend_resume", kindle_autosuspend_resume_fn)
+    end
+
     local kindle_network_profile_guard_fn = load_patch("kindle_network_profile_guard")
     if kindle_network_profile_guard_fn then
         run_patch(logger, plugin, "kindle_network_profile_guard", kindle_network_profile_guard_fn)
@@ -130,25 +146,57 @@ function M.init(logger, plugin)
     -- going through Device:_afterResume.
     local Device = require("device")
     local UIManager = require("ui/uimanager")
+    if Device.isKobo and Device:isKobo() then
+        require("modules/menu/network_adapters/kobo").install(require("ui/network/manager"))
+        if Device.isMTK and Device:isMTK() then
+            local kobo_bluetooth_fix_fn = load_patch("kobo_bluetooth_fix")
+            if kobo_bluetooth_fix_fn then
+                run_patch(logger, plugin, "kobo_bluetooth_fix", kobo_bluetooth_fix_fn)
+            end
+        end
+    end
+    local nonblocking_wifi_fn = load_patch("nonblocking_wifi")
+    if nonblocking_wifi_fn then
+        run_patch(logger, plugin, "nonblocking_wifi", nonblocking_wifi_fn)
+    end
     local SCHEDULE_STATES = {
         "__ZEN_UI_NIGHT_SCHEDULE",
         "__ZEN_UI_BRIGHTNESS_SCHEDULE",
         "__ZEN_UI_WARMTH_SCHEDULE",
     }
+    local FRONTLIGHT_SCHEDULE_STATES = {
+        "__ZEN_UI_BRIGHTNESS_SCHEDULE",
+        "__ZEN_UI_WARMTH_SCHEDULE",
+    }
 
-    local function reschedule_schedules()
-        for _i, name in ipairs(SCHEDULE_STATES) do
+    local function reschedule_states(states)
+        for _i, name in ipairs(states) do
             local state = rawget(_G, name)
             if type(state) == "table" then
                 local fn = state.force_reschedule or state.reschedule
+                -- Avoid redundant synchronous LIPC writes while Kindle powerd is waking.
+                if name ~= "__ZEN_UI_NIGHT_SCHEDULE" and Device.isKindle and Device:isKindle() then
+                    fn = state.reschedule
+                end
                 if type(fn) == "function" then pcall(fn) end
             end
         end
     end
 
+    local function reschedule_schedules()
+        reschedule_states(SCHEDULE_STATES)
+    end
+
+    local function reapply_frontlight_schedules()
+        reschedule_states(FRONTLIGHT_SCHEDULE_STATES)
+    end
+
     local function schedule_resume_reapply()
         UIManager:unschedule(reschedule_schedules)
+        UIManager:unschedule(reapply_frontlight_schedules)
         UIManager:scheduleIn(0.1, reschedule_schedules)
+        -- Some frontlights ignore writes immediately after resume.
+        UIManager:scheduleIn(1.5, reapply_frontlight_schedules)
     end
 
     if type(UIManager.broadcastEvent) == "function" then
@@ -156,6 +204,9 @@ function M.init(logger, plugin)
         UIManager.broadcastEvent = function(self, event, ...)
             if event and event.handler == "onResume" then
                 schedule_resume_reapply()
+            elseif event and event.handler == "onSuspend" then
+                UIManager:unschedule(reschedule_schedules)
+                UIManager:unschedule(reapply_frontlight_schedules)
             end
             return orig_broadcastEvent(self, event, ...)
         end
@@ -192,13 +243,6 @@ function M.init(logger, plugin)
                 pcall(Screen.setHWNightmode, Screen, want)
                 require("ui/uimanager"):setDirty("all", "full")
             end
-            -- KOReader restores Device.orig_hw_nightmode on exit (the HW flag it
-            -- believes the OS had before launch). After a crash the persisted
-            -- inversion is KOReader's own, but boot mistakes it for the native
-            -- state, so on exit it re-inverts the Kindle home screen and covers.
-            -- The Kindle native state is never inverted (the flag is KOReader's),
-            -- so pin orig back to false to hand the OS a clean screen on exit.
-            Device.orig_hw_nightmode = false
         end
     end
 

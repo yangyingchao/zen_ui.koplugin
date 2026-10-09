@@ -1,9 +1,9 @@
 ---
 title: Launcher
-category: Launcher
+category: Interface
 summary: Customizable app launcher with action buttons, plugin buttons, and folders.
-settingsPath: Zen Settings > Launcher
-order: 40
+settingsPath: Zen Settings > Interface > Launcher
+order: 47
 ---
 
 <!-- Documentation current through ZenOS v3.0.0. -->
@@ -31,10 +31,12 @@ Launcher adds a configurable tab to the ZenOS menu. It can create shortcut butto
 - Add action buttons backed by dispatcher actions.
 - Add buttons that run a chosen Controls control.
 - Add plugin buttons from launchable plugin menus found on the device.
+- Automatically add launchable plugin menus for new plugins installed by ZenPM and remove those buttons when ZenPM uninstalls their plugins. Existing and manually added buttons are left unchanged.
 - Add context-aware KOReader submenu buttons, such as Network, Tools, or Style tweaks.
 - Add folders and arrange buttons inside each folder.
-- Insert a row break to start later buttons on a new row.
+- Insert a row break to start later buttons on a new row, with an optional centered title.
 - Configure each button or folder label and icon.
+- Mark any button or folder as a reader action for the library filter.
 - Move Control, action, plugin-menu, and KOReader-menu buttons into folders or back to the root launcher.
 
 ## Setting reference
@@ -45,17 +47,19 @@ Launcher adds a configurable tab to the ZenOS menu. It can create shortcut butto
 | Buttons | Opens the launcher button arranger. |
 | Book switcher | Shows recent books as a launcher page, optionally only while reading. |
 | Book details | Shows information for the current book as a reader-only launcher page. |
+| Book details > Items | Toggles and orders read time, time remaining, pages today, time today, pages, and the progress bar. Today totals include all books read since local midnight. |
 | Order | Arranges the Book details, Book switcher, and Buttons pages. |
 | Open menu to Launcher | Opens the top menu on the Launcher tab. |
 | Show labels | Shows launcher button labels. Enabled by default; disabling it hides the labels. |
-| Hide reader actions in library | When enabled, action buttons bound to reader-only dispatcher actions are hidden (and inactive) while the launcher is opened from the library. Disabled by default. |
+| Hide reader actions in library | When enabled, buttons marked as reader actions are hidden (and inactive) while the launcher is opened from the library. Disabled by default. |
+| Button or folder > Reader action | Includes the button in the library filter. Defaults to enabled for reader-only dispatcher actions and disabled for all other buttons. Can be toggled for any button. |
 | Buttons > Add > Open folder | Adds an independently configured folder destination button. This is separate from a Launcher folder used to group buttons. |
 | Buttons > Add > Specific tag | Adds a button that opens one selected tag. |
 | Buttons > Add > Control | Adds a launcher button that runs a selected Controls control. |
 | Buttons > Add > Action | Adds a launcher button that runs a dispatcher action, with a suggested icon. |
 | Buttons > Add > Plugin Menu | Scans for launchable plugin menus and adds the selected plugin menu as a launcher button with a suggested icon. |
 | Buttons > Add > KOReader menu | Adds a native KOReader submenu available in the current library or reader context. |
-| Buttons > Add > Row break | Inserts a row break in the Launcher button layout. |
+| Buttons > Add > Row break | Inserts a row break in the Launcher button layout, with an optional centered title. |
 | Control button > Control | Selects the Controls control run by the button. |
 | Buttons > Add > Folder | Adds a launcher folder. |
 | Action button > Action | Selects the dispatcher action run by the button. |

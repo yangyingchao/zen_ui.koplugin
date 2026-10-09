@@ -20,6 +20,18 @@ local function closeReaderOverlays(ui)
     if not ok then error(err) end
 end
 
+local function hideRestoredItemUnderline(plugin)
+    local features = plugin and plugin.config and plugin.config.features
+    if type(features) ~= "table" or features.browser_hide_underline ~= true then return end
+    local ok_fm, FileManager = pcall(require, "apps/filemanager/filemanager")
+    if not ok_fm or not FileManager then return end
+    local chooser = FileManager.instance and FileManager.instance.file_chooser
+    local selected = chooser and chooser.selected
+    local row = selected and chooser.layout and chooser.layout[selected.y]
+    local item = row and row[selected.x]
+    if item and type(item.onUnfocus) == "function" then item:onUnfocus() end
+end
+
 function M.restoreEnabled(plugin)
     local features = plugin and plugin.config and plugin.config.features
     return type(features) == "table" and features.restore_library_view == true
@@ -61,15 +73,14 @@ function M.showFromReader(ui, plugin, opts)
     local target_tab = opts.target_tab
     local target_folder = opts.target_folder
     local target_tag = opts.target_tag
-    local return_to_default = not open_home and target_tab == nil
-        and target_folder == nil and target_tag == nil
     local restore = M.restoreEnabled(plugin)
     local outside_home = file and not paths.isInHomeDir(file)
+    local default_requested = false
     _G.__ZEN_UI_LAST_READ_FILE = file
 
     closeConfigMenuForTransition(ui)
     closeReaderOverlays(ui)
-    if M.returnToRakuyomiReader(restore, plugin) then
+    if not opts.after_close and M.returnToRakuyomiReader(restore, plugin) then
         return true
     end
 
@@ -83,20 +94,24 @@ function M.showFromReader(ui, plugin, opts)
             _G.__ZEN_UI_OPEN_TARGET_FOLDER = target_folder
         elseif target_tag then
             _G.__ZEN_UI_OPEN_TARGET_TAG = target_tag
-        elseif force_default or (return_to_default and not outside_home) then
+        elseif force_default then
             _G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB = true
+            default_requested = true
         elseif not restore and not outside_home then
             _G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB = true
-        elseif outside_home then
+            default_requested = true
+        elseif outside_home and not restore then
             _G.__ZEN_UI_KEEP_BOOK_LOCATION = true
         end
     end
 
     ui:onClose()
+    if opts.after_close then opts.after_close() end
     if can_show_file_manager then
         ui:showFileManager(file)
+        hideRestoredItemUnderline(plugin)
         -- KOReader bypasses FileManager.showFiles when an instance survived teardown.
-        if force_default and rawget(_G, "__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB") == true then
+        if default_requested and rawget(_G, "__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB") == true then
             local open_default = rawget(_G, "__ZEN_UI_NAVBAR_OPEN_DEFAULT_TAB")
             if type(open_default) == "function" then
                 _G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB = nil
@@ -113,6 +128,10 @@ function M.showFromReader(ui, plugin, opts)
                 if type(open_folder) == "function" then
                     open_folder(target_folder)
                 else
+                    local direct_archive = paths.isArchiveRoot(target_folder)
+                    fm.file_chooser._zen_direct_archive_root = direct_archive
+                        and paths.getArchiveDir() or nil
+                    fm.file_chooser._zen_opening_archive_root = direct_archive or nil
                     fm.file_chooser:changeToPath(target_folder)
                 end
             end

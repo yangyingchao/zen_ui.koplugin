@@ -157,6 +157,10 @@ local function show_folder_from_filemanager(folder)
     local open_folder = rawget(_G, "__ZEN_UI_NAVBAR_OPEN_FOLDER")
     if type(open_folder) == "function" then return open_folder(folder) == true end
     require("common/utils").closeWidgetsAbove(fm)
+    local paths = require("common/paths")
+    local direct_archive = paths.isArchiveRoot(folder)
+    fm.file_chooser._zen_direct_archive_root = direct_archive and paths.getArchiveDir() or nil
+    fm.file_chooser._zen_opening_archive_root = direct_archive or nil
     fm.file_chooser:changeToPath(folder)
     return true
 end
@@ -229,9 +233,15 @@ local function get_footer()
     return reader and reader.view and reader.view.footer or nil
 end
 
-local function is_bottom_status_bar_visible()
+local function is_bottom_status_bar_visible(plugin)
     local footer = get_footer()
-    return footer and footer.view and footer.view.footer_visible == true
+    local live_visible = footer and footer.view and footer.view.footer_visible
+    if type(live_visible) == "boolean" then return live_visible end
+    local active_plugin = plugin or _plugin
+    local plugin_config = active_plugin and active_plugin.config
+    if type(plugin_config) ~= "table" then return false end
+    local reader_footer = plugin_config.reader_footer
+    return type(reader_footer) ~= "table" or reader_footer.status_bar_enabled ~= false
 end
 
 local function fallback_footer_mode(footer)
@@ -296,9 +306,13 @@ zen_action_active = {
     zen_ui_toggle_reader_themes = function(plugin)
         return feature_enabled("reader_themes", plugin or _plugin)
     end,
-    zen_ui_toggle_reader_bottom_status_bar = is_bottom_status_bar_visible,
+    zen_ui_toggle_reader_bottom_status_bar = function(plugin)
+        return is_bottom_status_bar_visible(plugin or _plugin)
+    end,
     zen_ui_toggle_reader_status_bars = function(plugin)
-        return is_top_status_bar_enabled(plugin or _plugin) or is_bottom_status_bar_visible()
+        local active_plugin = plugin or _plugin
+        return is_top_status_bar_enabled(active_plugin)
+            or is_bottom_status_bar_visible(active_plugin)
     end,
 }
 
@@ -510,6 +524,12 @@ function M.onDispatcherRegisterActions()
         title = _("ZenOS: Stats"),
         general = true,
     })
+    Dispatcher:registerAction("zen_ui_show_battery_stats", {
+        category = "none",
+        event = "ShowZenUIBatteryStats",
+        title = "ZenOS: " .. _("Battery Stats"),
+        general = true,
+    })
     -- Folder action stores its target path per-gesture (category="string" passes the
     -- stored value to the event). No section flag: the default menu loop skips it, so
     -- our _addItem patch renders a PathChooser in the General section instead of a fixed
@@ -633,11 +653,12 @@ M.isBottomStatusBarVisible = is_bottom_status_bar_visible
 M.setBottomStatusBar = set_bottom_status_bar
 
 function M.onToggleReaderBottomStatusBar(plugin)
-    return set_bottom_status_bar(plugin, not is_bottom_status_bar_visible())
+    return set_bottom_status_bar(plugin, not is_bottom_status_bar_visible(plugin))
 end
 
 function M.onToggleReaderStatusBars(plugin)
-    local enable = not (is_top_status_bar_enabled(plugin) or is_bottom_status_bar_visible())
+    local enable = not (is_top_status_bar_enabled(plugin)
+        or is_bottom_status_bar_visible(plugin))
     local top_ok = set_top_status_bar(plugin, enable)
     local bottom_ok = set_bottom_status_bar(plugin, enable)
     return top_ok or bottom_ok
@@ -671,6 +692,10 @@ function M.onShowZenUIStats(plugin)
     return show_zen_tab(plugin, "stats")
 end
 
+function M.onShowZenUIBatteryStats(plugin)
+    return require("modules/settings/battery_stats_menu").open(plugin)
+end
+
 function M.onShowZenUIFolder(plugin, folder)
     -- category="string": Dispatcher passes the per-action stored folder path as arg.
     return show_zen_folder(plugin, folder)
@@ -701,6 +726,7 @@ function M.install(target)
     target.onShowZenUITags = M.onShowZenUITags
     target.onShowZenUITag = M.onShowZenUITag
     target.onShowZenUIStats = M.onShowZenUIStats
+    target.onShowZenUIBatteryStats = M.onShowZenUIBatteryStats
     target.onShowZenUIFolder = M.onShowZenUIFolder
     target.onZenUIKOSyncSync = M.onZenUIKOSyncSync
     target.onShowZenUIToc = M.onShowZenUIToc

@@ -31,9 +31,6 @@ describe("About settings", function()
         ZenSpec.replace("modules/settings/zen_bugreporter", {
             show_dialog = function() end,
         })
-        ZenSpec.replace("modules/settings/sections/advanced_settings", {
-            build = function() return {} end,
-        })
         ZenSpec.replace("common/inline_icon_map", setmetatable({}, {
             __index = function(_self, key) return key end,
         }))
@@ -74,11 +71,25 @@ describe("About settings", function()
 
         assert.is_true(config._meta.quickstart_completed)
         assert.is_true(config._meta.quickstart_menu_tour_pending)
+        assert.is_true(config._meta.quickstart_reader_tour_pending)
         assert.are.equal(1, saves)
         assert.are.equal(1, #scheduled)
         assert.are.equal(0.35, scheduled[1].delay)
 
         scheduled[1].callback()
         assert.are.equal(1, tour_starts)
+    end)
+
+    it("keeps device details with About", function()
+        local items = require("modules/settings/sections/about_settings").build({
+            config = {},
+            plugin = {},
+        })
+
+        local device_items = items[2].sub_item_table
+        assert.are.equal(4, #device_items)
+        assert.are.same({ "ZenOS: 1.0.0", "Device", "Setup Guide", "Report a Bug" }, {
+            items[1].text_func(), items[2].text, items[3].text, items[4].text,
+        })
     end)
 end)

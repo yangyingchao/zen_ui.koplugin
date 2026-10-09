@@ -9,6 +9,8 @@ local BD = require("ui/bidi")
 local _ = require("gettext")
 local DecodeCache = require("common/cover_decode_cache")
 local RenderCache = require("common/cover_render_cache")
+local FolderCoverFiles = require("common/folder_cover_files")
+local lfs = require("libs/libkoreader-lfs")
 local plugin_root = require("common/plugin_root")
 local now = require("common/zen_logger").now
 
@@ -89,8 +91,10 @@ end
 -- ============================================================
 
 function CoverUtils.getRatio()
-    local G = rawget(_G, "G_reader_settings")
-    local ratio_str = G and G:readSetting("uniform_cover_ratio") or "2:3"
+    local plugin = rawget(_G, "__ZEN_UI_PLUGIN")
+    local cfg = type(plugin) == "table" and plugin.config
+        or require("config/manager").get()
+    local ratio_str = type(cfg) == "table" and cfg.uniform_cover_ratio or "2:3"
     local num, den = ratio_str:match("(%d+):(%d+)")
     return (tonumber(num) or 2) / (tonumber(den) or 3)
 end
@@ -112,7 +116,7 @@ function CoverUtils.getFolderPreviewBounds(mode, max_w, max_h, cover_count, slot
     max_w, max_h = tonumber(max_w), tonumber(max_h)
     if not max_w or max_w < 1 or not max_h or max_h < 1 then return nil end
     local portrait_w, portrait_h = CoverUtils.calcDims(max_w, max_h)
-    if mode == "gallery" then
+    if mode == "gallery" and (tonumber(cover_count) or 0) > 1 then
         slot = tonumber(slot) or 1
         local left_w = math.floor((portrait_w - 1) / 2)
         local top_h = math.floor((portrait_h - 1) / 2)
@@ -430,46 +434,61 @@ end
 -- Explicit cover file detection and loading
 -- ============================================================
 
-function CoverUtils.loadExplicitCovers(path, mode)
-    local util = require("util")
-    local RenderImage = require("ui/renderimage")
-    local EXTS = { ".jpg", ".jpeg", ".png", ".webp", ".gif" }
-
-    local function findAny(dir, stem)
-        for _i, ext in ipairs(EXTS) do
-            local f = dir .. "/" .. stem .. ext
-            if util.fileExists(f) then return f end
+function CoverUtils.loadExplicitCover(path, max_w, max_h)
+    max_w, max_h = tonumber(max_w), tonumber(max_h)
+    if not max_w or max_w < 1 or not max_h or max_h < 1 then
+        max_w, max_h = nil, nil
+    end
+    local ok_attr, attr = pcall(lfs.attributes, path)
+    local signature = ok_attr and type(attr) == "table" and attr.mode == "file"
+        and table.concat({
+            tostring(attr.modification), tostring(attr.change), tostring(attr.size),
+        }, "\31") or nil
+    local key = table.concat({
+        "zen-explicit", tostring(path), tostring(max_w), tostring(max_h),
+    }, "\31")
+    local bb = signature and type(DecodeCache.get) == "function"
+        and DecodeCache:get(key, signature) or nil
+    if not bb then
+        local RenderImage = require("ui/renderimage")
+        local ok, decoded = pcall(function()
+            return RenderImage:renderImageFile(path, false)
+        end)
+        if not ok or not decoded then return nil end
+        bb = decoded
+        if max_w and max_h then
+            local width, height = bb:getWidth(), bb:getHeight()
+            local scale = math.min(1, math.max(max_w / width, max_h / height))
+            if scale < 1 then
+                local ok_scale, scaled = pcall(RenderImage.scaleBlitBuffer,
+                    RenderImage, bb, math.ceil(width * scale), math.ceil(height * scale))
+                if ok_scale and scaled then bb = scaled end
+            end
+        end
+        if signature and type(DecodeCache.put) == "function" then
+            DecodeCache:put(key, signature, bb)
         end
     end
+    return {
+        data = bb,
+        w = bb:getWidth(),
+        h = bb:getHeight(),
+        alpha = true,
+    }
+end
 
-    local files = {}
-    if mode == "gallery" or mode == "stack" then
-        for i = 1, 4 do
-            local f = findAny(path, "cover" .. i)
-            if f then files[i] = f end
-        end
-    end
-    -- Slot 1 fallback: cover.ext / .cover.ext (applies to all modes)
-    if not files[1] then
-        files[1] = findAny(path, "cover") or findAny(path, ".cover")
-    end
-
-    local any = false
-    for i = 1, 4 do if files[i] then any = true; break end end
-    if not any then return nil end
+function CoverUtils.loadExplicitCovers(path, mode, max_w, max_h)
+    local files = FolderCoverFiles.find(path, mode)
+    if not next(files) then return nil, false end
 
     local result = {}
     for i = 1, 4 do
         if files[i] then
-            local ok, bb = pcall(function()
-                return RenderImage:renderImageFile(files[i], false)
-            end)
-            if ok and bb then
-                table.insert(result, { data = bb, w = bb:getWidth(), h = bb:getHeight() })
-            end
+            local cover = CoverUtils.loadExplicitCover(files[i], max_w, max_h)
+            if cover then table.insert(result, cover) end
         end
     end
-    return #result > 0 and result or nil
+    return #result > 0 and result or nil, true
 end
 
 -- ============================================================
@@ -495,7 +514,6 @@ function CoverUtils.collect(dir_path, chooser, max_covers, _need_copy, entries, 
         end
 
         if not entries then
-            local lfs = require("libs/libkoreader-lfs")
             local G = rawget(_G, "G_reader_settings")
             local collate = G and G:readSetting("collate") or "strcoll"
             local ok, iter, dir_obj = pcall(lfs.dir, dir_path)
@@ -553,14 +571,11 @@ function CoverUtils.collect(dir_path, chooser, max_covers, _need_copy, entries, 
             and enabled(info.has_cover) and not enabled(info.ignore_cover)
     end
 
-    local _img_exts = { jpg=1, jpeg=1, png=1, webp=1, gif=1 }
     for entry_index, entry in ipairs(entries) do
         if (entry.is_file or entry.file) and #covers < max_covers then
             local fpath = entry.path or entry.file
-            -- skip folder cover image files (cover.png, .cover.png, cover1.jpg, etc.)
             local _fname = (fpath:match("([^/]+)$") or ""):lower()
-            local _fext  = _fname:match("%.([^%.]+)$")
-            if not (_fext and _img_exts[_fext] and _fname:match("^%.?cover%d*%.")) then
+            if not FolderCoverFiles.isManaged(_fname) then
                 local preview_w, preview_h
                 if type(cover_specs) == "table" then
                     preview_w, preview_h = CoverUtils.getFolderPreviewBounds(
@@ -703,6 +718,7 @@ local function previewCover(cover, max_w, max_h, uniform, ImageWidget)
     return ImageWidget:new{
         image = cover.data,
         image_disposable = true,
+        alpha = cover.alpha == true,
         width = width,
         height = height,
         scale_factor = scale_factor,
@@ -809,6 +825,14 @@ end
 function CoverUtils.drawGallery(covers, portrait_w, portrait_h, border, bg_fn, uniform,
         cache_key)
     local bg = bg_fn and bg_fn() or coverBg()
+    if not bg_fn then
+        for _i, cover in ipairs(covers) do
+            if cover.alpha == true then
+                bg = Blitbuffer.COLOR_LIGHT_GRAY
+                break
+            end
+        end
+    end
     local cached = CoverUtils.getCachedGallery(
         cache_key, portrait_w, portrait_h, border, bg_fn)
     if cached then
@@ -962,7 +986,8 @@ function CoverUtils.drawStack(covers, portrait_w, portrait_h, border, bg_fn, uni
             bordersize = border,
             width = frame_w,
             height = frame_h,
-            background = Blitbuffer.COLOR_WHITE,
+            background = covers[1].alpha == true
+                and Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_WHITE,
             CenterContainer:new{
                 dimen = { w = image_w, h = image_h },
                 image,
@@ -1012,7 +1037,8 @@ function CoverUtils.drawStack(covers, portrait_w, portrait_h, border, bg_fn, uni
             bordersize = border,
             width = frame_w,
             height = frame_h,
-            background = Blitbuffer.COLOR_WHITE,
+            background = cover.alpha == true
+                and Blitbuffer.COLOR_LIGHT_GRAY or Blitbuffer.COLOR_WHITE,
             overlap_offset = {
                 math.floor((portrait_w - frame_w) / 2) + off.x,
                 math.floor((portrait_h - frame_h) / 2) + off.y,
@@ -1148,20 +1174,16 @@ function CoverUtils.makeCover(path, chooser, options)
     end
 
     local covers = options.covers_data
+    local has_explicit = false
     if not covers or #covers == 0 then
-        -- Auto-detect explicit cover image files (cover.png, cover1.png, etc.)
-        covers = CoverUtils.loadExplicitCovers(path, mode)
+        -- Auto-detect explicit cover image files (cover.jpg, cover1.jpg, etc.)
+        covers, has_explicit = CoverUtils.loadExplicitCovers(
+            path, mode, options.max_w or 200, options.max_h or 300)
     end
-    if not covers or #covers == 0 then
+    if not has_explicit and (not covers or #covers == 0) then
         covers = CoverUtils.collect(path, chooser, max_covers, need_copy)
-    elseif #covers < max_covers then
-        -- Fewer explicit covers than needed; fill remaining slots from books.
-        local combined = {}
-        for _i, c in ipairs(covers) do table.insert(combined, c) end
-        local extra = CoverUtils.collect(path, chooser, max_covers - #combined, need_copy)
-        for _i, c in ipairs(extra) do table.insert(combined, c) end
-        covers = combined
     end
+    covers = covers or {}
 
     local folder_name = options.folder_name or (path:match("([^/]+)/?$") or path):gsub("/$", "")
     folder_name = BD.directory(folder_name)
@@ -1175,7 +1197,10 @@ function CoverUtils.makeCover(path, chooser, options)
     local cover_widget
 
     if #covers > 0 then
-        if mode == "gallery" then
+        if #covers == 1 then
+            cover_widget = CoverUtils.drawSingle(
+                covers[1], portrait_w, portrait_h, border, options.uniform)
+        elseif mode == "gallery" then
             cover_widget = CoverUtils.drawGallery(
                 covers, portrait_w, portrait_h, border, nil, options.uniform)
         elseif mode == "stack" then

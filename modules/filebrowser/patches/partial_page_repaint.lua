@@ -14,12 +14,17 @@ local function apply_partial_page_repaint()
 
     local FileChooser = require("ui/widget/filechooser")
     local UIManager   = require("ui/uimanager")
-    local Background  = require("common/ui/background")
+    local zen_plugin = rawget(_G, "__ZEN_UI_PLUGIN")
 
     local pending = false
 
+    local function is_enabled()
+        local features = zen_plugin and zen_plugin.config and zen_plugin.config.features
+        return type(features) == "table" and features.partial_page_repaint == true
+    end
+
     local function schedule_repaint(self)
-        if self.items_max_lines then return end
+        if not is_enabled() or self.items_max_lines then return end
         -- Skip transient overlay choosers (e.g. MoveChooser) that shouldn't
         -- trigger a forced full repaint when their item count < perpage.
         if self._zen_no_forced_repaint then return end
@@ -30,19 +35,14 @@ local function apply_partial_page_repaint()
         local page          = self.page or 1
         local items_on_page = math.max(0, math.min(perpage, total - (page - 1) * perpage))
         local short_page = items_on_page > 0 and items_on_page < perpage
-        local bg_page_changed = false
-        if Background.library_active() then
-            local last_page = self._zen_bg_repaint_page
-            self._zen_bg_repaint_page = page
-            bg_page_changed = (last_page ~= nil and last_page ~= page)
-                or (last_page == nil and page > 1)
-        end
-        if (short_page or bg_page_changed) and not pending then
+        if short_page and not pending then
             pending = true
             local widget = self
+            local generation = self._zen_cover_hydration_generation
             UIManager:nextTick(function()
                 pending = false
-                if widget._zen_no_forced_repaint then return end
+                if not is_enabled() or widget._zen_no_forced_repaint or (widget.page or 1) ~= page
+                        or widget._zen_cover_hydration_generation ~= generation then return end
                 UIManager:setDirty(nil, "full")
                 UIManager:forceRePaint()
             end)

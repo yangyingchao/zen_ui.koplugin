@@ -33,8 +33,9 @@ def test_representative_home_library_stats_reader_and_page_browser_capture(
         role = "featured" if index == 0 else "reader" if title == "Do Less" else "library"
         books.append(ResolvedBook(index + 1, title, "Showcase Author", None, path, role, "EPUB"))
     ids = {
-        "zen_home", "library_covers_full", "library_list_full",
-        "stats", "reader", "page_browser_grid",
+        "zen_home", "library_covers_full", "library_list_full", "metadata_editor",
+        "stats", "quicksettings_minimal", "network_switcher", "bluetooth_switcher",
+        "reader", "page_browser_grid", "page_browser_carousel",
     }
     scenarios = [scenario for scenario in load_catalog() if scenario.id in ids]
     run_dir = tmp_path / "artifacts"

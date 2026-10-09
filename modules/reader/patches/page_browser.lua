@@ -17,6 +17,116 @@ local function apply_page_browser()
     local lfs          = require("libs/libkoreader-lfs")
     local _stock_icons_dir = lfs.currentdir() .. "/resources/icons/mdlight/"
 
+    -- Boox Android aborts forked thumbnail workers inside ART; render in-process.
+    if Device.isAndroid and Device:isAndroid() then
+        local ReaderThumbnail = require("apps/reader/modules/readerthumbnail")
+        local Blitbuffer = require("ffi/blitbuffer")
+        local Geom = require("ui/geometry")
+        local RenderImage = require("ui/renderimage")
+        local TileCacheItem = require("document/tilecacheitem")
+        local Screen = Device.screen
+        local logger = require("logger")
+
+        if not ReaderThumbnail._zen_android_sync_thumbnail_patch then
+            ReaderThumbnail._zen_android_sync_thumbnail_patch = true
+            local orig_check_tile_generation = ReaderThumbnail.checkTileGeneration
+
+            ReaderThumbnail.startTileGeneration = function(self, request)
+                local ui = self.ui
+                local document = ui.document
+                local saved_pos = ui.rolling and document:getCurrentPos()
+                local configurable = document.configurable
+                local saved_wrap, saved_trim, saved_straighten
+                if ui.paging then
+                    saved_wrap = configurable.text_wrap
+                    saved_trim = configurable.trim_page
+                    saved_straighten = configurable.auto_straighten
+                end
+                local bb, tile
+
+                local ok, err = pcall(function()
+                    -- _getPageImage mutates ReaderView and emits events meant only for a disposable worker.
+                    local width, height = Screen:getWidth(), Screen:getHeight()
+                    local zoom = 1
+                    if ui.paging then
+                        configurable.text_wrap = false
+                        configurable.trim_page = 3
+                        configurable.auto_straighten = 0
+                        local dimen = document:getPageDimensions(request.page, 1, 0)
+                        zoom = math.min(width / dimen.w, height / dimen.h)
+                        width, height = math.floor(dimen.w * zoom), math.floor(dimen.h * zoom)
+                    end
+                    bb = Blitbuffer.new(width, height, self.bb_type)
+                    local rect = Geom:new{ w = width, h = height }
+                    if ui.rolling then
+                        document:drawCurrentViewByPage(bb, 0, 0, rect, request.page)
+                    else
+                        local state = ui.view.state
+                        document:drawPage(bb, 0, 0, rect, request.page, zoom, 0, state.gamma, state.saturation)
+                    end
+                    if ui.view.highlight_visible then
+                        local view = setmetatable({
+                            state = { page = request.page, zoom = zoom, rotation = 0, offset = Geom:new() },
+                            page_scroll = false, visible_area = rect,
+                            highlight = setmetatable({
+                                page_boxes = {}, lighten_factor = math.max(ui.view.highlight.lighten_factor, 0.3),
+                            }, { __index = ui.view.highlight }),
+                        }, { __index = ui.view })
+                        view:drawSavedHighlight(bb, 0, 0)
+                    end
+                    local dogear = ui.view.dogear
+                    if dogear and ui.bookmark:isPageBookmarked(ui.paging and request.page or document:getXPointer()) then
+                        local icon_x = require("ui/bidi").mirroredUILayout() and 0 or width - dogear.icon:getWidth()
+                        dogear.icon:paintTo(bb, icon_x, dogear.dogear_y_offset)
+                    end
+                    if ui.rolling then
+                        local header_height = document:getHeaderHeight()
+                        if header_height > 0 then
+                            local cropped = bb:viewport(0, header_height, width, height - header_height):copy()
+                            bb:free()
+                            bb = cropped
+                        end
+                    end
+                    local scale = math.min(request.width / bb:getWidth(), request.height / bb:getHeight())
+                    bb = RenderImage:scaleBlitBuffer(bb,
+                        math.floor(bb:getWidth() * scale),
+                        math.floor(bb:getHeight() * scale), true)
+                    tile = TileCacheItem:new{ bb = bb, pageno = request.page }
+                    tile.size = tonumber(tile.bb.stride) * tile.bb.h
+                end)
+
+                if saved_pos then document:gotoPos(saved_pos) end
+                if ui.paging then
+                    configurable.text_wrap = saved_wrap
+                    configurable.trim_page = saved_trim
+                    configurable.auto_straighten = saved_straighten
+                end
+                if not ok then
+                    if bb then bb:free() end
+                    logger.warn("ZenOS Android synchronous thumbnail generation failed:", err)
+                    return false
+                end
+                request._zen_sync_tile = tile
+                return true
+            end
+
+            ReaderThumbnail.checkTileGeneration = function(self, request)
+                local tile = request._zen_sync_tile
+                if not tile then
+                    return orig_check_tile_generation(self, request)
+                end
+                request._zen_sync_tile = nil
+                if self.tile_cache then
+                    self.tile_cache:insert(request.hash, tile)
+                end
+                if request.when_generated_callback then
+                    request.when_generated_callback(tile, request.batch_id, true)
+                end
+                return false
+            end
+        end
+    end
+
     local function key_matches_menu(key)
         if not key then return false end
         if type(key.match) ~= "function" then return key == "Menu" end
@@ -52,21 +162,32 @@ local function apply_page_browser()
     local _plugin_ref = rawget(_G, "__ZEN_UI_PLUGIN")
     ZenTocWidget.set_plugin(_plugin_ref)
 
+    local function is_page_browser_layout(layout)
+        return layout == "single" or layout == "carousel" or layout == "grid"
+    end
+
     local function get_page_browser_layout()
         local settings = PresetStore.getSettings("reader")
         local layout = type(settings) == "table" and settings.page_browser_layout
-        if layout == "single" or layout == "grid" then return layout end
-        return "grid"
+        if is_page_browser_layout(layout) then return layout end
+        return "carousel"
     end
 
     local function set_page_browser_layout(layout)
-        if layout ~= "single" and layout ~= "grid" then return end
+        if not is_page_browser_layout(layout) then return end
         local store = PresetStore.loadStore("reader")
         if type(store) ~= "table" then return end
         if type(store.settings) ~= "table" then store.settings = {} end
         if store.settings.page_browser_layout == layout then return end
         store.settings.page_browser_layout = layout
         PresetStore.saveStore("reader", store)
+    end
+
+    local function get_page_browser_font_size(key)
+        local config = _plugin_ref and _plugin_ref.config
+        local page_browser = type(config) == "table" and config.page_browser
+        local size = type(page_browser) == "table" and tonumber(page_browser[key])
+        if size and size >= 10 and size <= 40 then return size end
     end
 
     local function is_enabled()
@@ -121,28 +242,36 @@ local function apply_page_browser()
         local btn_sz  = Screen:scaleBySize(32)
         local btn_pad = Screen:scaleBySize(11)
         local slot_btn_w = btn_sz + btn_pad * 2
+        local header_gap = Screen:scaleBySize(4)
         local title_y = math.floor((title_h - btn_sz) / 2)
         canvas:paintRect(0, title_h - 1, slot_w, 1, Blitbuffer.COLOR_LIGHT_GRAY)
         local stock_icons_dir = _stock_icons_dir
-        local header_icons = {
+        local left_icons = {
             { "appbar.search", stock_icons_dir },
             { "info", _icons_dir },
+        }
+        for i, icon in ipairs(left_icons) do
+            local icon_path = icon[3]
+                or (icon[2] and utils.resolveIcon(icon[2], icon[1]))
+            paint_icon(nil, icon_path, (slot_btn_w + header_gap) * (i - 1) + btn_pad, title_y, btn_sz)
+        end
+        local center_icons = {
             { "appbar.textsize", stock_icons_dir },
             { "bookmark", stock_icons_dir },
+            { "toc", _icons_dir },
         }
-        local vocab_icon_path = package.loaded["db"]
-            and _icons_dir and utils.resolveLocalIcon(_icons_dir, "tab_vocab")
-        if vocab_icon_path then
-            table.insert(header_icons, 4, { nil, nil, vocab_icon_path })
+        local center_group_w = slot_btn_w * #center_icons + header_gap * (#center_icons - 1)
+        local header_center_x = math.floor((slot_w - center_group_w) / 2)
+        for i, icon in ipairs(center_icons) do
+            local icon_path = utils.resolveIcon(icon[2], icon[1])
+            paint_icon(nil, icon_path,
+                header_center_x + (slot_btn_w + header_gap) * (i - 1) + btn_pad, title_y, btn_sz)
         end
-        for i, icon in ipairs(header_icons) do
-            local icon_path = icon[3]
-                or (icon[2] and utils.resolveLocalIcon(icon[2], icon[1]))
-            paint_icon(nil, icon_path, slot_btn_w * (i - 1) + btn_pad, title_y, btn_sz)
+        if package.loaded["db"] then
+            local more_path = _icons_dir and utils.resolveIcon(_icons_dir, "more_vertical")
+            paint_icon(nil, more_path, slot_w - 2 * slot_btn_w + btn_pad, title_y, btn_sz)
         end
-        local toc_icon_path = _icons_dir and utils.resolveLocalIcon(_icons_dir, "toc")
-        paint_icon(nil, toc_icon_path, slot_btn_w * #header_icons + btn_pad, title_y, btn_sz)
-        local close_icon_path = _icons_dir and utils.resolveLocalIcon(_icons_dir, "close_light")
+        local close_icon_path = _icons_dir and utils.resolveIcon(_icons_dir, "close_light")
         paint_icon(nil, close_icon_path, slot_w - slot_btn_w + btn_pad, title_y, btn_sz)
 
         local icon_size            = Screen:scaleBySize(24)
@@ -226,8 +355,15 @@ local function apply_page_browser()
 
         if layout == "single" then
             paint_page(42, 0, grid_top, slot_w, grid_h)
+        elseif layout == "carousel" then
+            local gap = Screen:scaleBySize(8)
+            local cell_w = math.floor(slot_w * 2 / 3)
+            local center_x = math.floor((slot_w - cell_w) / 2)
+            paint_page(41, center_x - cell_w - gap, grid_top, cell_w, grid_h)
+            paint_page(42, center_x, grid_top, cell_w, grid_h)
+            paint_page(43, center_x + cell_w + gap, grid_top, cell_w, grid_h)
         else
-            local cols, rows = 3, 2
+            local cols, rows = 3, 3
             local gap = Screen:scaleBySize(8)
             local margin_x = Screen:scaleBySize(14)
             local cell_w = math.floor((slot_w - 2 * margin_x - (cols - 1) * gap) / cols)
@@ -256,11 +392,13 @@ local function apply_page_browser()
             value_max = 240,
         }
 
-        local grid_slide_path = _icons_dir and utils.resolveLocalIcon(_icons_dir, "grid_slide")
-        local grid_path       = _icons_dir and utils.resolveLocalIcon(_icons_dir, "grid")
-        local chevron_left_path  = utils.resolveLocalIcon(stock_icons_dir, "chevron.left")
-        local chevron_right_path = utils.resolveLocalIcon(stock_icons_dir, "chevron.right")
+        local grid_slide_path = _icons_dir and utils.resolveIcon(_icons_dir, "grid_slide")
+        local carousel_path   = utils.resolveIcon(_icons_dir, "coverflow")
+        local grid_path       = _icons_dir and utils.resolveIcon(_icons_dir, "grid")
+        local chevron_left_path  = utils.resolveIcon(stock_icons_dir, "chevron.left")
+        local chevron_right_path = utils.resolveIcon(stock_icons_dir, "chevron.right")
         local is_single_page = layout == "single"
+        local is_carousel = layout == "carousel"
 
         local function make_toggle_icon(file_path, active)
             local icon = IconWidget:new{
@@ -286,12 +424,19 @@ local function apply_page_browser()
             background = is_single_page and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
             make_toggle_icon(grid_slide_path, is_single_page),
         }
+        local btn_carousel_frame = FrameContainer:new{
+            padding_top = icon_pad_v, padding_bottom = icon_pad_v,
+            padding_left = icon_pad_h, padding_right = icon_pad_h,
+            bordersize = 0,
+            background = is_carousel and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+            make_toggle_icon(carousel_path, is_carousel),
+        }
         local btn_grid_frame = FrameContainer:new{
             padding_top = icon_pad_v, padding_bottom = icon_pad_v,
             padding_left = icon_pad_h, padding_right = icon_pad_h,
             bordersize = 0,
-            background = is_single_page and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-            make_toggle_icon(grid_path, not is_single_page),
+            background = layout == "grid" and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+            make_toggle_icon(grid_path, layout == "grid"),
         }
         local divider = LineWidget:new{
             dimen = Geom:new{ w = Screen:scaleBySize(1), h = icon_size + icon_pad_v * 2 },
@@ -302,7 +447,18 @@ local function apply_page_browser()
             padding = 0, margin = 0, bordersize = Screen:scaleBySize(2),
             background = Blitbuffer.COLOR_WHITE,
             radius = Screen:scaleBySize(4),
-            HorizontalGroup:new{ align = "center", btn_view_frame, divider, btn_grid_frame },
+            HorizontalGroup:new{
+                align = "center",
+                btn_view_frame,
+                divider,
+                btn_carousel_frame,
+                LineWidget:new{
+                    dimen = Geom:new{ w = Screen:scaleBySize(1), h = icon_size + icon_pad_v * 2 },
+                    background = Blitbuffer.COLOR_DARK_GRAY,
+                    direction = "vert",
+                },
+                btn_grid_frame,
+            },
         }
         WidgetResources.paintFrameBorderOnTop(btn_row)
         local function make_skip_btn(file_path)
@@ -387,6 +543,7 @@ local function apply_page_browser()
         local GestureRange    = require("ui/gesturerange")
         local ZenSlider       = require("common/ui/zen_slider")
         local ZenIconButton   = require("common/ui/zen_icon_button")
+        local inline_icons    = require("common/inline_icon_map")
         local logger          = require("common/zen_logger").new("page_browser")
         local _               = require("gettext")
 
@@ -415,6 +572,11 @@ local function apply_page_browser()
         local function rebuild_focus_layout(pbw, desired_id)
             if not pbw._zen_focus_enabled then return end
             desired_id = desired_id or current_focus_id(pbw)
+            if pbw._zen_layout_mode == "carousel"
+                and type(desired_id) == "string"
+                and desired_id:match("^page:%d+$") then
+                desired_id = "page:" .. ((pbw.focus_page_shift or 1) + 1)
+            end
             unfocus_current(pbw)
 
             local layout = {}
@@ -451,6 +613,7 @@ local function apply_page_browser()
             local footer = {
                 { pbw._zen_btn_skip_left, "footer:previous" },
                 { pbw._zen_btn_view_frame, "footer:single" },
+                { pbw._zen_btn_carousel_frame, "footer:carousel" },
                 { pbw._zen_btn_grid_frame, "footer:grid" },
                 { pbw._zen_btn_skip_right, "footer:next" },
             }
@@ -535,7 +698,7 @@ local function apply_page_browser()
         PageBrowserWidget.onPhysicalKeyboardConnected = PageBrowserWidget.registerKeyEvents
 
         local function resolve_stock_icon(name)
-            return utils.resolveLocalIcon(_stock_icons_dir, name)
+            return utils.resolveIcon(_stock_icons_dir, name)
         end
 
         local function get_page_display_text(pbw, page_num)
@@ -655,6 +818,70 @@ local function apply_page_browser()
             return true
         end
 
+        local function configure_carousel_grid(pbw)
+            if pbw._zen_layout_mode ~= "carousel" or not pbw.grid
+                or pbw.nb_grid_items ~= 3 then
+                return false
+            end
+            local grid_w = pbw.grid_width or (pbw.dimen and pbw.dimen.w)
+            local grid_h = pbw.grid_height
+            if not grid_w or not grid_h then return false end
+
+            local gap = Screen:scaleBySize(12)
+            local item_w = math.max(1, math.floor(grid_w * 2 / 3))
+            local item_h = math.max(1, grid_h - Screen:scaleBySize(10))
+            local center_x = math.floor((grid_w - item_w) / 2)
+            local offsets = {
+                center_x - item_w - gap,
+                center_x,
+                center_x + item_w + gap,
+            }
+            if BD.mirroredUILayout() then
+                offsets[1], offsets[3] = offsets[3], offsets[1]
+            end
+
+            local size_changed = pbw.grid_item_width ~= item_w
+                or pbw.grid_item_height ~= item_h
+            pbw.grid_item_width = item_w
+            pbw.grid_item_height = item_h
+            pbw.grid_item_dimen = Geom:new{ w = item_w, h = item_h }
+            pbw.focus_page_shift = 1
+
+            for idx = 1, 3 do
+                local page_frame = pbw.grid[idx]
+                if page_frame and page_frame[1] then
+                    page_frame.overlap_offset = { offsets[idx], 0 }
+                    page_frame[1].dimen = pbw.grid_item_dimen:copy()
+                    page_frame.dimen = nil
+                end
+                local nav_frame = pbw.grid[pbw.nb_grid_items + idx]
+                if nav_frame and nav_frame.is_nav_item and nav_frame[1] then
+                    nav_frame.initial_overlap_offset = { offsets[idx], 0 }
+                    nav_frame.overlap_offset = { offsets[idx], 0 }
+                    nav_frame[1].dimen = pbw.grid_item_dimen:copy()
+                    nav_frame.dimen = nil
+                end
+            end
+            if size_changed then pbw._zen_tile_size = nil end
+            return true
+        end
+
+        local function get_badge_bottom(pbw, item, item_h, is_focus_page)
+            if pbw._zen_layout_mode ~= "carousel" or not is_focus_page then
+                return item_h
+            end
+
+            local thumb_frame = item[1] and item[1][1]
+            local image = thumb_frame and thumb_frame.is_page_thumbnail and thumb_frame[1]
+            local image_size = image and type(image.getSize) == "function" and image:getSize()
+            local thumb_h = image_size and image_size.h
+            if not thumb_h then return nil end
+
+            return math.floor((item_h - thumb_h) / 2) + thumb_h
+        end
+
+        PageBrowserWidget._zenConfigureCarouselGrid = configure_carousel_grid
+
         -- ----------------------------------------------------------------
         -- 1. Patch init: blank title, actions on the left and close on the right.
         -- ----------------------------------------------------------------
@@ -664,9 +891,12 @@ local function apply_page_browser()
             if self._zen_layout_mode == "single" then
                 self._zen_nb_cols_override = 1
                 self._zen_nb_rows_override = 1
+            elseif self._zen_layout_mode == "carousel" then
+                self._zen_nb_cols_override = 3
+                self._zen_nb_rows_override = 1
             else
                 self._zen_nb_cols_override = 3
-                self._zen_nb_rows_override = 2
+                self._zen_nb_rows_override = 3
             end
             _orig_init(self)
             local stock_focus_layout = self.build_focus_layout
@@ -683,9 +913,9 @@ local function apply_page_browser()
                                       w = Screen:getWidth(), h = Screen:getHeight() },
                 }
             }
-            -- Grid mode is fixed at 3 columns × 2 rows on every device.
+            -- Grid mode is fixed at 3 columns × 3 rows on every device.
             self._zen_orig_nb_cols = 3
-            self._zen_orig_nb_rows = 2
+            self._zen_orig_nb_rows = 3
             -- Block slider input until the opening swipe gesture completes so
             -- the northward swipe that opens us doesn't immediately move the
             -- slider (which appears right where the finger lifted).
@@ -763,6 +993,7 @@ local function apply_page_browser()
             end
 
             local slot_w = btn_sz + btn_pad * 2
+            local header_gap = Screen:scaleBySize(4)
 
             local old_right_button = self.title_bar.right_button
             local header_buttons = {}
@@ -774,7 +1005,7 @@ local function apply_page_browser()
                     end
                 end
                 self.title_bar.right_button = make_header_btn(
-                    utils.resolveLocalIcon(_icons_dir, "close_light"), nil,
+                    utils.resolveIcon(_icons_dir, "close_light"), nil,
                     old_right_button.callback, old_right_button.hold_callback,
                     "right", old_right_button.allow_flash)
                 table.insert(self.title_bar, self.title_bar.right_button)
@@ -787,6 +1018,7 @@ local function apply_page_browser()
                 UIManager:show(ZenTocWidget:new{
                     ui         = pbw_ref.ui,
                     focus_page = visible_page_raw(pbw_ref, pbw_ref.focus_page or pbw_ref.cur_page or 1),
+                    font_size  = get_page_browser_font_size("toc_font_size"),
                     on_goto    = function(page)
                         if pbw_ref.ui.link then
                             pbw_ref.ui.link:addCurrentLocationToStack()
@@ -801,6 +1033,7 @@ local function apply_page_browser()
             local function open_book_info()
                 require("modules/reader/book_details").show(pbw_ref.ui, {
                     config = _plugin_ref and _plugin_ref.config,
+                    plugin = _plugin_ref,
                     close_all_callback = function() pbw_ref:onClose() end,
                 })
             end
@@ -868,25 +1101,75 @@ local function apply_page_browser()
                 end)
             end
 
-            -- Page-browser title-bar actions, from left to right.
-            local action_icons = {
+            local function add_header_action(action, x_pos)
+                local icon_path = action[4] or (action[3] and resolve_stock_icon(action[1]))
+                    or (_icons_dir and utils.resolveIcon(_icons_dir, action[1]))
+                local button = make_header_btn(icon_path, x_pos, action[2])
+                table.insert(self.title_bar, button)
+                table.insert(header_buttons, button)
+                return button
+            end
+
+            local left_actions = {
                 { "appbar.search", open_search, true },
                 { "info", open_book_info },
+            }
+            for i, action in ipairs(left_actions) do
+                add_header_action(action, (slot_w + header_gap) * (i - 1))
+            end
+
+            local center_actions = {
                 { "appbar.textsize", open_reader_menu, true },
                 { "bookmark", open_bookmarks, true },
                 { "toc", open_toc },
             }
-            local vocab_icon_path = package.loaded["db"]
-                and _icons_dir and utils.resolveLocalIcon(_icons_dir, "tab_vocab")
-            if vocab_icon_path then
-                table.insert(action_icons, 4, { nil, open_vocab, nil, vocab_icon_path })
+            local title_w = self.title_bar.width or Screen:getWidth()
+            local center_group_w = slot_w * #center_actions + header_gap * (#center_actions - 1)
+            local center_x = math.floor((title_w - center_group_w) / 2)
+            self._zen_reader_tour_targets = {}
+            for i, action in ipairs(center_actions) do
+                self._zen_reader_tour_targets[i] = add_header_action(
+                    action, center_x + (slot_w + header_gap) * (i - 1))
             end
-            for i, action in ipairs(action_icons) do
-                local icon_path = action[4] or (action[3] and resolve_stock_icon(action[1]))
-                    or (_icons_dir and utils.resolveLocalIcon(_icons_dir, action[1]))
-                local button = make_header_btn(icon_path, slot_w * (i - 1), action[2])
-                table.insert(self.title_bar, button)
-                table.insert(header_buttons, button)
+
+            local vocab_icon_path = package.loaded["db"]
+                and _icons_dir and utils.resolveIcon(_icons_dir, "tab_vocab")
+            if vocab_icon_path then
+                local overflow_button
+                local function show_overflow_menu()
+                    local ButtonDialog = require("ui/widget/buttondialog")
+                    local dialog
+                    dialog = ButtonDialog:new{
+                        buttons = {
+                            {{
+                                text = inline_icons.vocabulary .. "  " .. _("Vocabulary builder"),
+                                align = "left",
+                                avoid_text_truncation = false,
+                                callback = function()
+                                    UIManager:close(dialog)
+                                    open_vocab()
+                                end,
+                            }},
+                        },
+                        shrink_unneeded_width = true,
+                        anchor = function()
+                            local button_dimen = overflow_button.image and overflow_button.image.dimen
+                            local dialog_dimen = dialog.movable and dialog.movable.dimen
+                            if not (button_dimen and dialog_dimen) then return button_dimen end
+                            local inset = Screen:scaleBySize(10)
+                            return {
+                                x = BD.mirroredUILayout()
+                                    and inset + dialog_dimen.w
+                                    or Screen:getWidth() - dialog_dimen.w - inset,
+                                y = button_dimen.y,
+                                h = button_dimen.h,
+                            }
+                        end,
+                    }
+                    UIManager:show(dialog)
+                end
+                overflow_button = add_header_action(
+                    { "more_vertical", show_overflow_menu }, title_w - 2 * slot_w)
             end
             if self.title_bar.right_button then
                 table.insert(header_buttons, self.title_bar.right_button)
@@ -952,9 +1235,12 @@ local function apply_page_browser()
                 if self._zen_layout_mode == "single" then
                     self._zen_nb_cols_override = 1
                     self._zen_nb_rows_override = 1
+                elseif self._zen_layout_mode == "carousel" then
+                    self._zen_nb_cols_override = 3
+                    self._zen_nb_rows_override = 1
                 else
                     self._zen_nb_cols_override = 3
-                    self._zen_nb_rows_override = 2
+                    self._zen_nb_rows_override = 3
                 end
             end
             -- Free any panel we built in a previous updateLayout call.
@@ -1108,9 +1394,14 @@ local function apply_page_browser()
             -- Derive the thumbnail-span width from the actual layout, then use
             -- roughly half of that for the slider so it sits as a short centred
             -- track rather than spanning edge-to-edge.
-            local outer_margin = (self.grid[1] and self.grid[1].overlap_offset
-                                  and self.grid[1].overlap_offset[1]) or 0
-            local thumb_span = math.max(1, grid_w - 2 * outer_margin)
+            local thumb_span
+            if self._zen_layout_mode == "carousel" then
+                thumb_span = self.grid_item_width or math.floor(grid_w * 2 / 3)
+            else
+                local outer_margin = (self.grid[1] and self.grid[1].overlap_offset
+                                      and self.grid[1].overlap_offset[1]) or 0
+                thumb_span = math.max(1, grid_w - 2 * outer_margin)
+            end
             local slider_w   = math.floor(thumb_span * 0.95)
 
             local function chapter_title(pg)
@@ -1256,7 +1547,9 @@ local function apply_page_browser()
                         local pdy = math.floor((sz.h - th) / 2)
                         local inner_x = gx + ox + pdx
                         local inner_bottom = gy + oy + pdy + th
-                        local badge_y = gy + oy + sz.h - badge_max_h - gap_bot_s
+                        local badge_bottom = get_badge_bottom(
+                            pbw, item, sz.h, page_num == fp) or pdy + th
+                        local badge_y = gy + oy + badge_bottom - badge_max_h - gap_bot_s
                         local erase_h = math.max(0, inner_bottom - badge_y)
                         if erase_h > 0 then
                             bb:paintRect(inner_x, badge_y, tw, erase_h,
@@ -1274,7 +1567,7 @@ local function apply_page_browser()
                             local bh  = lsz.h + 2 * pv_s
                             local bw  = math.max(lsz.w + 2 * ph_s, bh)
                             local bx  = gx + ox + math.floor((sz.w - bw) / 2)
-                            local by  = gy + oy + sz.h - bh - gap_bot_s
+                            local by  = gy + oy + badge_bottom - bh - gap_bot_s
 
                             local r_p = bh / 2
                             for row = 0, bh - 1 do
@@ -1360,15 +1653,15 @@ local function apply_page_browser()
             self._zen_slider     = zen_slider
             self._zen_chap_label = chap_label
 
-            -- View-mode toggle buttons: single page / grid.
+            -- View-mode toggle buttons: single page / carousel / grid.
             -- Create a unified button group with divider and active state styling.
             local pbw = self
 
-            -- Determine current layout mode
-            local is_single_page = (self.nb_cols == 1 and self.nb_rows == 1)
+            local layout_mode = self._zen_layout_mode or "grid"
 
-            local grid_slide_path = _icons_dir and utils.resolveLocalIcon(_icons_dir, "grid_slide")
-            local grid_path       = _icons_dir and utils.resolveLocalIcon(_icons_dir, "grid")
+            local grid_slide_path = _icons_dir and utils.resolveIcon(_icons_dir, "grid_slide")
+            local carousel_path   = utils.resolveIcon(_icons_dir, "coverflow")
+            local grid_path       = _icons_dir and utils.resolveIcon(_icons_dir, "grid")
             local chevron_left_path  = resolve_stock_icon("chevron.left")
             local chevron_right_path = resolve_stock_icon("chevron.right")
 
@@ -1378,77 +1671,45 @@ local function apply_page_browser()
             local icon_pad_h = zen_icon_pad_h
             local icon_pad_v = zen_icon_pad_v
 
-            local icon_view = IconWidget:new{
-                file   = grid_slide_path,
-                width  = icon_size,
-                height = icon_size,
-                alpha  = not is_single_page, -- opaque when active, alpha when inactive
-            }
-
-            local icon_grid = IconWidget:new{
-                file   = grid_path,
-                width  = icon_size,
-                height = icon_size,
-                alpha  = is_single_page, -- opaque when active, alpha when inactive
-            }
-
-            -- Invert the active icon (white icon on black bg)
-            if is_single_page then
-                icon_view:_render()
-                if icon_view._bb then
-                    local bb_copy = icon_view._bb:copy()
-                    bb_copy:invertRect(0, 0, bb_copy:getWidth(), bb_copy:getHeight())
-                    icon_view._bb = bb_copy
+            local function make_layout_button(file_path, active)
+                local icon = IconWidget:new{
+                    file   = file_path,
+                    width  = icon_size,
+                    height = icon_size,
+                    alpha  = not active,
+                }
+                if active then
+                    icon:_render()
+                    if icon._bb then
+                        local bb_copy = icon._bb:copy()
+                        bb_copy:invertRect(0, 0, bb_copy:getWidth(), bb_copy:getHeight())
+                        icon._bb = bb_copy
+                    end
                 end
-            else
-                icon_grid:_render()
-                if icon_grid._bb then
-                    local bb_copy = icon_grid._bb:copy()
-                    bb_copy:invertRect(0, 0, bb_copy:getWidth(), bb_copy:getHeight())
-                    icon_grid._bb = bb_copy
-                end
+                return FrameContainer:new{
+                    padding_top    = icon_pad_v,
+                    padding_bottom = icon_pad_v,
+                    padding_left   = icon_pad_h,
+                    padding_right  = icon_pad_h,
+                    bordersize     = 0,
+                    focusable      = self._zen_focus_enabled,
+                    focus_inner_border = true,
+                    focus_border_size = Screen:scaleBySize(3),
+                    focus_border_color = active and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
+                    background     = active and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+                    CenterContainer:new{
+                        dimen = Geom:new{ w = icon_size, h = icon_size },
+                        icon,
+                    },
+                }
             end
 
-            -- Wrap icons in fixed-width containers to ensure perfect centering
-            local CenterContainer_ic = require("ui/widget/container/centercontainer")
-            local icon_view_centered = CenterContainer_ic:new{
-                dimen = Geom:new{ w = icon_size, h = icon_size },
-                icon_view,
-            }
-            local icon_grid_centered = CenterContainer_ic:new{
-                dimen = Geom:new{ w = icon_size, h = icon_size },
-                icon_grid,
-            }
-
-            -- Container for left button (single page view) - no rounded inner corners
-            local btn_view_frame = FrameContainer:new{
-                padding_top    = icon_pad_v,
-                padding_bottom = icon_pad_v,
-                padding_left   = icon_pad_h,
-                padding_right  = icon_pad_h,
-                bordersize     = 0,
-                focusable     = self._zen_focus_enabled,
-                focus_inner_border = true,
-                focus_border_size = Screen:scaleBySize(3),
-                focus_border_color = is_single_page and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-                background     = is_single_page and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
-                icon_view_centered,
-            }
-
-            -- Container for right button (grid view) - no rounded inner corners
-            local btn_grid_frame = FrameContainer:new{
-                padding_top    = icon_pad_v,
-                padding_bottom = icon_pad_v,
-                padding_left   = icon_pad_h,
-                padding_right  = icon_pad_h,
-                bordersize     = 0,
-                focusable     = self._zen_focus_enabled,
-                focus_inner_border = true,
-                focus_border_size = Screen:scaleBySize(3),
-                focus_border_color = is_single_page and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
-                background     = is_single_page and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK,
-                icon_grid_centered,
-            }
+            local btn_view_frame = make_layout_button(
+                grid_slide_path, layout_mode == "single")
+            local btn_carousel_frame = make_layout_button(
+                carousel_path, layout_mode == "carousel")
+            local btn_grid_frame = make_layout_button(
+                grid_path, layout_mode == "grid")
 
             -- Vertical divider
             local LineWidget = require("ui/widget/linewidget")
@@ -1466,6 +1727,15 @@ local function apply_page_browser()
                 align = "center",
                 btn_view_frame,
                 divider,
+                btn_carousel_frame,
+                LineWidget:new{
+                    dimen = Geom:new{
+                        w = Screen:scaleBySize(1),
+                        h = icon_size + icon_pad_v * 2,
+                    },
+                    background = Blitbuffer.COLOR_DARK_GRAY,
+                    direction = "vert",
+                },
                 btn_grid_frame,
             }
 
@@ -1512,16 +1782,26 @@ local function apply_page_browser()
                 pbw:updateLayout()
                 UIManager:setDirty(pbw, function() return "partial", pbw.dimen end)
             end
+            local _switch_carousel = function()
+                pbw._zen_layout_mode = "carousel"
+                pbw._zen_nb_cols_override = 3
+                pbw._zen_nb_rows_override = 1
+                set_page_browser_layout("carousel")
+                logger.dbg("switch to carousel")
+                pbw:updateLayout()
+                UIManager:setDirty(pbw, function() return "partial", pbw.dimen end)
+            end
             local _switch_grid = function()
                 pbw._zen_layout_mode = "grid"
                 pbw._zen_nb_cols_override = 3
-                pbw._zen_nb_rows_override = 2
+                pbw._zen_nb_rows_override = 3
                 set_page_browser_layout("grid")
                 logger.dbg("switch to grid")
                 pbw:updateLayout()
                 UIManager:setDirty(pbw, function() return "partial", pbw.dimen end)
             end
             self._zen_switch_single = _switch_single
+            self._zen_switch_carousel = _switch_carousel
             self._zen_switch_grid   = _switch_grid
 
             -- Chapter-skip: jump to nearest TOC boundary before/after focus_page
@@ -1552,12 +1832,13 @@ local function apply_page_browser()
             -- Store button group reference for tap handling
             self._zen_btn_group = btn_row
             self._zen_btn_view_frame = btn_view_frame
+            self._zen_btn_carousel_frame = btn_carousel_frame
             self._zen_btn_grid_frame = btn_grid_frame
             self._zen_btn_skip_left = skip_left_btn
             self._zen_btn_skip_right = skip_right_btn
 
             -- Compute hit zones analytically from known panel layout.
-            -- The button group is a unified widget, split into left/right tap zones.
+            -- The button group is a unified widget with one zone per layout.
             -- Panel top Y (screen-absolute):
             local panel_abs_y = (self.dimen.y or 0) + self.dimen.h - zen_panel_h
             -- The navigation controls are the first content row in the panel.
@@ -1569,22 +1850,29 @@ local function apply_page_browser()
             local btn_row_h = btn_row_sz.h
             local btn_origin_x = (self.dimen.x or 0) + math.floor((grid_w - btn_row_w) / 2)
 
-            -- Split button group into left (view) and right (grid) hit zones
-            local half_w = math.floor(btn_row_w / 2)
+            -- Split the unified group into three equal layout hit zones.
+            local third_w = math.floor(btn_row_w / 3)
 
             self._zen_btn_view_zone = Geom:new{
                 x = btn_origin_x,
                 y = btn_zone_y,
-                w = half_w,
+                w = third_w,
+                h = btn_row_h,
+            }
+            self._zen_btn_carousel_zone = Geom:new{
+                x = btn_origin_x + third_w,
+                y = btn_zone_y,
+                w = third_w,
                 h = btn_row_h,
             }
             self._zen_btn_grid_zone = Geom:new{
-                x = btn_origin_x + half_w,
+                x = btn_origin_x + 2 * third_w,
                 y = btn_zone_y,
-                w = btn_row_w - half_w,
+                w = btn_row_w - 2 * third_w,
                 h = btn_row_h,
             }
             logger.dbg("btn_view_zone x="..self._zen_btn_view_zone.x.." y="..self._zen_btn_view_zone.y.." w="..self._zen_btn_view_zone.w.." h="..self._zen_btn_view_zone.h)
+            logger.dbg("btn_carousel_zone x="..self._zen_btn_carousel_zone.x.." y="..self._zen_btn_carousel_zone.y.." w="..self._zen_btn_carousel_zone.w.." h="..self._zen_btn_carousel_zone.h)
             logger.dbg("btn_grid_zone x="..self._zen_btn_grid_zone.x.." y="..self._zen_btn_grid_zone.y.." w="..self._zen_btn_grid_zone.w.." h="..self._zen_btn_grid_zone.h)
 
             -- Skip buttons flanking the view-toggle group
@@ -1707,6 +1995,7 @@ local function apply_page_browser()
                 .." post_scrub="..tostring(self._zen_post_scrub)
                 .." nb_grid_items="..tostring(self.nb_grid_items)
                 .." nb_pages="..tostring(self.nb_pages))
+            configure_carousel_grid(self)
             -- On the very first call (focus_page is nil, init → updateLayout → update),
             -- pre-initialise focus_page from cur_page with clamping so the grid
             -- never displays blank leading/trailing slots.  Subsequent calls
@@ -1715,7 +2004,8 @@ local function apply_page_browser()
             local shift = self.focus_page_shift
             local items = self.nb_grid_items
             local total = self.nb_pages
-            if not self.focus_page and shift and items and total and total >= items then
+            if self._zen_layout_mode ~= "carousel"
+                and not self.focus_page and shift and items and total and total >= items then
                 local fp     = self.cur_page or 1
                 local min_fp = shift + 1
                 local max_fp = math.max(min_fp, total - items + 1 + shift)
@@ -1754,6 +2044,17 @@ local function apply_page_browser()
                 self._zen_mapping_thumbnails = nil
             end
             if not ok then error(err, 0) end
+
+            -- Keep the next page that can enter from either edge warm. The
+            -- native update already requests focus-1/focus/focus+1; KOReader's
+            -- optional broader preloader covers these lookahead pages too.
+            if self._zen_layout_mode == "carousel"
+                and not G_reader_settings:isTrue("page_browser_preload_thumbnails") then
+                local focus_page = self.focus_page or self.cur_page or 1
+                self:preloadThumbnail(focus_page - 2, "preload carousel previous")
+                self:preloadThumbnail(focus_page + 2, "preload carousel next")
+            end
+
             self._zen_page_label_text_cache = nil
             self._zen_page_label_source = nil
             logger.perf("Original update completed", (os.clock() - t0) * 1000)
@@ -1791,6 +2092,20 @@ local function apply_page_browser()
         --     placeholders can draw borders at the correct centred position.
         -- ----------------------------------------------------------------
         local _orig_showTile = PageBrowserWidget.showTile
+        local function show_tile(self, grid_idx, page, tile, do_refresh)
+            local cur_page = self.cur_page
+            local has_hidden_flows = self.has_hidden_flows
+            if self._zen_layout_mode == "carousel" then
+                self.cur_page = self.focus_page or cur_page
+            end
+            if self._zen_visible_pages then self.has_hidden_flows = false end
+            local ok, result = pcall(_orig_showTile, self, grid_idx, page, tile, do_refresh)
+            self.cur_page = cur_page
+            self.has_hidden_flows = has_hidden_flows
+            if not ok then error(result, 0) end
+            return result
+        end
+
         PageBrowserWidget.showTile = function(self, grid_idx, page, tile, do_refresh)
             local has_bitmap = tile and tile.bb ~= nil
             if tile and tile.bb and not self._zen_tile_size then
@@ -1815,23 +2130,9 @@ local function apply_page_browser()
                 .." scrubbing="..tostring(self._zen_scrubbing)
                 .." post_scrub="..tostring(self._zen_post_scrub))
             if suppressed then
-                if self._zen_visible_pages then
-                    local has_hidden_flows = self.has_hidden_flows
-                    self.has_hidden_flows = false
-                    local result = _orig_showTile(self, grid_idx, page, tile, false)
-                    self.has_hidden_flows = has_hidden_flows
-                    return result
-                end
-                return _orig_showTile(self, grid_idx, page, tile, false)
+                return show_tile(self, grid_idx, page, tile, false)
             end
-            if self._zen_visible_pages then
-                local has_hidden_flows = self.has_hidden_flows
-                self.has_hidden_flows = false
-                local result = _orig_showTile(self, grid_idx, page, tile, do_refresh)
-                self.has_hidden_flows = has_hidden_flows
-                return result
-            end
-            return _orig_showTile(self, grid_idx, page, tile, do_refresh)
+            return show_tile(self, grid_idx, page, tile, do_refresh)
         end
 
         local _orig_preloadThumbnail = PageBrowserWidget.preloadThumbnail
@@ -1924,23 +2225,27 @@ local function apply_page_browser()
                                            bs, Blitbuffer.COLOR_BLACK, 0)
                         end
 
-                        local label = TextWidget:new{
-                            text    = get_page_display_text(self, visible_page_raw(self, page_num)),
-                            face    = badge_face,
-                            fgcolor = fg_color,
-                            padding = 0,
-                        }
-                        local lsz = label:getSize()
-                        local bh  = lsz.h + 2 * pv
-                        local bw  = math.max(lsz.w + 2 * ph, bh)  -- never narrower than a circle
-                        local bx  = gx + ox + math.floor((sz.w - bw) / 2)
-                        local by  = gy + oy + sz.h - bh - gap_bot
+                        local badge_bottom = get_badge_bottom(
+                            self, item, sz.h, page_num == fp)
+                        if badge_bottom then
+                            local label = TextWidget:new{
+                                text    = get_page_display_text(self, visible_page_raw(self, page_num)),
+                                face    = badge_face,
+                                fgcolor = fg_color,
+                                padding = 0,
+                            }
+                            local lsz = label:getSize()
+                            local bh  = lsz.h + 2 * pv
+                            local bw  = math.max(lsz.w + 2 * ph, bh)  -- never narrower than a circle
+                            local bx  = gx + ox + math.floor((sz.w - bw) / 2)
+                            local by  = gy + oy + badge_bottom - bh - gap_bot
 
-                        paintPill(bx, by, bw, bh, bg_color)
-                        label:paintTo(bb,
-                            bx + math.floor((bw - lsz.w) / 2),
-                            by + math.floor((bh - lsz.h) / 2))
-                        label:free()
+                            paintPill(bx, by, bw, bh, bg_color)
+                            label:paintTo(bb,
+                                bx + math.floor((bw - lsz.w) / 2),
+                                by + math.floor((bh - lsz.h) / 2))
+                            label:free()
+                        end
                     end
                 end
             end
@@ -1949,6 +2254,50 @@ local function apply_page_browser()
         -- ----------------------------------------------------------------
         -- 5. Gesture handling: slider, view-toggle buttons, panel boundary
         -- ----------------------------------------------------------------
+        local function move_carousel_to_page(pbw, page)
+            local focus_page = pbw.focus_page or pbw.cur_page
+            if pbw._zen_layout_mode ~= "carousel" or not page
+                or page == focus_page then
+                return false
+            end
+            if pbw:updateFocusPage(page, false) then pbw:update() end
+            return true
+        end
+
+        local function scroll_carousel(pbw, delta)
+            if pbw._zen_layout_mode ~= "carousel" then return false end
+            if pbw:updateFocusPage(delta, true) then pbw:update() end
+            return true
+        end
+
+        local _orig_onScrollPageUp = PageBrowserWidget.onScrollPageUp
+        PageBrowserWidget.onScrollPageUp = function(self)
+            if scroll_carousel(self, -1) then return true end
+            if _orig_onScrollPageUp then return _orig_onScrollPageUp(self) end
+            return true
+        end
+
+        local _orig_onScrollPageDown = PageBrowserWidget.onScrollPageDown
+        PageBrowserWidget.onScrollPageDown = function(self)
+            if scroll_carousel(self, 1) then return true end
+            if _orig_onScrollPageDown then return _orig_onScrollPageDown(self) end
+            return true
+        end
+
+        local function handle_carousel_side_tap(pbw, pos)
+            if pbw._zen_layout_mode ~= "carousel" or not (pbw.grid and pos) then
+                return false
+            end
+            for idx = 1, 3, 2 do
+                local item = pbw.grid[idx]
+                if item and item.dimen and pos:intersectWith(item.dimen) then
+                    move_carousel_to_page(pbw, item.page_idx)
+                    return true
+                end
+            end
+            return false
+        end
+
         local _orig_onTap = PageBrowserWidget.onTap
         PageBrowserWidget.onTap = function(self, arg, ges)
             logger.dbg("onTap at "..ges.pos.x..","..ges.pos.y)
@@ -1980,6 +2329,12 @@ local function apply_page_browser()
                 if self._zen_switch_single then self._zen_switch_single() end
                 return true
             end
+            if self._zen_btn_carousel_zone
+               and self._zen_btn_carousel_zone:contains(ges.pos) then
+                logger.dbg("onTap → btn_carousel")
+                if self._zen_switch_carousel then self._zen_switch_carousel() end
+                return true
+            end
             if self._zen_btn_grid_zone
                and self._zen_btn_grid_zone:contains(ges.pos) then
                 logger.dbg("onTap → btn_grid")
@@ -1994,6 +2349,9 @@ local function apply_page_browser()
                and ges.pos.y >= (self.dimen.y + self.dimen.h - panel_h) then
                 return true
             end
+            -- Side previews recenter in carousel mode; the center page keeps
+            -- the native tap behavior and opens in the reader.
+            if handle_carousel_side_tap(self, ges.pos) then return true end
             -- Native page slots use linear-page indexes while this Zen view is
             -- active; translate a thumbnail tap back to its document page.
             if self._zen_visible_pages and self.grid then
@@ -2223,10 +2581,11 @@ local function apply_page_browser()
                     and tonumber(focused._zen_focus_id:match("^page:(%d+)$"))
                 local page = page_index and pbw.grid and pbw.grid[page_index]
                     and pbw.grid[page_index].page_idx
+                if move_carousel_to_page(pbw, page) then return true end
                 if page then
                     pbw:onClose(true)
                     pbw.ui.link:addCurrentLocationToStack()
-                    pbw.ui:handleEvent(Event:new("GotoPage", page))
+                    pbw.ui:handleEvent(Event:new("GotoPage", visible_page_raw(pbw, page)))
                     return true
                 end
                 pbw:onPress()
@@ -2261,18 +2620,43 @@ local function apply_page_browser()
     -- -----------------------------------------------------------------------
     -- Open KOReader's native PageBrowserWidget (with ZenOS tweaks)
     -- -----------------------------------------------------------------------
-    local function open_page_browser(ui, from_menu_hold)
+    local function open_page_browser(ui, from_menu_hold, layout)
         local PageBrowserWidget = require("ui/widget/pagebrowserwidget")
+        local previous_layout = layout and get_page_browser_layout()
+        if layout then set_page_browser_layout(layout) end
         zen_patch_page_browser_widget()
         local browser = PageBrowserWidget:new{ ui = ui }
         browser._zen_ignore_opening_menu_key = from_menu_hold or nil
         UIManager:show(browser)
+        if layout then
+            return browser, function()
+                set_page_browser_layout(previous_layout)
+                browser:onClose()
+            end
+        end
+        return browser
+    end
+
+    local function start_reader_tour(ui)
+        local ok, tour = pcall(require, "common/quickstart/reader_tour")
+        if ok then
+            tour.start(_plugin_ref, ui, function(layout)
+                return open_page_browser(ui, nil, layout)
+            end)
+        end
     end
 
     -- Patch ReaderMenu.initGesListener to register the swipe-up zone
     -- -----------------------------------------------------------------------
     local ReaderMenu = require("apps/reader/modules/readermenu")
     local _orig_initGesListener = ReaderMenu.initGesListener
+
+    ReaderMenu._zen_start_reader_tour = function(self_rm)
+        if type(self_rm.onCloseReaderMenu) == "function" then
+            self_rm:onCloseReaderMenu()
+        end
+        UIManager:scheduleIn(0, function() start_reader_tour(self_rm.ui) end)
+    end
 
     local _orig_reader_menu_onKeyPress = ReaderMenu.onKeyPress
     local _orig_reader_menu_onKeyRepeat = ReaderMenu.onKeyRepeat
@@ -2350,6 +2734,7 @@ local function apply_page_browser()
             _orig_initGesListener(self_rm)
         end
         register_page_browser_zone(self_rm.ui)
+        UIManager:scheduleIn(0.5, function() start_reader_tour(self_rm.ui) end)
     end
 
     -- onReaderReady is aliased to initGesListener in KOReader; keep in sync
@@ -2366,9 +2751,13 @@ local function apply_page_browser()
     -- ZenOS customisations for fulltext search dialog
     -- -----------------------------------------------------------------------
     local ok_rs, ReaderSearch = pcall(require, "apps/reader/modules/readersearch")
-    if ok_rs and ReaderSearch then
+    local search_features = _plugin_ref and _plugin_ref.config
+        and _plugin_ref.config.features
+    if ok_rs and ReaderSearch
+            and (type(search_features) ~= "table" or search_features.search ~= false) then
         local InputDialog = require("ui/widget/inputdialog")
         local Screen_s    = require("device").screen
+        local BD          = require("ui/bidi")
         local ZenModalClose = require("common/ui/zen_modal_close")
         local _           = require("gettext")
         local logger_rs   = require("common/zen_logger").new("page_browser")
@@ -2398,6 +2787,11 @@ local function apply_page_browser()
         end
 
         ReaderSearch.onShowFulltextSearchInput = function(self, search_string)
+            local backward_text, forward_text = "◀", "▶"
+            if BD.mirroredUILayout() then
+                backward_text, forward_text = forward_text, backward_text
+            end
+            local arrow_width = Screen_s:scaleBySize(56)
             self.input_dialog = InputDialog:new{
                 title = _("Search Book"),
                 width = math.floor(math.min(Screen_s:getWidth(), Screen_s:getHeight()) * 0.9),
@@ -2408,10 +2802,24 @@ local function apply_page_browser()
                 buttons = {
                     {
                         {
+                            text = backward_text,
+                            width = arrow_width,
+                            callback = function()
+                                self:searchCallback(1)
+                            end,
+                        },
+                        {
                             text             = SEARCH_ICON .. " " .. _("Search"),
                             is_enter_default = true,
                             callback         = function()
                                 self:searchCallback()
+                            end,
+                        },
+                        {
+                            text = forward_text,
+                            width = arrow_width,
+                            callback = function()
+                                self:searchCallback(0)
                             end,
                         },
                     },
@@ -2420,7 +2828,6 @@ local function apply_page_browser()
             enable_search_dialog_close(self.input_dialog)
             -- Always case insensitive, whole-word via regex
             self.case_insensitive = true
-            self._zen_whole_word = true
             self.check_button_case = { checked = false }
             self.check_button_regex = { checked = false }
 
@@ -2585,19 +2992,6 @@ local function apply_page_browser()
         -- the full screen.  A flashui setDirty then schedules a full e-ink refresh.
         local _orig_onShowFindAllResults = ReaderSearch.onShowFindAllResults
         ReaderSearch.onShowFindAllResults = function(self, not_cached)
-            -- Only apply whole-word filtering when substring mode is NOT enabled
-            if not is_substring_enabled() and self._zen_whole_word and not_cached and self.findall_results then
-                local filtered = {}
-                for _i, item in ipairs(self.findall_results) do
-                    local pre = item.matched_word_prefix or ""
-                    local suf = item.matched_word_suffix or ""
-                    if pre == "" and suf == "" then
-                        table.insert(filtered, item)
-                    end
-                end
-                self.findall_results = filtered
-            end
-
             _orig_onShowFindAllResults(self, not_cached)
             local menu = self.result_menu
             if not menu or not UIManager:isWidgetShown(menu) then return end

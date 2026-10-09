@@ -1,9 +1,11 @@
 local logger = require("common/zen_logger").new("collections")
 local icons  = require("common/inline_icon_map")
+local submenu_arrow = icons.arrow_right
 local Cover  = require("common/cover_utils")
 local library_font = require("modules/filebrowser/patches/library_font")
 local Background = require("common/ui/background")
 local SharedState = require("common/shared_state")
+local _ = require("gettext")
 
 logger.dbg("module loaded")
 
@@ -26,12 +28,6 @@ local function apply_collections()
     local function is_tbr_collection(item)
         local coll_name = type(item) == "table" and item.name or item
         return coll_name == require("common/tbr_index").collectionName()
-    end
-
-    local orig_renameCollection = FileManagerCollection.renameCollection
-    function FileManagerCollection:renameCollection(item, ...)
-        if is_enabled() and is_tbr_collection(item) then return end
-        return orig_renameCollection(self, item, ...)
     end
 
     local orig_removeCollection = FileManagerCollection.removeCollection
@@ -297,7 +293,7 @@ local function apply_collections()
             }})
         end
         table.insert(sort_buttons, {{
-            text     = "\u{F04BF}  " .. _g("Order") .. "  \u{25B6}",
+            text     = "\u{F04BF}  " .. _g("Order") .. "  " .. submenu_arrow,
             align    = "left",
             enabled  = current ~= nil,
             callback = function()
@@ -355,7 +351,7 @@ local function apply_collections()
 
         local coll_name    = item.name
         local is_favorites = coll_name == ReadCollection.default_collection_name
-        local is_protected = is_favorites or is_tbr_collection(coll_name)
+        local is_tbr       = is_tbr_collection(coll_name)
         local display_name = is_favorites and _("Favorites") or coll_name
         local files        = get_collection_files_in_cover_order(coll_name)
         local book_count   = #files
@@ -363,7 +359,7 @@ local function apply_collections()
         local button_dialog
         local prepend_buttons = {}
         local extra_buttons = {}
-        if not is_protected then
+        if not is_favorites then
             table.insert(prepend_buttons, {{
                 text     = icons.rename .. "  " .. _("Rename"),
                 align    = "left",
@@ -387,7 +383,7 @@ local function apply_collections()
                 fm_coll:showCollFolderList(item)
             end,
         }})
-        if not is_protected then
+        if not is_favorites and not is_tbr then
             table.insert(extra_buttons, {{
                 text     = icons.delete .. "  " .. _("Delete collection"),
                 align    = "left",
@@ -456,7 +452,7 @@ local function apply_collections()
             local buttons = {}
             for _i, row in ipairs(prepend_buttons) do table.insert(buttons, row) end
             table.insert(buttons, {{
-                text     = "\u{F06D0}  " .. _("Display") .. "  \u{25B8}",
+                text     = "\u{F06D0}  " .. _("Display") .. "  " .. submenu_arrow,
                 align    = "left",
                 callback = function()
                     UIManager_cm:close(button_dialog)
@@ -464,7 +460,7 @@ local function apply_collections()
                 end,
             }})
             table.insert(buttons, {{
-                text     = "\u{F04BF}  " .. _("Sort") .. "  \u{25B8}",
+                text     = "\u{F04BF}  " .. _("Sort") .. "  " .. submenu_arrow,
                 align    = "left",
                 callback = function()
                     show_coll_sort_submenu(coll_name,
@@ -556,7 +552,7 @@ local function apply_collections()
             local button_dialog
             local buttons = {
                 {{
-                    text     = "\u{F04BF}  " .. _("Sort") .. "  \u{25B8}",
+                    text     = "\u{F04BF}  " .. _("Sort") .. "  " .. submenu_arrow,
                     align    = "left",
                     callback = function()
                         show_coll_sort_submenu(raw_coll_name,
@@ -565,7 +561,7 @@ local function apply_collections()
                     end,
                 }},
                 {{
-                    text     = "\u{F06D0}  " .. _("Display") .. "  \u{25B8}",
+                    text     = "\u{F06D0}  " .. _("Display") .. "  " .. submenu_arrow,
                     align    = "left",
                     callback = function()
                         UIManager_nb:close(button_dialog)
@@ -638,7 +634,7 @@ local function apply_collections()
                 end,
             }},
             {{
-                text     = "\u{F06D0}  " .. _("Display") .. "  \u{25B8}",
+                text     = "\u{F06D0}  " .. _("Display") .. "  " .. submenu_arrow,
                 align    = "left",
                 callback = showDisplaySubmenu,
             }},
@@ -682,6 +678,15 @@ local function apply_collections()
                         require("gettext")("Favorites"), true) == true
                 end
                 return false
+            end,
+            refreshTBRCollection = function()
+                local FileManager = require("apps/filemanager/filemanager")
+                local fm_coll = FileManager.instance and FileManager.instance.collections
+                local menu = fm_coll and fm_coll.booklist_menu
+                if not (menu and is_tbr_collection(menu.path)) then return false end
+                fm_coll:setCollate()
+                fm_coll:updateItemTable()
+                return true
             end,
         },
     })
@@ -929,7 +934,7 @@ local function apply_collections()
 
         if createStatusRow and tb.title_group and #tb.title_group >= 2 then
             local FileManager = require("apps/filemanager/filemanager")
-            local status_row = createStatusRow(nil, FileManager.instance)
+            local status_row = createStatusRow(nil, FileManager.instance, _("Collections"))
             tb.title_group[2] = status_row
             tb.title_group:resetLayout()
 
@@ -941,7 +946,7 @@ local function apply_collections()
             local repaintTitleBar = get_shared("repaintTitleBar")
             menu._zen_status_refresh = function()
                 if tb.title_group and #tb.title_group >= 2 then
-                    tb.title_group[2] = createStatusRow(nil, FileManager.instance)
+                    tb.title_group[2] = createStatusRow(nil, FileManager.instance, _("Collections"))
                     tb.title_group:resetLayout()
                     if repaintTitleBar then repaintTitleBar(tb) end
                 end

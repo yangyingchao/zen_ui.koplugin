@@ -13,6 +13,7 @@ describe("file browser navbar navigation", function()
     local dir_mtimes
     local dir_scan_calls
     local home_show_callback
+    local home_refresh_type
     local setup_observation
     local initial_reinject_callback
     local device_input
@@ -22,6 +23,10 @@ describe("file browser navbar navigation", function()
     local real_paths
     local full_repaints
     local device_has_keys
+    local screen_rotation_mode
+    local screen_is_color
+    local built_widgets
+    local original_color_text_widget
 
     local function class(methods)
         methods = methods or {}
@@ -30,11 +35,13 @@ describe("file browser navbar navigation", function()
             child.extend = self.extend
             return setmetatable(child, { __index = self })
         end
-        methods.new = methods.new or function(_, values)
+        methods.new = methods.new or function(self, values)
             values = values or {}
             values.dimen = values.dimen or { w = values.width or 20, h = values.height or 20 }
             values.getSize = values.getSize or function(self) return self.dimen end
             values.free = values.free or function() end
+            values.paintTo = values.paintTo or self.paintTo
+            built_widgets[#built_widgets + 1] = { widget = values, class = self }
             return values
         end
         return methods
@@ -59,6 +66,7 @@ describe("file browser navbar navigation", function()
         dir_mtimes = {}
         dir_scan_calls = 0
         home_show_callback = nil
+        home_refresh_type = nil
         setup_observation = nil
         initial_reinject_callback = nil
         native_available = true
@@ -67,15 +75,21 @@ describe("file browser navbar navigation", function()
         real_paths = {}
         full_repaints = 0
         device_has_keys = false
+        screen_rotation_mode = 0
+        screen_is_color = false
+        built_widgets = {}
         device_input = {
             disable_double_tap = true,
             tap_interval_override = nil,
         }
         original_memory_policy = package.loaded["common/memory_policy"]
+        original_color_text_widget = package.loaded["common/ui/color_text_widget"]
+        ZenSpec.unload("common/ui/color_text_widget")
         shared = {
             home = {
-                showHomeView = function(inject)
+                showHomeView = function(inject, refresh_type)
                     calls[#calls + 1] = "home"
+                    home_refresh_type = refresh_type
                     if home_show_callback then home_show_callback(inject) end
                 end,
                 closeAll = function() calls[#calls + 1] = "close_home" end,
@@ -89,11 +103,17 @@ describe("file browser navbar navigation", function()
                 showTagDetail = function(tag, _inject, tab_id)
                     calls[#calls + 1] = "tag:" .. tag .. ":" .. tab_id
                 end,
+                showStatusView = function(status, label, _inject, tab_id)
+                    calls[#calls + 1] = table.concat({
+                        "status", status, label, tab_id,
+                    }, ":")
+                end,
                 showTBRView = function() calls[#calls + 1] = "to_be_read" end,
                 closeAll = function() calls[#calls + 1] = "close_groups" end,
             },
         }
         FileManager = class({
+            onClose = function() calls[#calls + 1] = "close_filemanager" end,
             setupLayout = function(self)
                 setup_observation = {
                     hidden = rawget(_G, "__ZEN_UI_HIDDEN_HOME_BOOTSTRAP"),
@@ -115,6 +135,9 @@ describe("file browser navbar navigation", function()
                 calls[#calls + 1] = "base:" .. tostring(path) .. ":" .. tostring(focused)
             end,
             onShowingReader = function() end,
+            onSetRotationMode = function(_, mode)
+                screen_rotation_mode = mode
+            end,
         })
         FileManager.instance = nil
         ZenSpec.replace("apps/filemanager/filemanager", FileManager)
@@ -143,6 +166,18 @@ describe("file browser navbar navigation", function()
         end
         ZenSpec.replace("ffi/blitbuffer", {
             COLOR_BLACK = "black", COLOR_DARK_GRAY = "dark", COLOR_WHITE = "white",
+            TYPE_BB8 = 1,
+            ColorRGB32 = function(r, g, b, a) return { r, g, b, a } end,
+            new = function(w, h)
+                return {
+                    getWidth = function() return w end,
+                    getHeight = function() return h end,
+                    fill = function() end,
+                    blitFrom = function() end,
+                    invertRect = function(self) self.inverted = true end,
+                    free = function() end,
+                }
+            end,
         })
         ZenSpec.replace("device", {
             input = device_input,
@@ -150,7 +185,8 @@ describe("file browser navbar navigation", function()
                 scaleBySize = function(_, value) return value end,
                 getWidth = function() return 800 end,
                 getHeight = function() return 600 end,
-                isColorScreen = function() return false end,
+                getRotationMode = function() return screen_rotation_mode end,
+                isColorScreen = function() return screen_is_color end,
             },
             hasKeys = function() return device_has_keys end,
         })
@@ -166,6 +202,9 @@ describe("file browser navbar navigation", function()
             realpath = function(path) return real_paths[path] or path end,
         })
         ZenSpec.replace("dispatcher", {
+            getDisplayList = function(settings)
+                return settings.kindle_library and { { key = "kindle_library" } } or {}
+            end,
             execute = function(_self, action)
                 dispatcher_executions[#dispatcher_executions + 1] = action
             end,
@@ -194,10 +233,13 @@ describe("file browser navbar navigation", function()
                 return result
             end,
             resolveLocalIcon = function(_, icon) return icon end,
+            resolveIcon = function(_dir, icon) return "/icons/" .. icon .. ".svg" end,
             closeWidgetsAbove = function() end,
         })
         ZenSpec.replace("common/paths", {
             getHomeDir = function() return "/library" end,
+            getArchiveDir = function() return "/archive" end,
+            isArchiveRoot = function(path) return path:gsub("/+$", "") == "/archive" end,
             isInHomeDir = function(path) return path:sub(1, 8) == "/library" end,
         })
         ZenSpec.replace("common/plugin_root", "/plugin")
@@ -209,6 +251,7 @@ describe("file browser navbar navigation", function()
         })
         ZenSpec.replace("modules/filebrowser/patches/standalone_page", {
             enable_gesture_manager_dispatch = function() end,
+            enable_filemanager_dispatch = function() end,
         })
         ZenSpec.replace("common/ui/background", {
             library_active = function() return false end,
@@ -236,7 +279,8 @@ describe("file browser navbar navigation", function()
         })
         ZenSpec.replace("libs/libkoreader-lfs", {
             attributes = function(path, field)
-                if field == "mode" and (path == "/library" or dir_mtimes[path]) then
+                if field == "mode" and (path == "/library" or path == "/archive"
+                        or dir_mtimes[path]) then
                     return "directory"
                 end
                 if field == "modification" then return dir_mtimes[path] end
@@ -274,13 +318,14 @@ describe("file browser navbar navigation", function()
                 features = { navbar = true, restore_library_view = false },
                 navbar = {
                     show_tabs = {
-                        books = true, folder = true, home = true, authors = true, series = true,
+                        books = true, archive = true, folder = true, home = true,
+                        authors = true, series = true,
                         tags = true, to_be_read = true, history = true,
                         favorites = true, collections = true, search = true,
                         page_left = true, page_right = true, menu = true,
                     },
                     tab_order = {
-                        "home", "books", "authors", "series", "tags", "to_be_read",
+                        "home", "books", "archive", "authors", "series", "tags", "to_be_read",
                         "history", "favorites", "collections", "search",
                         "page_left", "page_right", "menu",
                     },
@@ -307,11 +352,14 @@ describe("file browser navbar navigation", function()
             "__ZEN_UI_LIBRARY_STATE", "__ZEN_UI_OPEN_HOME_AFTER_FILEMANAGER",
             "__ZEN_UI_OPEN_TARGET_TAB", "__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB",
             "__ZEN_UI_OPEN_TARGET_FOLDER", "__ZEN_UI_OPEN_TARGET_TAG",
+            "__ZEN_UI_KEEP_BOOK_LOCATION",
             "__ZEN_UI_HIDDEN_HOME_BOOTSTRAP", "__ZEN_UI_DEFER_FILEMANAGER_LISTING",
+            "__ZEN_UI_ARCHIVE_LISTING_DIRTY",
         }) do
             _G[name] = nil
         end
         package.loaded["common/memory_policy"] = original_memory_policy
+        package.loaded["common/ui/color_text_widget"] = original_color_text_widget
     end)
 
     local function make_instance()
@@ -348,11 +396,49 @@ describe("file browser navbar navigation", function()
     it("keeps configured tab order and resolves the first enabled default", function()
         assert.are.equal("home", _G.__ZEN_UI_NAVBAR_RESOLVE_DEFAULT_TAB())
         assert.are.same({
-            "home", "books", "authors", "series", "tags", "to_be_read",
+            "home", "books", "archive", "authors", "series", "tags", "to_be_read",
             "history", "favorites", "collections", "search",
             "page_left", "page_right", "menu",
-        }, { unpack(_G.__ZEN_UI_PLUGIN.config.navbar.tab_order, 1, 13) })
+        }, { unpack(_G.__ZEN_UI_PLUGIN.config.navbar.tab_order, 1, 14) })
         assert.are.equal("Home", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
+    end)
+
+    it("keeps the move chooser fullscreen without a navbar", function()
+        local Menu = require("ui/widget/menu")
+        local chooser = {
+            height = 600,
+            covers_fullscreen = true,
+            is_borderless = true,
+            title_bar_fm_style = true,
+            select_directory = true,
+            select_file = false,
+            _zen_renderer = true,
+            _zen_no_forced_repaint = true,
+        }
+
+        Menu.init(chooser)
+
+        assert.are.equal(600, chooser.height)
+        assert.is_nil(chooser._zen_prevent_swipe_close)
+        assert.is_nil(chooser.onMultiSwipe)
+    end)
+
+    it("keeps the named folder cover picker fullscreen without a navbar", function()
+        local Menu = require("ui/widget/menu")
+        local picker = {
+            name = "folder_cover_picker",
+            height = 600,
+            covers_fullscreen = true,
+            is_borderless = true,
+            title_bar_fm_style = true,
+            _zen_no_forced_repaint = true,
+        }
+
+        Menu.init(picker)
+
+        assert.are.equal(600, picker.height)
+        assert.is_nil(picker._zen_prevent_swipe_close)
+        assert.is_nil(picker.onMultiSwipe)
     end)
 
     it("opens a hidden default tab and keeps its top-menu icon", function()
@@ -419,6 +505,21 @@ describe("file browser navbar navigation", function()
         assert.are.same({ "base:/library:nil", "covers" }, calls)
         assert.are.equal("Library", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
         assert.is_nil(fm.file_chooser._zen_needs_cover_refresh)
+        assert.is_nil(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
+    end)
+
+    it("keeps the physical folder and focused book when restoring Reader", function()
+        _G.__ZEN_UI_PLUGIN.config.features.restore_library_view = true
+        local fm = make_instance()
+        FileManager._test_next_instance = fm
+        calls = {}
+
+        FileManager.showFiles(FileManager,
+            "/library/Fiction", "/library/Fiction/Book.epub")
+
+        assert.are.same({
+            "base:/library/Fiction:/library/Fiction/Book.epub",
+        }, calls)
         assert.is_nil(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
     end)
 
@@ -549,6 +650,21 @@ describe("file browser navbar navigation", function()
         assert.is_true(measurement_detail(measurements[1], "covers_suppressed="))
     end)
 
+    it("keeps FileManager visible when returning to a PDF outside Library", function()
+        local fm = {
+            root_path = "/outside",
+            focused_file = nil,
+        }
+        FileManager.instance = nil
+        _G.__ZEN_UI_KEEP_BOOK_LOCATION = true
+
+        FileManager.setupLayout(fm)
+
+        assert.is_nil(fm.invisible)
+        assert.is_nil(fm._zen_hidden_home_startup)
+        assert.are.equal("/outside", fm.root_path)
+    end)
+
     it("opens deferred Home below every existing startup widget without polling", function()
         local fm = make_instance()
         fm.invisible = true
@@ -647,6 +763,39 @@ describe("file browser navbar navigation", function()
         assert.is_nil(setup_observation.deferred)
         assert.is_nil(fm.invisible)
         assert.is_nil(fm._zen_hidden_home_startup)
+    end)
+
+    it("does not request another repaint after setupLayout", function()
+        _G.__ZEN_UI_PLUGIN.config.navbar.default_tab = "books"
+        local file_chooser = { path_items = {} }
+        local fm = {
+            root_path = "/library",
+            _test_setup_file_chooser = file_chooser,
+            { file_chooser },
+        }
+        FileManager.instance = fm
+        local dirty_calls = 0
+        UIManager.setDirty = function() dirty_calls = dirty_calls + 1 end
+
+        FileManager.setupLayout(fm)
+
+        assert.are.equal(0, dirty_calls)
+    end)
+
+    it("reapplies a Library default after cold-start path tracking", function()
+        _G.__ZEN_UI_PLUGIN.config.navbar.default_tab = "books"
+        local fm = make_instance()
+        fm.file_chooser.path = "/library/Fiction"
+        fm[1] = { fm.file_chooser }
+        FileManager.onPathChanged(fm, fm.file_chooser.path)
+        UIManager._window_stack = { { widget = fm } }
+        calls = {}
+
+        initial_reinject_callback()
+
+        assert.are.same({ "books:/library" }, calls)
+        assert.are.equal("Library", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
+        assert.is_true(fm._zen_default_tab_bootstrapped)
     end)
 
     it("defers hidden FileManager construction when restoring Home", function()
@@ -765,7 +914,9 @@ describe("file browser navbar navigation", function()
         fc._zen_needs_full_listing = true
         dir_mtimes["/library"] = 10
         local hidden_dirty = 0
-        UIManager.setDirty = function() hidden_dirty = hidden_dirty + 1 end
+        UIManager.setDirty = function(_self, widget)
+            if widget == fm then hidden_dirty = hidden_dirty + 1 end
+        end
         fc._zen_warm_item_table = function(_, path)
             calls[#calls + 1] = "warm:" .. path
             return warmed_items, { cache = "disk_hit", items = 1 }
@@ -941,15 +1092,17 @@ describe("file browser navbar navigation", function()
         end
 
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
-        assert.are.equal(0, #next_ticks)
+        assert.are.equal(1, #next_ticks)
+        table.remove(next_ticks, 1)()
         calls = {}
 
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("books"))
         assert.are.same({}, calls)
         assert.are.equal(3, fm.file_chooser.page)
         assert.are.equal(1, cover_resume_calls)
-        assert.are.equal(1, #next_ticks)
+        assert.are.equal(2, #next_ticks)
 
+        table.remove(next_ticks, 1)()
         table.remove(next_ticks, 1)()
         assert.are.same({}, calls)
         assert.is_nil(fm.file_chooser._zen_home_retained_library)
@@ -1020,6 +1173,7 @@ describe("file browser navbar navigation", function()
             next_ticks[#next_ticks + 1] = callback
         end
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
+        table.remove(next_ticks, 1)()
         dir_mtimes["/library/sub"] = 21
         calls = {}
 
@@ -1053,6 +1207,7 @@ describe("file browser navbar navigation", function()
             next_ticks[#next_ticks + 1] = callback
         end
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
+        table.remove(next_ticks, 1)()
         dir_mtimes["/library/sub"] = 21
         calls = {}
 
@@ -1080,6 +1235,7 @@ describe("file browser navbar navigation", function()
             next_ticks[#next_ticks + 1] = callback
         end
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
+        table.remove(next_ticks, 1)()
         dir_mtimes["/library/Book.sdr"] = 21
         calls = {}
 
@@ -1133,6 +1289,78 @@ describe("file browser navbar navigation", function()
         assert.are.equal("Library", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
     end)
 
+    it("routes archive folder shortcuts through the Archive tab", function()
+        make_instance()
+        calls = {}
+
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_FOLDER("/archive"))
+
+        assert.are.same({ "books:/archive" }, calls)
+        assert.are.equal("Archive", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
+        assert.are.equal("/archive", FileManager.instance.file_chooser._zen_direct_archive_root)
+    end)
+
+    it("rescans a retained Archive listing once after an archive change", function()
+        local fm = make_instance()
+        local fc = fm.file_chooser
+        fc.path = "/archive"
+        fc.refreshPath = function() calls[#calls + 1] = "refresh_archive" end
+        fc.onGotoPage = function() calls[#calls + 1] = "redraw_archive" end
+        _G.__ZEN_UI_ARCHIVE_LISTING_DIRTY = true
+        calls = {}
+
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("archive"))
+        assert.is_nil(_G.__ZEN_UI_ARCHIVE_LISTING_DIRTY)
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("archive"))
+
+        assert.are.same({ "refresh_archive", "redraw_archive" }, calls)
+    end)
+
+    it("resumes deferred covers when Archive replaces a visible Home startup", function()
+        local fm = make_instance()
+        local fc = fm.file_chooser
+        fm._zen_hidden_home_startup = true
+        fc._zen_hidden_home_startup = true
+        local suspended_cover_jobs = 0
+        local cover_resume_calls = 0
+        fc._zen_resume_visible_cover_work = function()
+            cover_resume_calls = cover_resume_calls + 1
+            assert.are.equal(2, suspended_cover_jobs)
+            suspended_cover_jobs = 0
+            return true
+        end
+        fc._zen_cancel_hidden_folder_prewarm = function(_self, _reason, mode)
+            if mode == "discard" then suspended_cover_jobs = 0 end
+        end
+        fc.changeToPath = function(_, path)
+            calls[#calls + 1] = "books:" .. path
+            suspended_cover_jobs = 2
+        end
+        calls = {}
+
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("archive"))
+
+        assert.are.same({ "books:/archive" }, calls)
+        assert.is_nil(fm._zen_hidden_home_startup)
+        assert.is_nil(fc._zen_hidden_home_startup)
+        assert.are.equal(1, cover_resume_calls)
+    end)
+
+    it("keeps Library active when Folder contains the library root", function()
+        local fm = make_instance()
+        _G.__ZEN_UI_PLUGIN.config.navbar.folder_path = "/"
+        dir_mtimes["/"] = 10
+        fm.file_chooser.changeToPath = function(self, path)
+            self.path = path
+            FileManager.onPathChanged(fm, path)
+        end
+
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("folder"))
+        assert.are.equal("Folder", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("books"))
+        assert.are.equal("Library", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
+    end)
+
     it("builds the configured folder when the hidden Home listing is still deferred", function()
         local fm = make_instance()
         local fc = fm.file_chooser
@@ -1171,7 +1399,7 @@ describe("file browser navbar navigation", function()
         assert.is_nil(fc._zen_needs_full_listing)
         assert.are.equal("Folder", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
         assert.are.same({ "/library" }, rendered_paths)
-        assert.are.equal(0, full_repaints)
+        assert.are.equal(1, full_repaints)
     end)
 
     it("keeps Folder active when FileChooser canonicalizes its configured path", function()
@@ -1308,7 +1536,7 @@ describe("file browser navbar navigation", function()
         assert.is_nil(fc._zen_hidden_home_startup)
         assert.is_nil(fc._zen_needs_full_listing)
         assert.are.equal("Manga", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
-        assert.are.equal(0, full_repaints)
+        assert.are.equal(1, full_repaints)
     end)
 
     it("handles a cold Folder tap from the live Home navbar", function()
@@ -1387,7 +1615,7 @@ describe("file browser navbar navigation", function()
         assert.is_nil(wrapper._zen_hidden_home_startup)
         assert.are.equal("Folder", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
         assert.are.same({ "/library/Fiction" }, rendered_paths)
-        assert.are.equal(0, full_repaints)
+        assert.are.equal(2, full_repaints)
 
         local filemanager_navbar = fm[1][1][2]
         calls = {}
@@ -1415,7 +1643,7 @@ describe("file browser navbar navigation", function()
         assert.is_nil(fc._zen_hidden_home_startup)
         assert.is_nil(fc._zen_needs_full_listing)
         assert.are.equal("Library", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
-        assert.are.equal(0, full_repaints)
+        assert.are.equal(1, full_repaints)
     end)
 
     it("does not reopen the navbar page already on top", function()
@@ -1426,6 +1654,112 @@ describe("file browser navbar navigation", function()
 
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("authors"))
         assert.are.same({}, calls)
+        assert.are.equal(0, full_repaints)
+    end)
+
+    it("fully refreshes every navbar page switch, including Authors to Library and Home", function()
+        local fm = make_instance()
+        UIManager._window_stack = { { widget = fm } }
+        home_widget._zen_navbar_tab_id = "home"
+        shared.home.isActiveOnTop = function()
+            local top = UIManager._window_stack[#UIManager._window_stack]
+            return top and top.widget == home_widget
+        end
+        shared.home.showHomeView = function()
+            UIManager._window_stack = { { widget = fm }, { widget = home_widget } }
+        end
+        shared.group_view.showAuthorsView = function()
+            UIManager._window_stack = {
+                { widget = fm }, { widget = { _zen_navbar_tab_id = "authors" } },
+            }
+        end
+        package.loaded["common/utils"].closeWidgetsAbove = function(anchor)
+            while UIManager._window_stack[#UIManager._window_stack].widget ~= anchor do
+                table.remove(UIManager._window_stack)
+            end
+        end
+        local refreshes = 0
+        UIManager.setDirty = function(_self, widget, mode, region)
+            if mode == "full" then
+                assert.is_nil(widget)
+                assert.is_nil(region)
+                refreshes = refreshes + 1
+            end
+            assert.are_not.equal("flashui", mode)
+        end
+
+        local tabs = {
+            "authors", "books", "authors", "home", "books", "series",
+            "archive", "tags", "to_be_read", "history", "favorites", "collections",
+        }
+        for index, id in ipairs(tabs) do
+            assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB(id))
+            assert.are.equal(index, refreshes)
+        end
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("menu"))
+        assert.are.equal(#tabs, refreshes)
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
+        assert.are.equal(#tabs + 1, refreshes)
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
+        assert.are.equal(#tabs + 1, refreshes)
+    end)
+
+    it("fully refreshes Authors to retained Home through touch and keyboard navigation", function()
+        device_has_keys = true
+        _G.__ZEN_UI_PLUGIN.config.navbar.tab_order = { "home", "authors" }
+        local fm = make_instance()
+        home_widget._zen_navbar_tab_id = "home"
+        UIManager._window_stack = { { widget = fm }, { widget = home_widget } }
+        shared.home.isActiveOnTop = function()
+            return UIManager._window_stack[#UIManager._window_stack].widget == home_widget
+        end
+        local authors_menu
+        shared.group_view.showAuthorsView = function(inject)
+            authors_menu = {
+                name = "authors",
+                dimen = { w = 800, h = 600 },
+                inner_dimen = { w = 800, h = 600 },
+                close_callback = function()
+                    assert.are.equal(authors_menu, table.remove(UIManager._window_stack).widget)
+                end,
+                [1] = {
+                    dimen = { w = 800, h = 560 },
+                    inner_dimen = { w = 800, h = 560 },
+                    resetLayout = function() end,
+                },
+            }
+            table.insert(UIManager._window_stack, { widget = authors_menu })
+            inject(authors_menu, "authors")
+        end
+        local refreshes = 0
+        UIManager.setDirty = function(_self, widget, mode)
+            if mode == "full" then
+                assert.is_nil(widget)
+                refreshes = refreshes + 1
+            end
+        end
+        local activations = {
+            function()
+                local navbar = authors_menu[1][1][2]
+                navbar.getTappedTabId = function() return "home" end
+                assert.is_true(navbar:onTapNavBar(nil, { pos = { x = 200, y = 1 } }))
+            end,
+            function()
+                assert.is_true(authors_menu:onZenNavbarFocusDown())
+                assert.is_true(authors_menu:onZenNavbarFocusLeft())
+                assert.is_true(authors_menu:onZenNavbarConfirm())
+            end,
+        }
+        for _i, activate in ipairs(activations) do
+            assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("authors"))
+            refreshes, full_repaints = 0, 0
+            activate()
+            assert.are.equal(home_widget, UIManager._window_stack[#UIManager._window_stack].widget)
+            assert.are.equal(1, refreshes)
+            assert.are.equal(1, full_repaints)
+            assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
+            assert.are.equal(1, refreshes)
+        end
     end)
 
     it("opens a custom tag tab directly in that tag's detail view", function()
@@ -1443,6 +1777,56 @@ describe("file browser navbar navigation", function()
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("ct_tag"))
         assert.are.same({ "tag:Science:ct_tag" }, calls)
         assert.are.equal("Science", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
+    end)
+
+    it("opens a custom status tab directly in that status view", function()
+        local navbar = _G.__ZEN_UI_PLUGIN.config.navbar
+        navbar.custom_tabs = {
+            { id = "ct_finished", type = "status", status = "complete",
+                label = "Finished" },
+        }
+        navbar.show_tabs.ct_finished = true
+        table.insert(navbar.tab_order, "ct_finished")
+        local fm = make_instance()
+        fm[1] = { fm.file_chooser }
+        local status_menu = {
+            name = "status_detail",
+            page = 3,
+            dimen = { w = 800, h = 600 },
+            inner_dimen = { w = 800, h = 600 },
+            border_size = 0,
+            close_callback = function() calls[#calls + 1] = "status_closed" end,
+            updateItems = function() calls[#calls + 1] = "status_reset" end,
+            [1] = {
+                dimen = { w = 800, h = 560 },
+                inner_dimen = { w = 800, h = 560 },
+                resetLayout = function() end,
+            },
+        }
+        shared.group_view.showStatusView = function(status, label, inject, tab_id)
+            calls[#calls + 1] = table.concat({
+                "status", status, label, tab_id,
+            }, ":")
+            inject(status_menu, tab_id)
+        end
+        _G.__ZEN_UI_REINJECT_FM_NAVBAR()
+        full_repaints = 0
+        calls = {}
+
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("ct_finished"))
+        assert.same({ "status:complete:Finished:ct_finished" }, calls)
+        assert.are.equal("Finished", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
+        assert.are.equal(1, full_repaints)
+
+        local status_navbar = status_menu[1][1][2]
+        status_navbar.getTappedTabId = function() return "ct_finished" end
+        calls = {}
+        assert.is_true(status_navbar:onTapNavBar(nil, { pos = { x = 400, y = 1 } }))
+        assert.are.equal(1, status_menu.page)
+        assert.are.same({ "status_reset" }, calls)
+        assert.are.equal(2, full_repaints)
+        assert.is_true(status_navbar:onTapNavBar(nil, { pos = { x = 400, y = 1 } }))
+        assert.are.equal(2, full_repaints)
     end)
 
     it("launches available native menu tabs and retains unavailable ones", function()
@@ -1595,6 +1979,37 @@ describe("file browser navbar navigation", function()
             reveal.details)
     end)
 
+    it("uses one full refresh between Library and Home", function()
+        local fm = make_instance()
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("books"))
+        fm.file_chooser.path = "/library"
+        fm.file_chooser.item_table = { { path = "/library/Book.epub" } }
+        dir_mtimes["/library"] = 10
+        UIManager._window_stack = {
+            { widget = fm },
+            { widget = home_widget },
+        }
+        local flash_count = 0
+        local full_count = 0
+        UIManager.setDirty = function(_self, _widget, mode)
+            if mode == "flashui" then flash_count = flash_count + 1 end
+            if mode == "full" then full_count = full_count + 1 end
+        end
+        shared.home.resumeActive = function(refresh_type)
+            home_refresh_type = refresh_type
+            UIManager:setDirty(home_widget, refresh_type)
+            return true, "reused"
+        end
+
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
+        assert.is_nil(home_refresh_type)
+        assert.are.equal(0, flash_count)
+        assert.are.equal(1, full_count)
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("books"))
+        assert.are.equal(0, flash_count)
+        assert.are.equal(2, full_count)
+    end)
+
     it("reveals a reinitialized hidden FileManager before handling Library taps", function()
         local fm = make_instance()
         fm.invisible = true
@@ -1636,8 +2051,7 @@ describe("file browser navbar navigation", function()
         assert.is_nil(fm.invisible)
         assert.is_nil(fm._zen_hidden_home_startup)
         assert.are.same({
-            widget = fm,
-            mode = "ui",
+            mode = "full",
             top = fm,
         }, reveal)
         local top = UIManager._window_stack[#UIManager._window_stack].widget
@@ -1674,7 +2088,7 @@ describe("file browser navbar navigation", function()
         assert.are.equal(wrapper, UIManager._window_stack[2].widget)
     end)
 
-    it("records a real navbar tap to retained Home without a forced full repaint", function()
+    it("records a real navbar tap to retained Home with one full refresh", function()
         local fm = make_instance()
         fm.file_chooser.path = "/library"
         fm.file_chooser.page = 1
@@ -1711,10 +2125,8 @@ describe("file browser navbar navigation", function()
         assert.is_true(navbar:onTapNavBar(nil, { pos = { x = 50, y = 1 } }))
 
         assert.are.same({ "resume_home" }, calls)
-        assert.are.equal(0, force_repaints)
-        for _i, entry in ipairs(dirty) do
-            assert.is_false(entry.widget == nil and entry.mode == "full")
-        end
+        assert.are.equal(1, force_repaints)
+        assert.are.same({ mode = "full" }, dirty[#dirty])
         local reveal
         for _i, measurement in ipairs(measurements) do
             if measurement.message == "Library to Home first reveal" then
@@ -1735,6 +2147,37 @@ describe("file browser navbar navigation", function()
         assert.is_false(navbar:onTapNavBar(nil, { pos = { x = 1, y = 1 } }))
         assert.is_false(navbar:onTapNavBar(nil, { pos = { x = 799, y = 1 } }))
         assert.are.same({}, calls)
+    end)
+
+    it("refreshes the full screen after file-manager rotation", function()
+        local fm = make_instance()
+        local dirty = {}
+        UIManager.setDirty = function(_, widget, mode)
+            dirty[#dirty + 1] = { widget, mode }
+        end
+        FileManager.onSetRotationMode(fm, 1)
+        assert.are.equal(1, screen_rotation_mode)
+        assert.are.same({ { fm, "full" } }, dirty)
+        FileManager.onSetRotationMode(fm, 1)
+        assert.are.equal(1, #dirty)
+        _G.__ZEN_UI_PLUGIN.config.features.navbar = false
+        FileManager.onSetRotationMode(fm, 2)
+        assert.are.equal(1, #dirty)
+    end)
+
+    it("opens the KOReader plus menu when holding the navbar outside home folders", function()
+        local fm = make_instance()
+        fm[1] = { fm.file_chooser }
+        fm.onShowPlusMenu = function() calls[#calls + 1] = "plus_menu" end
+        _G.__ZEN_UI_REINJECT_FM_NAVBAR()
+        local navbar = fm[1][1][2]
+        assert.is_table(navbar.ges_events.HoldNavBar)
+
+        fm.file_chooser.path = "/outside"
+        assert.is_true(navbar:onHoldNavBar(nil, { pos = { x = 400, y = 1 } }))
+        fm.file_chooser.path = "/library/subfolder"
+        assert.is_false(navbar:onHoldNavBar(nil, { pos = { x = 400, y = 1 } }))
+        assert.are.same({ "plus_menu" }, calls)
     end)
 
     it("activates a focused file-manager navbar tab on Press", function()
@@ -1876,6 +2319,37 @@ describe("file browser navbar navigation", function()
         assert.are.same({ "top_menu" }, calls)
     end)
 
+    it("restores the standalone frame fill after disabling wallpaper", function()
+        local fm = make_instance()
+        fm[1] = { fm.file_chooser }
+        local home_menu
+        home_show_callback = function(inject)
+            home_menu = {
+                name = "home",
+                dimen = { w = 800, h = 600 },
+                inner_dimen = { w = 800, h = 600 },
+                updateItems = function() end,
+                { dimen = { w = 800, h = 560 } },
+            }
+            inject(home_menu, "home")
+        end
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("home"))
+        local frame = home_menu[1]
+        local body = frame[1][1]
+        local old_navbar = frame[1][2]
+        assert.are.equal("white", frame.background)
+
+        frame.background = nil -- Wallpaper painting clears the retained frame's fill.
+        _G.__ZEN_UI_PLUGIN.config.library_background = { enabled = false }
+        UIManager._window_stack = { { widget = fm }, { widget = home_menu } }
+        _G.__ZEN_UI_REINJECT_NAVBARS()
+
+        assert.are.equal(frame, home_menu[1])
+        assert.are.equal(body, frame[1][1])
+        assert.are_not.equal(old_navbar, frame[1][2])
+        assert.are.equal("white", frame.background)
+    end)
+
     it("uses rendered tab centers when tapping a standalone navbar background", function()
         local fm = make_instance()
         fm[1] = { fm.file_chooser }
@@ -1901,26 +2375,146 @@ describe("file browser navbar navigation", function()
 
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("stats"))
         assert.are.equal(_G.__ZEN_UI_PLUGIN, stats_plugin)
+        assert.are.equal(1, full_repaints)
         local navbar = stats_page[1][1][2]
         calls = {}
 
         assert.is_true(navbar:onTapNavBar(nil, { pos = { x = 620, y = 1 } }))
         assert.are.same({ "to_be_read" }, calls)
+        assert.are.equal(2, full_repaints)
+    end)
+
+    it("opens Kindle as a standalone tab and resets it to page one", function()
+        local navbar_config = _G.__ZEN_UI_PLUGIN.config.navbar
+        navbar_config.show_tabs.kindle = true
+        navbar_config.tab_order = { "kindle" }
+
+        make_instance()
+        assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("kindle"))
+        assert.are.same({ { kindle_library = true } }, dispatcher_executions)
+
+        local updates = 0
+        local menu = {
+            name = "kindle_library",
+            page = 3,
+            dimen = { w = 800, h = 600 },
+            inner_dimen = { w = 800, h = 600 },
+            updateItems = function() updates = updates + 1 end,
+            { dimen = { w = 800, h = 580 } },
+        }
+        require("ui/widget/menu").init(menu)
+        local navbar = menu[1][1][2]
+
+        assert.is_true(menu._zen_standalone_navbar_injected)
+        assert.is_true(navbar:onTapNavBar(nil, { pos = { x = 400, y = 1 } }))
+        assert.are.equal(1, menu.page)
+        assert.are.equal(1, updates)
     end)
 
     it("dispatches books and stock file-browser tabs to their intended actions", function()
         make_instance()
         for _i, id in ipairs({
-            "books", "history", "favorites", "collections", "search",
+            "books", "archive", "history", "favorites", "collections", "search",
             "page_left", "page_right", "menu",
         }) do
             assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB(id))
         end
         assert.are.same({
-            "books:/library", "history", "favorites", "collections", "search",
+            "books:/library", "books:/archive", "history", "favorites", "collections", "search",
             "previous", "next", "menu",
         }, calls)
         assert.are.equal("Collections", _G.__ZEN_UI_ACTIVE_TAB_LABEL)
+    end)
+
+    it("closes History above FileManager before exiting", function()
+        local fm = make_instance()
+        local history = { name = "history" }
+        UIManager._window_stack = { { widget = fm }, { widget = history } }
+        package.loaded["common/utils"].closeWidgetsAbove = function(anchor)
+            assert.are.equal(fm, anchor)
+            calls[#calls + 1] = "close_history"
+        end
+        calls = {}
+
+        FileManager.onClose(fm)
+
+        assert.are.same({ "close_history", "close_filemanager" }, calls)
+    end)
+
+    it("executes configured gestures on History, Favorites, and Collections", function()
+        local original_titlebar = package.loaded["ui/widget/titlebar"]
+        local original_guard = rawget(_G, "__ZEN_UI_BROADCAST_GUARD_PATCHED")
+        ZenSpec.replace("ui/widget/titlebar", {})
+        local StandalonePage = dofile(ZenSpec.root .. "/modules/filebrowser/patches/standalone_page.lua")
+        package.loaded["ui/widget/titlebar"] = original_titlebar
+        _G.__ZEN_UI_BROADCAST_GUARD_PATCHED = original_guard
+        local dispatch = require("modules/filebrowser/patches/standalone_page")
+        dispatch.enable_gesture_manager_dispatch = StandalonePage.enable_gesture_manager_dispatch
+        dispatch.enable_filemanager_dispatch = StandalonePage.enable_filemanager_dispatch
+
+        local FileManagerHistory = require("apps/filemanager/filemanagerhistory")
+        local FileManagerCollection = require("apps/filemanager/filemanagercollection")
+        for _i, navbar_enabled in ipairs({ true, false }) do
+            _G.__ZEN_UI_PLUGIN.config.features.navbar = navbar_enabled
+            for _j, view in ipairs({ "history", "favorites", "collections", "collection_detail" }) do
+                local fm = make_instance()
+                local action_calls, page_calls = 0, 0
+                local menu = {
+                    name = view == "history" and "history" or "collections",
+                    dimen = { w = 800, h = 600 },
+                    inner_dimen = { w = 800, h = 600 },
+                    updateItems = function() end,
+                    handleEvent = function(_self, event)
+                        if event.handler == "onGesture" then
+                            page_calls = page_calls + 1
+                            return true
+                        end
+                        return false
+                    end,
+                    { dimen = { w = 800, h = 560 } },
+                }
+                fm.handleEvent = function(_self, event)
+                    assert.are.equal("onToggleZenMode", event.handler)
+                    action_calls = action_calls + 1
+                    return true
+                end
+                UIManager._window_stack = { { widget = fm }, { widget = menu } }
+                UIManager.sendEvent = function(self, event)
+                    return self._window_stack[#self._window_stack].widget:handleEvent(event)
+                end
+                fm._ordered_touch_zones = { {
+                    def = { id = "multiswipe" },
+                    gs_range = { match = function(_self, ges) return ges.ges == "multiswipe" end },
+                    handler = function()
+                        UIManager:sendEvent({ handler = "onToggleZenMode" })
+                        return true
+                    end,
+                } }
+
+                if view == "history" then
+                    fm.history.booklist_menu = menu
+                    FileManagerHistory.onShowHist(fm.history)
+                elseif view == "collections" then
+                    fm.collections.coll_list = menu
+                    FileManagerCollection.onShowCollList(fm.collections)
+                else
+                    fm.collections.booklist_menu = menu
+                    fm.collections.coll_list = view == "collection_detail" and {} or nil
+                    FileManagerCollection.onShowColl(fm.collections, view == "collection_detail" and "Reading" or nil)
+                end
+
+                assert.is_true(menu:handleEvent({
+                    handler = "onGesture", args = { { ges = "multiswipe", pos = { y = 200 } } },
+                }))
+                assert.are.equal(1, action_calls, view)
+                assert.are.equal(0, page_calls, view)
+                assert.is_true(menu:handleEvent({
+                    handler = "onGesture", args = { { ges = "swipe", direction = "west", pos = { y = 200 } } },
+                }))
+                assert.are.equal(1, action_calls, view)
+                assert.are.equal(1, page_calls, view)
+            end
+        end
     end)
 
     it("returns an open collection to the collections root on an active-tab tap", function()
@@ -1965,7 +2559,7 @@ describe("file browser navbar navigation", function()
         assert.are.equal(2, detail.page)
     end)
 
-    it("reveals the current Library page without scheduling a full-screen repaint", function()
+    it("fully refreshes when revealing the current Library page", function()
         local fm = make_instance()
         fm.file_chooser.path = "/library"
         fm.file_chooser.onGotoPage = function(_, page)
@@ -1983,12 +2577,11 @@ describe("file browser navbar navigation", function()
 
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("books"))
         assert.are.same({ "goto:1" }, calls)
-        assert.are.equal(1, #next_ticks)
+        assert.are.equal(2, #next_ticks)
         table.remove(next_ticks, 1)()
-        for _i, entry in ipairs(dirty) do
-            assert.is_false(entry.widget == nil and entry.mode == "full")
-        end
-        assert.are.equal(0, force_repaints)
+        table.remove(next_ticks, 1)()
+        assert.are.same({ mode = "full" }, dirty[#dirty])
+        assert.are.equal(1, force_repaints)
     end)
 
     it("rejects unknown tab ids without changing the active tab", function()
@@ -2009,17 +2602,240 @@ describe("file browser navbar navigation", function()
         assert.is_true(used_configured_size)
     end)
 
+    it("centers the active white icon in a larger rectangular blue squircle", function()
+        local navbar = _G.__ZEN_UI_PLUGIN.config.navbar
+        navbar.show_icons = true
+        navbar.active_tab_filled = true
+        navbar.filled_background_opacity = 100
+        navbar.colored = false
+        local fm = make_instance()
+        fm[1] = { fm.file_chooser }
+        built_widgets = {}
+        _G.__ZEN_UI_REINJECT_FM_NAVBAR()
+        local filled
+        local frame
+        local fill_count = 0
+        local padded_count = 0
+        for _i, entry in ipairs(built_widgets) do
+            local widget = entry.widget
+            if widget._tint_color then
+                filled = entry
+            end
+            if widget.radius then
+                padded_count = padded_count + 1
+                assert.are.equal(7, widget.padding_left)
+                assert.are.equal(7, widget.padding_right)
+                assert.are.equal(4, widget.padding_top)
+                assert.are.equal(4, widget.padding_bottom)
+                assert.are.equal(11, widget.radius)
+            end
+            if widget.radius and widget.background then
+                frame = widget
+                fill_count = fill_count + 1
+            end
+            assert.is_nil(widget._background_color)
+            assert.is_false(widget.background ~= nil and widget.dimen.h == 2)
+        end
+        assert.are.equal(1, fill_count)
+        assert.is_true(padded_count > 1)
+        assert.are.equal(filled.widget, frame[1])
+        assert.are.same({ 255, 255, 255, 255 }, filled.widget._tint_color)
+        assert.are.same({ 0x4F, 0x6F, 0x8F, 255 }, frame.background)
+
+        local icon = filled.widget
+        local mask = package.loaded["ffi/blitbuffer"].new(34, 34)
+        icon._tint_mask = mask
+        icon._bb = { getType = function() return 1 end }
+        icon._offset_x, icon._offset_y = 0, 0
+        local drawing = {}
+        filled.class.paintTo(icon, {
+            colorblitFromRGB32 = function(_self, source, x, y, _ox, _oy, w, h, color)
+                drawing[#drawing + 1] = { source, x, y, w, h, color }
+            end,
+        }, 10, 20)
+        assert.are.same({
+            { mask, 10, 20, 34, 34, { 255, 255, 255, 255 } },
+        }, drawing)
+    end)
+
+    it("blends filled backgrounds without fading icons or touching rounded corners", function()
+        local mock = package.loaded["ffi/blitbuffer"]
+        ZenSpec.unload("ffi/blitbuffer")
+        local Blitbuffer = require("ffi/blitbuffer")
+        ZenSpec.replace("ffi/blitbuffer", mock)
+        mock.ColorRGB32, mock.new = Blitbuffer.ColorRGB32, Blitbuffer.new
+        mock.TYPE_BBRGB32 = Blitbuffer.TYPE_BBRGB32
+        package.loaded["ui/widget/container/framecontainer"].paintTo = function(frame, bb, x, y)
+            local size = frame:getSize()
+            if frame.background then
+                bb:paintRoundedRectRGB32(x, y, size.w, size.h, frame.background, frame.radius)
+            end
+            bb:paintRectRGB32(x + 8, y + 8, 4, 4, Blitbuffer.ColorRGB32(255, 255, 255, 255))
+        end
+        local navbar = _G.__ZEN_UI_PLUGIN.config.navbar
+        navbar.show_icons = true
+        navbar.active_tab_filled = true
+        local fm = make_instance()
+        fm[1] = { fm.file_chooser }
+        assert.are.equal(60, navbar.filled_background_opacity)
+        for _i, opacity in ipairs({ 60, 0, 50, 100 }) do
+            navbar.filled_background_opacity = opacity
+            built_widgets = {}
+            _G.__ZEN_UI_REINJECT_FM_NAVBAR()
+            local frame
+            for _j, entry in ipairs(built_widgets) do
+                if entry.widget.radius and entry.widget.background then frame = entry.widget end
+            end
+            for _j, mode in ipairs({ { false, 0 }, { true, 0 }, { true, 1 }, { false, 0 } }) do
+                local screen = package.loaded["device"].screen
+                screen.night_mode = mode[1]
+                for _k, buffer_type in ipairs({ Blitbuffer.TYPE_BBRGB32, Blitbuffer.TYPE_BB8 }) do
+                    local bb = Blitbuffer.new(30, 30, buffer_type)
+                    bb:setInverse(mode[2])
+                    local background = Blitbuffer.ColorRGB32(40, 80, 100, 255)
+                    bb:paintRectRGB32(0, 0, 30, 30, screen.night_mode and background:invert() or background)
+                    frame:paintTo(bb, 4, 6)
+                    bb:setInverse(0)
+                    local function visiblePixel(x, y)
+                        local pixel = bb:getPixel(x, y)
+                        return screen.night_mode and mode[2] == 0 and pixel:invert() or pixel
+                    end
+                    local expected = background:getColorRGB32()
+                    expected:blend(Blitbuffer.ColorRGB32(0x4F, 0x6F, 0x8F,
+                        math.floor(opacity * 255 / 100 + 0.5)))
+                    if buffer_type == Blitbuffer.TYPE_BB8 then
+                        expected = background:getColor8()
+                        expected:blend(Blitbuffer.ColorRGB32(0x4F, 0x6F, 0x8F,
+                            math.floor(opacity * 255 / 100 + 0.5)):getColor8A())
+                    end
+                    local pixel = visiblePixel(7, 16)
+                    -- Inversion and grayscale conversion may round one level apart.
+                    assert.is_true(math.abs(expected:getR() - pixel:getR()) <= 1)
+                    assert.is_true(math.abs(expected:getG() - pixel:getG()) <= 1)
+                    assert.is_true(math.abs(expected:getB() - pixel:getB()) <= 1)
+                    assert.is_true(math.abs(background:getColor8():getR()
+                        - visiblePixel(4, 6):getColor8():getR()) <= 1)
+                    assert.are.equal(screen.night_mode and 0 or 255, visiblePixel(13, 15):getR())
+                    assert.is_not_nil(frame.background)
+                    bb:free()
+                end
+            end
+        end
+    end)
+
+    it("preserves icon and underline colors when dark mode changes without rebuilding", function()
+        local mock = package.loaded["ffi/blitbuffer"]
+        ZenSpec.unload("ffi/blitbuffer")
+        local Blitbuffer = require("ffi/blitbuffer")
+        ZenSpec.replace("ffi/blitbuffer", mock)
+        mock.ColorRGB32 = Blitbuffer.ColorRGB32
+        local screen = package.loaded["device"].screen
+        screen_is_color = true
+        local navbar = _G.__ZEN_UI_PLUGIN.config.navbar
+        navbar.show_icons = true
+        navbar.active_tab_filled = true
+        navbar.filled_background_opacity = 100
+        navbar.filled_outline_color = { 10, 20, 30 }
+        local fm = make_instance()
+        fm[1] = { fm.file_chooser }
+        built_widgets = {}
+        _G.__ZEN_UI_REINJECT_FM_NAVBAR()
+        local icon
+        for _i, entry in ipairs(built_widgets) do
+            if entry.widget._tint_color then icon = entry.widget end
+        end
+        icon._bb = { getType = function() return 1 end }
+        icon._offset_x, icon._offset_y = 0, 0
+        local painted_color
+        local bb = {
+            colorblitFromRGB32 = function(_self, _source, _x, _y, _ox, _oy, _w, _h, color)
+                painted_color = color
+            end,
+            paintRectRGB32 = function(_self, _x, _y, _w, _h, color) painted_color = color end,
+        }
+        for _i, night_mode in ipairs({ false, true, false }) do
+            screen.night_mode = night_mode
+            icon:paintTo(bb, 0, 0)
+            assert.are.equal(night_mode and icon._tint_color:invert() or icon._tint_color, painted_color)
+        end
+        assert.are.same({ 10, 20, 30 }, navbar.filled_outline_color)
+
+        navbar.active_tab_filled = false
+        navbar.colored = true
+        built_widgets = {}
+        _G.__ZEN_UI_REINJECT_FM_NAVBAR()
+        local underline
+        for _i, entry in ipairs(built_widgets) do
+            local widget = entry.widget
+            if widget.paintTo and widget.dimen.h == 2 then underline = widget end
+        end
+        local color = Blitbuffer.ColorRGB32(0x33, 0x99, 0xFF, 255)
+        for _i, night_mode in ipairs({ false, true, false }) do
+            screen.night_mode = night_mode
+            underline:paintTo(bb, 0, 0)
+            assert.are.equal(night_mode and color:invert() or color, painted_color)
+        end
+        assert.are.same({ 0x33, 0x99, 0xFF }, navbar.active_tab_color)
+    end)
+
+    it("uses the fill color for active labels when icons are hidden", function()
+        screen_is_color = true
+        local navbar = _G.__ZEN_UI_PLUGIN.config.navbar
+        navbar.active_tab_filled = true
+        navbar.filled_outline_color = { 10, 20, 30 }
+        navbar.filled_background_color = { 40, 50, 60 }
+        navbar.colored = true
+        local fm = make_instance()
+        fm[1] = { fm.file_chooser }
+        built_widgets = {}
+        _G.__ZEN_UI_REINJECT_FM_NAVBAR()
+        local filled_labels = {}
+        for _i, entry in ipairs(built_widgets) do
+            local widget = entry.widget
+            assert.is_nil(widget._background_color)
+            if widget.text == "Home" and widget.fgcolor then
+                filled_labels[#filled_labels + 1] = widget
+            end
+        end
+        assert.are.equal(1, #filled_labels)
+        assert.are.same({ 40, 50, 60, 255 }, filled_labels[1].fgcolor)
+
+        navbar.active_tab_filled = false
+        navbar.active_tab_underline = true
+        built_widgets = {}
+        _G.__ZEN_UI_REINJECT_FM_NAVBAR()
+        local underline_count = 0
+        for _i, entry in ipairs(built_widgets) do
+            local widget = entry.widget
+            assert.is_nil(widget._background_color)
+            if widget.paintTo and widget.dimen.h == 2 then underline_count = underline_count + 1 end
+            if widget.text == "Home" and widget.fgcolor then
+                assert.are.same({ 0x33, 0x99, 0xFF, 255 }, widget.fgcolor)
+            end
+        end
+        assert.are.equal(1, underline_count)
+    end)
+
     it("captures the active view and closes library overlays before Reader opens", function()
         local fm = make_instance()
         _G.__ZEN_UI_PLUGIN.config.features.restore_library_view = true
         assert.is_true(_G.__ZEN_UI_NAVBAR_OPEN_TAB("series"))
+        shared.group_view.getActivePage = function(tab_id)
+            assert.are.equal("series", tab_id)
+            return 4
+        end
+        shared.group_view.getActiveDetail = function()
+            return { group_name = "Saga", page = 3 }
+        end
         calls = {}
 
         FileManager.onShowingReader(fm)
 
         assert.are.same({ "close_groups", "close_home" }, calls)
         assert.are.equal("series", _G.__ZEN_UI_LIBRARY_STATE.tab)
-        assert.are.equal(1, _G.__ZEN_UI_LIBRARY_STATE.page)
+        assert.are.equal(4, _G.__ZEN_UI_LIBRARY_STATE.page)
+        assert.are.equal("Saga", _G.__ZEN_UI_LIBRARY_STATE.detail_group)
+        assert.are.equal(3, _G.__ZEN_UI_LIBRARY_STATE.detail_page)
     end)
 
     it("defers FileManager listing before opening Home after Reader closes", function()

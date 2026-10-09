@@ -22,6 +22,7 @@ describe("Zen arrange list settings resume", function()
         "ui/widget/container/leftcontainer",
         "ui/widget/linewidget",
         "ui/widget/container/overlapgroup",
+        "ui/widget/overlapgroup",
         "ui/widget/radiomark",
         "ui/widget/container/rightcontainer",
         "ui/size",
@@ -114,6 +115,7 @@ describe("Zen arrange list settings resume", function()
         ZenSpec.replace("ui/widget/container/leftcontainer", {})
         ZenSpec.replace("ui/widget/linewidget", {})
         ZenSpec.replace("ui/widget/container/overlapgroup", {})
+        ZenSpec.replace("ui/widget/overlapgroup", {})
         ZenSpec.replace("ui/widget/radiomark", {})
         ZenSpec.replace("ui/widget/container/rightcontainer", {})
         ZenSpec.replace("ui/size", { padding = { large = 1 } })
@@ -229,12 +231,87 @@ describe("Zen arrange list settings resume", function()
         assert.are.equal(picker._zen_menu_proxy, callback_host)
     end)
 
-    it("restores a callback-backed settings leaf", function()
+    it("renders numeric radio selections and refreshes disabled execution options", function()
+        local function widget(_self, options)
+            options.getSize = function() return { w = 10, h = 10 } end
+            options.isTruncated = function() return false end
+            return options
+        end
+        for _i, name in ipairs({
+            "ui/widget/checkmark", "ui/widget/radiomark",
+            "ui/widget/container/framecontainer", "ui/widget/container/leftcontainer",
+            "ui/widget/container/rightcontainer", "ui/widget/overlapgroup",
+            "ui/widget/container/bottomcontainer", "ui/widget/linewidget",
+            "ui/widget/horizontalgroup", "ui/widget/horizontalspan",
+            "ui/widget/textwidget", "ui/widget/verticalgroup",
+        }) do
+            package.loaded[name].new = widget
+        end
+        package.loaded["ui/bidi"].mirroredUILayout = function() return false end
+        package.loaded["ffi/blitbuffer"].COLOR_DARK_GRAY = "gray"
+        local size = package.loaded["ui/size"]
+        size.padding = { fullscreen = 1, default = 1, large = 1 }
+        size.border = { thin = 1 }
+        size.line = { thin = 1 }
+        local icons = package.loaded["common/ui/icon_menu_item"]
+        icons.SETTINGS_TOGGLE_HEIGHT, icons.SETTINGS_TOGGLE_WIDTH = 10, 20
+        icons.SETTINGS_ICON_WIDTH, icons.SETTINGS_CARET_SIZE = 10, 10
+        icons.getItemFace = function() return { orig_size = 20 } end
+        icons.getSettingsIconFace = icons.getItemFace
+        icons.enableFullRowFocus = function() end
+
+        local sort = package.loaded["ui/widget/sortwidget"]
+        local original_new = sort.new
+        sort.new = function(self, options)
+            local picker = original_new(self, options)
+            picker._populateItems = function(parent)
+                parent.main_content = {}
+                for _i, item in ipairs(parent.item_table) do
+                    parent.main_content[#parent.main_content + 1] = {
+                        item = item, width = 100, height = 20, show_parent = parent,
+                    }
+                end
+            end
+            return picker
+        end
+        local count, index = 1, nil
+        local item = {
+            text = "Execute one by one", radio = true,
+            enabled_func = function() return count > 1 end,
+            checked_func = function() return index end,
+            callback = function() index = 1 end,
+        }
+        local picker = ArrangeList.show{
+            menu_mode = true, allow_arrange = false, item_table = { item },
+        }
+        local function radio() return picker.main_content[1].checkmark_widget end
+        assert.is_false(radio().enabled)
+        assert.is_false(radio().checked)
+        assert.is_true(item.dim)
+
+        count = 2
+        picker._zen_menu_proxy:updateItems()
+        assert.is_true(radio().enabled)
+        assert.is_not_true(item.dim)
+        item:callback()
+        assert.are.equal(1, index)
+        assert.is_true(radio().checked)
+
+        index = 2
+        picker._zen_menu_proxy:updateItems()
+        assert.is_true(radio().checked)
+        count, index = 1, nil
+        picker._zen_menu_proxy:updateItems()
+        assert.is_false(radio().enabled)
+        assert.is_false(radio().checked)
+    end)
+
+    it("restores descendants of a callback-backed settings leaf", function()
         local callback_parent
         require("modules/settings/zen_settings_page").claimArrangeRoute = function()
             return {
                 opener = { text = "Arrange" },
-                path = { "First", "Tabs" },
+                path = { "First", "Tabs", "TBR", "Order" },
             }
         end
 
@@ -250,7 +327,30 @@ describe("Zen arrange list settings resume", function()
                             keep_menu_open = true,
                             callback = function(parent)
                                 callback_parent = parent
-                                ui_manager:show({ title = "Tabs" })
+                                ArrangeList.show{
+                                    settings_resume = {
+                                        opener = parent._zen_settings_resume.opener,
+                                        path = { "First", "Tabs" },
+                                    },
+                                    item_table = {
+                                        {
+                                            text = "TBR",
+                                            sub_item_table = {
+                                                {
+                                                    text = "Order",
+                                                    _zen_settings_submenu = true,
+                                                    callback = function(order_parent)
+                                                        ui_manager:show({
+                                                            title = "Order",
+                                                            settings_resume =
+                                                                order_parent._zen_settings_resume,
+                                                        })
+                                                    end,
+                                                },
+                                            },
+                                        },
+                                    },
+                                }
                             end,
                         },
                     },
@@ -258,10 +358,12 @@ describe("Zen arrange list settings resume", function()
             },
         }
 
-        assert.are.equal(3, #shown_widgets)
-        assert.are.equal("Tabs", shown_widgets[3].title)
+        assert.are.equal(5, #shown_widgets)
+        assert.are.equal("Order", shown_widgets[5].title)
         assert.is_false(shown_widgets[2].invisible)
         assert.are.same({ "First" }, callback_parent._zen_settings_resume.path)
+        assert.are.same({ "First", "Tabs", "TBR" },
+            shown_widgets[5].settings_resume.path)
     end)
 
     it("does not reveal deferred parents while closing the whole arrange stack", function()

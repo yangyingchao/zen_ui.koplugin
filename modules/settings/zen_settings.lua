@@ -4,6 +4,7 @@ local UIManager = require("ui/uimanager")
 local settings_apply = require("modules/settings/zen_settings_apply")
 local updater        = require("modules/settings/zen_updater")
 local icons          = require("common/inline_icon_map")
+local plugin_root    = require("common/plugin_root")
 local IconItem       = require("common/ui/icon_menu_item")
 local utils          = require("modules/settings/zen_settings_utils")
 
@@ -14,8 +15,8 @@ local menu_section     = require("modules/settings/sections/menu_settings")
 local app_launcher_section = require("modules/settings/sections/app_launcher_settings")
 local reader_section   = require("modules/settings/sections/reader_settings")
 local extras_section   = require("modules/settings/sections/extras_settings")
+local general_section  = require("modules/settings/sections/general_settings")
 local about_section    = require("modules/settings/sections/about_settings")
-local updates_section  = require("modules/settings/sections/updates_settings")
 local shutdown         = require("common/shutdown")
 
 local M = {}
@@ -56,10 +57,10 @@ function M.build(plugin)
     local app_launcher_item = app_launcher_section.build(ctx)
     local reader_items         = reader_section.build(ctx)
     local extras_items      = extras_section.build(ctx)
-    local general_items     = about_section.build(ctx)
-    local updates_items     = updates_section.build(ctx)
+    local about_items     = about_section.build(ctx)
+    local general_items   = general_section.build(ctx, extras_items)
 
-    table.insert(general_items, IconItem.decorate({
+    table.insert(about_items, IconItem.decorate({
         text = _("Quit KOReader"),
         callback = function()
             UIManager:show(require("ui/widget/confirmbox"):new{
@@ -84,7 +85,6 @@ function M.build(plugin)
     })
 
     utils.reorder_nested_items_by_text(filebrowser_items, _("Status bar"), {
-        _("Enable custom status bar"),
         _("12-hour time"),
         _("Show bottom border"),
         _("Bold text"),
@@ -109,7 +109,7 @@ function M.build(plugin)
 
     utils.reorder_nested_items_by_text({ navbar_item }, _("Active tab"), {
         _("Underline"),
-        _("Underline above icon"),
+        _("Filled"),
         _("Colored"),
         _("Active tab color"),
     })
@@ -128,6 +128,29 @@ function M.build(plugin)
     -- Root menu assembly
     -- -------------------------------------------------------------------------
 
+    local function move_item(items, text, destination)
+        for i, item in ipairs(items) do
+            if item.text == text then
+                table.insert(destination, table.remove(items, i))
+                return
+            end
+        end
+    end
+
+    for _i, item in ipairs(general_items) do
+        if item.text == _("Advanced") then
+            move_item(item.sub_item_table, _("Double tap to open books"), filebrowser_items)
+            break
+        end
+    end
+
+    extras_items = utils.order_items_by_text(extras_items, {
+        _("Install ZenPM"),
+        _("Zen OPDS"),
+        _("Stats"),
+        _("Rakuyomi"),
+    })
+
     quick_settings_item.text = _("Controls")
     IconItem.decorate(quick_settings_item, icons.settings_quick)
     app_launcher_item.text = _("Launcher")
@@ -137,39 +160,49 @@ function M.build(plugin)
     IconItem.decorate(home_item, icons.settings_home)
     navbar_item.text = _("Navbar")
 
-    local root_items = {
+    local interface_items = {
         quick_settings_item,
         app_launcher_item,
-        home_item,
-        IconItem.decorate({ text = _("Library"), sub_item_table = filebrowser_items }, icons.settings_library),
         IconItem.decorate(navbar_item, icons.settings_navbar),
+    }
+    move_item(filebrowser_items, _("Status bar"), interface_items)
+    move_item(filebrowser_items, _("Font"), interface_items)
+    move_item(extras_items, _("Zen Keyboard"), interface_items)
+    move_item(filebrowser_items, _("Wallpaper"), interface_items)
+    move_item(extras_items, _("Custom icons"), interface_items)
+    move_item(quick_settings_item.sub_item_table, _("Blur menu background"), interface_items)
+    move_item(extras_items, _("Zen Search"), interface_items)
+
+    local library_item = IconItem.decorate({
+        text = _("Library"),
+        sub_item_table = filebrowser_items,
+        _zen_settings_root = "library",
+    }, icons.settings_library)
+
+    local root_items = {
+        home_item,
+        library_item,
         IconItem.decorate({ text = _("Reader"), sub_item_table = reader_items }, icons.settings_reader),
-        IconItem.decorate({ text = _("Extras"), sub_item_table = extras_items }, icons.fav_add),
-        IconItem.decorate({ text = _("Updates"), sub_item_table = updates_items }, icons.update),
         IconItem.decorate({
-            text = _("About"),
-            sub_item_table = general_items,
-        }, icons.settings_about),
+            text = _("Interface"),
+            sub_item_table = interface_items,
+            _zen_settings_root = "interface",
+        }, icons.settings_global),
+        IconItem.decorate({ text = _("Extras"), sub_item_table = extras_items }, icons.fav_add),
+        IconItem.decorate({ text = _("General"), sub_item_table = general_items }, icons.settings),
+        {
+            text = _("KOReader"),
+            icon_file = plugin_root .. "/icons/koreader.png",
+            _zen_settings_root = "koreader",
+            sub_item_table_func = function()
+                return require("modules/menu/app_launcher/native_menu").settingsItems("active")
+            end,
+        },
+        IconItem.decorate({ text = _("About"), sub_item_table = about_items }, icons.settings_about),
     }
 
-    -- Insert banner if an update is already known.
-    local update_banner = updater.build_update_available_item(plugin)
-    if update_banner then
-        table.insert(root_items, 1, update_banner)
-    end
-
-    -- KOReader reuses tab_item_table across menu open/close cycles, so
-    -- setUpdateItemTable (and build()) only runs once per session. The
-    -- tab callback fires on every switchMenuTab call — including when the
-    -- menu reopens — letting us keep the banner current in-place.
-    root_items.callback = function()
-        if root_items[1] and root_items[1]._zen_update_banner then
-            table.remove(root_items, 1)
-        end
-        local banner = updater.build_update_available_item(plugin)
-        if banner then
-            table.insert(root_items, 1, banner)
-        end
+    root_items._zen_header_action_func = function()
+        return updater.build_update_available_action(plugin)
     end
 
     -- fires when navigating back from a submenu (e.g. About after manual check).

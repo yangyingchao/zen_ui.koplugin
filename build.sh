@@ -86,11 +86,15 @@ rsync -a \
   --exclude 'spec/' \
   --exclude 'docs/' \
   --exclude 'icon-packs/' \
+  --include '/kindle-launcher/' \
+  --include '/kindle-launcher/ZenReader.sh' \
+  --include '/kindle-launcher/LICENSE' \
   --exclude '.DS_Store' \
   --exclude '.gitignore' \
   --exclude '*.zip' \
   --exclude '*.sh' \
   --include 'LICENSE.md' \
+  --include '/modules/filebrowser/metadata/LICENSES.md' \
   --exclude '*.md' \
   --exclude '*_includes/' \
   --exclude '_config.yml' \

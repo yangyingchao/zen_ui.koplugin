@@ -1,8 +1,10 @@
 describe("file manager status bar visibility", function()
     local FileManager
     local UIManager
+    local NetworkMgr
     local original_modules
     local original_plugin
+    local original_status_builder
     local created_text_widgets
 
     local function replace(name, module)
@@ -35,6 +37,7 @@ describe("file manager status bar visibility", function()
         UIManager = { _window_stack = {} }
         original_modules = {}
         original_plugin = rawget(_G, "__ZEN_UI_PLUGIN")
+        original_status_builder = rawget(_G, "__ZENOS_BUILD_STATUS_ROW")
         created_text_widgets = {}
 
         replace("ui/bidi", {})
@@ -56,7 +59,13 @@ describe("file manager status bar visibility", function()
         })
         replace("ui/widget/horizontalspan", {})
         replace("ui/widget/container/leftcontainer", {})
-        replace("ui/network/manager", {})
+        NetworkMgr = {
+            wifi_on = true,
+            connected = true,
+            isWifiOn = function(self) return self.wifi_on end,
+            isConnected = function(self) return self.connected end,
+        }
+        replace("ui/network/manager", NetworkMgr)
         replace("ui/widget/overlapgroup", {})
         replace("ui/widget/container/rightcontainer", {})
         local TextWidget = {}
@@ -68,6 +77,9 @@ describe("file manager status bar visibility", function()
             return setmetatable({}, { __index = self })
         end
         replace("ui/widget/textwidget", TextWidget)
+        replace("ui/widget/imagewidget", {
+            new = function(_, values) return values end,
+        })
         replace("ui/uimanager", UIManager)
         replace("ffi/blitbuffer", {
             ColorRGB32 = function() return 0 end,
@@ -91,7 +103,10 @@ describe("file manager status bar visibility", function()
         })
         replace("common/status_bar_registry", {})
         replace("common/ui/background", {})
-        replace("common/bluetooth", {})
+        replace("modules/menu/bluetooth/bluetooth", {
+            getState = function() end,
+            getCachedState = function() end,
+        })
         replace("common/inline_icon_map", {})
         replace("ui/rendertext", {})
         replace("gettext", setmetatable({
@@ -106,6 +121,10 @@ describe("file manager status bar visibility", function()
         })
         replace("ui/widget/menu", {})
         replace("ui/widget/touchmenu", {})
+        original_modules["common/ui/color_text_widget"] = {
+            value = package.loaded["common/ui/color_text_widget"],
+        }
+        ZenSpec.unload("common/ui/color_text_widget")
         original_modules["modules/filebrowser/patches/status_bar"] = {
             value = package.loaded["modules/filebrowser/patches/status_bar"],
         }
@@ -123,6 +142,7 @@ describe("file manager status bar visibility", function()
             package.loaded[name] = saved.value
         end
         _G.__ZEN_UI_PLUGIN = original_plugin
+        _G.__ZENOS_BUILD_STATUS_ROW = original_status_builder
     end)
 
     it("renders the configured date item", function()
@@ -137,6 +157,229 @@ describe("file manager status bar visibility", function()
         assert.are.equal(1, #group)
         assert.are.equal("August 8th", group[1].text)
         assert.are.equal("August 8th", created_text_widgets[1].text)
+    end)
+
+    it("keeps nested back buttons bound to their own views", function()
+        local status_api
+        require("common/shared_state").register = function(_plugin, api) status_api = api end
+        replace("ui/widget/button", { new = function(_self, values) return values end })
+        require("modules/filebrowser/patches/status_bar")()
+
+        local make_back = assert(get_upvalue(status_api.createStatusRowCustomBack,
+            "makeBackButton"))
+        local calls = {}
+        local tag_back = make_back(28, function() calls[#calls + 1] = "tags" end)
+        local series_back = make_back(28, function() calls[#calls + 1] = "series" end)
+        tag_back.callback()
+        series_back.callback()
+
+        assert.not_equal(tag_back, series_back)
+        assert.are.same({ "tags", "series" }, calls)
+    end)
+
+    it("limits embedded refreshes to changed and shifted status items", function()
+        local status_api
+        require("ui/geometry").new = function(_self, values) return values end
+        require("common/shared_state").register = function(_plugin, api) status_api = api end
+        require("modules/filebrowser/patches/status_bar")()
+
+        local previous = {
+            _zen_status_item_values = { date = "same", wifi = "same", battery = "99" },
+            _zen_status_item_regions = {
+                date = { x = 0, y = 0, w = 10, h = 14 },
+                wifi = { x = 20, y = 0, w = 10, h = 14 },
+                battery = { x = 50, y = 0, w = 10, h = 14 },
+            },
+        }
+        local current = {
+            _zen_status_item_values = { date = "same", wifi = "same", battery = "98" },
+            _zen_status_item_regions = {
+                date = { x = 0, y = 0, w = 10, h = 14 },
+                wifi = { x = 18, y = 0, w = 10, h = 14 },
+                battery = { x = 48, y = 0, w = 12, h = 14 },
+            },
+        }
+
+        local regions = status_api.statusRowRefreshRegions(previous, current)
+        table.sort(regions, function(first, second) return first.x < second.x end)
+
+        assert.are.same({
+            { x = 18, y = 0, w = 12, h = 14 },
+            { x = 48, y = 0, w = 12, h = 14 },
+        }, regions)
+    end)
+
+    it("flushes only requested titlebar regions", function()
+        local status_api
+        local painted, dirty, repaints = {}, {}, {}
+        require("device").screen.bb = {
+            paintRect = function(_self, x, y, w, h)
+                painted[#painted + 1] = { x = x, y = y, w = w, h = h }
+            end,
+        }
+        require("common/ui/background").library_path = function() return "" end
+        UIManager.widgetRepaint = function(_self, widget, x, y)
+            repaints[#repaints + 1] = { widget = widget, x = x, y = y }
+        end
+        UIManager.setDirty = function(_self, _kind, _refresh, region)
+            dirty[#dirty + 1] = region
+        end
+        require("common/shared_state").register = function(_plugin, api) status_api = api end
+        require("modules/filebrowser/patches/status_bar")()
+
+        local region = { x = 35, y = 20, w = 10, h = 14 }
+        status_api.repaintTitleBar({ dimen = { x = 0, y = 0, w = 600, h = 70 } }, { region })
+        assert.are.same({ region }, painted)
+        assert.are.same({ region }, dirty)
+        assert.are.equal(1, #repaints)
+
+        local row = {}
+        local tb = {
+            dimen = { x = 2, y = 3, w = 600, h = 70 },
+            title_group = { { getSize = function() return { h = 4 } end } },
+        }
+        status_api.repaintTitleBar(tb, { region }, row)
+        assert.are.same({ widget = row, x = 2, y = 7 }, repaints[2])
+    end)
+
+    it("keeps the patch active with empty status items", function()
+        _G.__ZEN_UI_PLUGIN.config.status_bar = {
+            left_order = {}, center_order = {}, right_order = {},
+        }
+
+        require("modules/filebrowser/patches/status_bar")()
+
+        assert.is_true(_G.__ZEN_UI_PLUGIN.config.features.status_bar)
+        assert.are.same({}, _G.__ZEN_UI_PLUGIN.config.status_bar.left_order)
+        assert.are.same({}, _G.__ZEN_UI_PLUGIN.config.status_bar.center_order)
+        assert.are.same({}, _G.__ZEN_UI_PLUGIN.config.status_bar.right_order)
+        assert.is_function(FileManager._updateStatusBar)
+        assert.is_function(_G.__ZENOS_BUILD_STATUS_ROW)
+    end)
+
+    it("unsubscribes its minute callback when FileManager closes", function()
+        local unsubscribed
+        require("common/clock_timer").unsubscribe = function(key) unsubscribed = key end
+        require("modules/filebrowser/patches/status_bar")()
+
+        FileManager:onCloseWidget()
+
+        assert.are.equal("filemanager_status_bar", unsubscribed)
+    end)
+
+    it("defaults Bluetooth before Wi-Fi and hides it when off or unsupported", function()
+        local status_api
+        require("common/shared_state").register = function(_plugin, api) status_api = api end
+        local cached_state
+        local state_reads = 0
+        local Bluetooth = require("modules/menu/bluetooth/bluetooth")
+        Bluetooth.getState = function()
+            state_reads = state_reads + 1
+            cached_state = true
+            return cached_state
+        end
+        Bluetooth.getCachedState = function() return cached_state end
+        require("common/inline_icon_map").bluetooth_on = "bluetooth-on"
+        _G.__ZEN_UI_PLUGIN.config.status_bar = { left_order = { "time" }, center_order = {} }
+        require("modules/filebrowser/patches/status_bar")()
+        assert.are.same({ "bluetooth", "wifi", "battery" }, _G.__ZEN_UI_PLUGIN.config.status_bar.right_order)
+
+        local build_group = get_upvalue(status_api.buildStatusRow, "_buildGroup")
+        assert.are.equal("bluetooth-on", build_group({ "bluetooth" }, { size = 14 }, false)[1].text)
+        assert.are.equal("bluetooth-on", build_group({ "bluetooth" }, { size = 14 }, false)[1].text)
+        assert.are.equal(1, state_reads)
+        cached_state = false
+        assert.is_nil(build_group({ "bluetooth" }, { size = 14 }, false))
+        cached_state = nil
+        assert.is_nil(build_group({ "bluetooth" }, { size = 14 }, false))
+        assert.are.equal(1, state_reads)
+    end)
+
+    it("only hides Wi-Fi when it is fully off", function()
+        local status_api
+        local SharedState = require("common/shared_state")
+        SharedState.register = function(_plugin, api) status_api = api end
+        _G.__ZEN_UI_PLUGIN.config.status_bar.wifi_hide_when_off = true
+        require("modules/filebrowser/patches/status_bar")()
+
+        local build_group = get_upvalue(status_api.buildStatusRow, "_buildGroup")
+
+        NetworkMgr.wifi_on = false
+        assert.is_nil(build_group({ "wifi" }, { size = 14 }, false))
+
+        _G.__ZEN_UI_PLUGIN.config.status_bar.wifi_hide_when_off = false
+        local off = build_group({ "wifi" }, { size = 14 }, false)
+        assert.are.equal("\u{ECA9}", off[1].text)
+
+        _G.__ZEN_UI_PLUGIN.config.status_bar.wifi_hide_when_off = true
+        NetworkMgr.wifi_on = true
+        NetworkMgr.connected = false
+        NetworkMgr.pending_connection = true
+        local connecting = build_group({ "wifi" }, { size = 14 }, false)
+        assert.are.equal("\u{ECA8}", connecting[1].text)
+        assert.is_not_nil(connecting[1].fgcolor)
+
+        NetworkMgr.connected = true
+        NetworkMgr.pending_connection = false
+        local connected = build_group({ "wifi" }, { size = 14 }, false)
+        assert.are.equal("\u{ECA8}", connected[1].text)
+        assert.is_nil(connected[1].fgcolor)
+    end)
+
+    it("keeps Wi-Fi gray while changing or disconnected with the radio on", function()
+        local status_api
+        require("common/shared_state").register = function(_plugin, api) status_api = api end
+        local Bluetooth = require("modules/menu/bluetooth/bluetooth")
+        local changing = true
+        Bluetooth.isChanging = function() return changing end
+        NetworkMgr.isWifiChanging = function() return changing end
+        require("common/inline_icon_map").bluetooth_on = "bluetooth-on"
+        _G.__ZEN_UI_PLUGIN.config.status_bar.wifi_hide_when_off = true
+        require("modules/filebrowser/patches/status_bar")()
+        local build_group = get_upvalue(status_api.buildStatusRow, "_buildGroup")
+
+        for _i, wifi_on in ipairs({ false, true }) do
+            NetworkMgr.wifi_on, NetworkMgr.connected = wifi_on, wifi_on
+            assert.is_not_nil(build_group({ "wifi" }, { size = 14 }, false)[1].fgcolor)
+            assert.is_not_nil(build_group({ "bluetooth" }, { size = 14 }, false)[1].fgcolor)
+        end
+        changing = false
+        NetworkMgr.connected = false
+        local failed = build_group({ "wifi" }, { size = 14 }, false)
+        assert.are.equal("\u{ECA8}", failed[1].text)
+        assert.is_not_nil(failed[1].fgcolor)
+        NetworkMgr.wifi_on = false
+        assert.is_nil(build_group({ "wifi" }, { size = 14 }, false))
+        assert.is_nil(build_group({ "bluetooth" }, { size = 14 }, false))
+        assert.is_function(FileManager.onNetworkStateChanged)
+    end)
+
+    it("refreshes the settings Wi-Fi icon after reconnecting while a toast is visible", function()
+        local status_api
+        require("common/shared_state").register = function(_plugin, api) status_api = api end
+        local changing = true
+        NetworkMgr.isWifiChanging = function() return changing end
+        require("modules/filebrowser/patches/status_bar")()
+        local build_group = get_upvalue(status_api.buildStatusRow, "_buildGroup")
+        local icon
+        local refreshes = 0
+        local settings = {
+            _zen_status_refresh = function()
+                icon = build_group({ "wifi" }, { size = 14 }, false)[1]
+                refreshes = refreshes + 1
+            end,
+        }
+        FileManager.instance = FileManager
+        UIManager._window_stack = {
+            { widget = FileManager }, { widget = settings }, { widget = { toast = true } },
+        }
+
+        FileManager:onNetworkConnected()
+        assert.is_not_nil(icon.fgcolor)
+        changing = false
+        FileManager:onNetworkStateChanged()
+        assert.is_nil(icon.fgcolor)
+        assert.are.equal(2, refreshes)
     end)
 
     it("does not repaint behind a Home page that hides its status bar", function()
@@ -190,6 +433,137 @@ describe("file manager status bar visibility", function()
         UIManager._window_stack[#UIManager._window_stack + 1] = { widget = {} }
         FileManager:_updateStatusBar()
         assert.are.equal(1, repaint_count)
+    end)
+
+    it("skips unchanged minute paints and repaints only changed title-row items", function()
+        require("ui/geometry").new = function(_self, values) return values end
+        require("modules/filebrowser/patches/status_bar")()
+
+        local function item(height)
+            return { getSize = function() return { w = 600, h = height } end }
+        end
+        local function status_row(time)
+            return {
+                getSize = function() return { w = 600, h = 20 } end,
+                _zen_status_item_values = { ["left:time"] = time },
+                _zen_status_item_regions = {
+                    ["left:time"] = { x = 10, y = 0, w = 30, h = 20 },
+                },
+            }
+        end
+        local rows = { status_row("12:34"), status_row("12:35") }
+        assert.is_true(replace_upvalue(FileManager._updateStatusBar,
+            "createStatusRow", function() return table.remove(rows, 1) end))
+        local repaints = {}
+        assert.is_true(replace_upvalue(FileManager._updateStatusBar,
+            "repaintTitleBar", function(_tb, regions, row)
+                repaints[#repaints + 1] = { regions = regions, row = row }
+            end))
+
+        local title_group = { item(4), status_row("12:34"), item(1), item(1) }
+        function title_group:resetLayout() end
+        FileManager.title_bar = {
+            dimen = { x = 2, y = 3 },
+            title_group = title_group,
+            titlebar_height = 24,
+            width = 600,
+            button_padding = 0,
+        }
+        FileManager.instance = FileManager
+        UIManager._window_stack = { { widget = FileManager } }
+
+        FileManager:_updateStatusBar(false, true)
+        assert.are.equal(0, #repaints)
+
+        FileManager:_updateStatusBar(false, true)
+        assert.are.equal(1, #repaints)
+        assert.are.equal(title_group[2], repaints[1].row)
+        assert.are.same({ { x = 12, y = 7, w = 30, h = 20 } }, repaints[1].regions)
+    end)
+
+    it("builds the setup row without an extra titlebar repaint", function()
+        local next_tick
+        local repaint_count = 0
+        _G.__ZEN_UI_PLUGIN.config.status_bar.hide_browser_bar = false
+        FileManager.setupLayout = function() end
+        FileManager.updateTitleBarPath = function(self, path) self.updated_path = path end
+        UIManager.nextTick = function(_self, callback) next_tick = callback end
+        require("common/clock_timer").subscribe = function() end
+        require("modules/filebrowser/patches/status_bar")()
+
+        local next_row = { getSize = function() return { h = 1 } end }
+        assert.is_true(replace_upvalue(FileManager._updateStatusBar,
+            "createStatusRow", function() return next_row end))
+        assert.is_true(replace_upvalue(FileManager._updateStatusBar,
+            "repaintTitleBar", function() repaint_count = repaint_count + 1 end))
+
+        local function item()
+            return { getSize = function() return { h = 1 } end }
+        end
+        local title_group = { item(), item(), item(), item() }
+        function title_group:resetLayout() end
+        FileManager.title_bar = {
+            title_group = title_group,
+            titlebar_height = 4,
+            width = 600,
+            button_padding = 0,
+        }
+        FileManager.file_chooser = { path = "/library" }
+        FileManager.instance = FileManager
+        UIManager._window_stack = { { widget = FileManager } }
+
+        FileManager:setupLayout()
+        assert.are.equal(next_row, title_group[2])
+        assert.are.equal(0, repaint_count)
+
+        next_tick()
+        assert.are.equal("/library", FileManager.updated_path)
+        assert.are.equal(0, repaint_count)
+
+        FileManager:_updateStatusBar()
+        assert.are.equal(1, repaint_count)
+    end)
+
+    it("updates minute subscriptions when the visible title items change", function()
+        local subscribed, unsubscribed = 0, 0
+        local timer = require("common/clock_timer")
+        timer.subscribe = function() subscribed = subscribed + 1 end
+        timer.unsubscribe = function() unsubscribed = unsubscribed + 1 end
+        require("modules/filebrowser/patches/status_bar")()
+
+        local function item()
+            return { getSize = function() return { w = 600, h = 1 } end }
+        end
+        local rows = {
+            { ["center:time"] = "12:34" },
+            {},
+            { ["right:battery"] = "73%" },
+        }
+        assert.is_true(replace_upvalue(FileManager._updateStatusBar,
+            "createStatusRow", function()
+                return setmetatable({ _zen_status_item_values = table.remove(rows, 1) },
+                    { __index = item() })
+            end))
+        assert.is_true(replace_upvalue(FileManager._updateStatusBar,
+            "_fm_autoRefresh", function() end))
+        local title_group = { item(), item(), item(), item() }
+        function title_group:resetLayout() end
+        FileManager.title_bar = {
+            title_group = title_group,
+            titlebar_height = 4,
+            width = 600,
+            button_padding = 0,
+        }
+        FileManager.instance = FileManager
+
+        FileManager:_updateStatusBar(true)
+        assert.are.equal(1, subscribed)
+
+        FileManager:_updateStatusBar(true)
+        assert.are.equal(1, unsubscribed)
+
+        FileManager:_updateStatusBar(true)
+        assert.are.equal(2, subscribed)
     end)
 
     it("routes the real-folder chevron through onFolderUp", function()
@@ -316,6 +690,46 @@ describe("file manager status bar visibility", function()
 
         assert.is_false(pcall(status_api.createStatusRow,
             "/library/Fiction/Series", file_manager))
+        assert.are.equal(1, back_buttons)
+    end)
+
+    it("hides back only for a directly opened Archive root", function()
+        local status_api
+        local back_buttons = 0
+        _G.__ZEN_UI_PLUGIN.config.status_bar = {
+            left_order = {}, center_order = {}, right_order = {},
+        }
+        ZenSpec.replace("common/paths", {
+            getHomeDir = function() return "/library" end,
+            normPath = function(path) return path end,
+            isHomeLocked = function() return false end,
+        })
+        ZenSpec.replace("common/shared_state", {
+            register = function(_plugin, api) status_api = api end,
+            registerLoader = function() end,
+        })
+        ZenSpec.replace("ui/widget/button", {
+            new = function()
+                back_buttons = back_buttons + 1
+                return { label_widget = {}, frame = {} }
+            end,
+        })
+
+        require("modules/filebrowser/patches/status_bar")()
+        assert.is_true(replace_upvalue(status_api.createStatusRow,
+            "_buildGroup", function() error("row build stopped") end))
+
+        local file_manager = {
+            file_chooser = {
+                item_table = {},
+                _zen_direct_archive_root = "/archive",
+            },
+        }
+        assert.is_false(pcall(status_api.createStatusRow, "/archive", file_manager))
+        assert.are.equal(0, back_buttons)
+
+        file_manager.file_chooser._zen_direct_archive_root = nil
+        assert.is_false(pcall(status_api.createStatusRow, "/archive", file_manager))
         assert.are.equal(1, back_buttons)
     end)
 end)

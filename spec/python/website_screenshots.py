@@ -33,7 +33,7 @@ CATALOG_PATH = Path(__file__).with_name("website_screenshot_scenarios.json")
 DEFAULT_PROFILE = REPO_ROOT / ".website-screenshot-books.json"
 ARTIFACT_ROOT = REPO_ROOT / "spec" / ".artifacts" / "screenshots"
 SHOWCASE_BACKGROUND = (
-    REPO_ROOT / "spec" / "fixtures" / "sergei-a-7NjKwGDUmBM-unsplash.jpg"
+    REPO_ROOT / "spec" / "fixtures" / "mountain_gray.jpg"
 )
 SCREEN_SIZE = (1272, 1696)
 BB_TYPE_RGB32 = 5
@@ -49,13 +49,14 @@ GROUPS = frozenset(("home", "library", "menus", "reader"))
 SESSIONS = frozenset(("general", "reader"))
 EXPECTED_IDS = frozenset((
     "zen_home", "home_bookshelf", "home_simple",
-    "library_covers_full", "library_list_full", "context_menu", "stats",
-    "launcher", "quicksettings", "quickstart", "zen_settings",
+    "library_covers_full", "library_list_full", "context_menu", "metadata_editor", "stats",
+    "launcher", "quicksettings", "quicksettings_minimal", "network_switcher",
+    "bluetooth_switcher", "quickstart", "zen_settings",
     "launcher_add_plugin_menu", "launcher_add_koreader_menu",
     "controls_buttons_settings", "navbar_buttons_settings",
     "reader", "reader_launcher_book_switcher",
     "reader_launcher_book_details", "reader_book_details", "page_browser_grid",
-    "reader_dict", "reader_highlight",
+    "page_browser_carousel", "reader_dict", "reader_highlight",
 ))
 SHOWCASE_BOOK_COUNT = 12
 SHOWCASE_PLACEHOLDER_COUNT = SHOWCASE_BOOK_COUNT
@@ -255,8 +256,8 @@ def validate_catalog(scenarios: Sequence[Scenario]) -> None:
         ):
             raise ValueError(f"invalid crop declaration for {scenario.id}")
     page_browser_ids = [value for value in ids if value.startswith("page_browser")]
-    if page_browser_ids != ["page_browser_grid"]:
-        raise ValueError("page_browser_grid must be the sole Page Browser scenario")
+    if page_browser_ids != ["page_browser_grid", "page_browser_carousel"]:
+        raise ValueError("Page Browser scenarios must be grid then carousel")
     if "update_available" in ids:
         raise ValueError("update_available is intentionally outside the capture catalog")
 
@@ -652,6 +653,8 @@ def _zen_config(background_path: Path = SHOWCASE_BACKGROUND) -> dict[str, object
             "show_warmth": True,
             "rotate_action": "90",
             "screenshot_timer_seconds": 3,
+            "zen_settings_label": "",
+            "launcher_label": "",
             "custom_buttons": [],
             "next_custom_id": 0,
             "layout_version": 2,
@@ -974,6 +977,7 @@ def _seed_sidecars(books: Sequence[StagedBook]) -> None:
         metadata = {
             "doc_pages": 384 + index * 17,
             "percent_finished": progress[index],
+            "partial_md5_checksum": hashlib.md5(str(book.path).encode()).hexdigest(),
             "summary": {"status": statuses[index]},
         }
         if book.role != "reader":
@@ -1105,6 +1109,14 @@ def seed_showcase(ko_home: Path, books: Sequence[StagedBook], runtime: Path) -> 
         "show_book_switcher": True,
         "book_switcher_reader_only": False,
         "show_book_details": True,
+        "book_details_enabled": {
+            "read_time": True,
+            "time_remaining": True,
+            "pages_today": True,
+            "time_today": True,
+            "pages": True,
+            "progress": True,
+        },
         "zenpm_launcher_added": True,
     })
     fixed_ts = int(time.mktime(FIXED_LOCAL_TIME.timetuple()))
@@ -1164,7 +1176,8 @@ def audit_inventory(
             continue
         if filename not in catalog_files:
             errors.append(f"untracked emulator image {filename}: {', '.join(references)}")
-        if filename.startswith("page_browser") and filename != "page_browser_grid.png":
+        if filename.startswith("page_browser") and filename not in (
+                "page_browser_grid.png", "page_browser_carousel.png"):
             errors.append(f"retired Page Browser image remains in docs: {filename}")
         if filename == "update_available.png":
             errors.append("update_available.png remains in docs")
@@ -1173,7 +1186,8 @@ def audit_inventory(
                 or filename in MANUAL_SCREENSHOT_ASSETS
                 or filename.endswith(".svg")):
             continue
-        if filename.startswith("page_browser") and filename != "page_browser_grid.png":
+        if filename.startswith("page_browser") and filename not in (
+                "page_browser_grid.png", "page_browser_carousel.png"):
             warnings.append(
                 f"website carousel still contains retired {filename}; remove it when the website source is next updated"
             )
@@ -1493,6 +1507,26 @@ class CaptureWorkflow:
             _require_ok(driver.command("set_library_display_mode", mode="mosaic_image"), action)
             _require_ok(driver.command("open_file_context", path=str(book.path.resolve())), action)
             return
+        if action == "metadata_editor":
+            title = str(options["book_title"])
+            book = next((book for book in books if book.title == title), None)
+            if book is None:
+                raise CaptureError(f"metadata editor book was not staged: {title}")
+            response = _require_ok(
+                driver.command(
+                    "show_metadata_editor_fixture",
+                    orientation="portrait",
+                    file=str(book.path.resolve()),
+                ),
+                action,
+            )
+            metadata = response.get("metadata", {})
+            if (metadata.get("file") != str(book.path.resolve())
+                    or metadata.get("title") != book.title
+                    or metadata.get("dirty") is not False
+                    or metadata.get("has_current_cover") is not True):
+                raise CaptureError(f"metadata editor fixture mismatch: {metadata}")
+            return
         if action == "navbar":
             _require_ok(driver.command("set_library_display_mode", mode="mosaic_image"), action)
             return
@@ -1525,7 +1559,45 @@ class CaptureWorkflow:
                 )
             if options.get("show_lockdown_control") is True:
                 _require_ok(driver.command("showcase_lockdown_control"), action)
-            _require_ok(driver.command("menu_tab_layout", tab_id=options["tab"]), action)
+            if options.get("minimal_controls") is True:
+                _require_ok(driver.command("showcase_minimal_controls"), action)
+            layout = _require_ok(driver.command("menu_tab_layout", tab_id=options["tab"]), action)
+            if options.get("minimal_controls") is True and (
+                layout.get("active_tab") != "quicksettings"
+                or "app_launcher" in layout.get("tabs", [])
+                or layout.get("button_ids") != [
+                    "wifi", "night", "rotate", "zen", "zen_settings", "launcher",
+                ]
+                or layout.get("unified_slider") is not True
+                or not {"Settings", "Launcher"}.issubset(layout.get("visible_texts", []))
+            ):
+                raise CaptureError(f"minimal Controls layout mismatch: {layout}")
+            return
+        if action == "network_switcher":
+            names = options.get("wifi_names")
+            if not isinstance(names, list) or len(names) < 2:
+                raise CaptureError("network switcher fixture needs fictional Wi-Fi names")
+            names = [str(name) for name in names]
+            _require_ok(driver.command("show_network_switcher_fixture", names=names), action)
+            _wait_for(
+                lambda: driver.command("network_switcher_fixture_state"),
+                lambda value: value.get("network_switcher", {}).get("labels") == names
+                and value.get("network_switcher", {}).get("status_visible") is True,
+                scenario.id,
+            )
+            return
+        if action == "bluetooth_switcher":
+            names = options.get("device_names")
+            if not isinstance(names, list) or len(names) < 2:
+                raise CaptureError("Bluetooth switcher fixture needs fictional device names")
+            names = [str(name) for name in names]
+            _require_ok(driver.command("show_bluetooth_switcher_fixture", names=names), action)
+            _wait_for(
+                lambda: driver.command("bluetooth_switcher_fixture_state"),
+                lambda value: value.get("bluetooth_switcher", {}).get("labels") == names
+                and value.get("bluetooth_switcher", {}).get("status_visible") is True,
+                scenario.id,
+            )
             return
         if action == "quickstart":
             _require_ok(driver.command("open_quickstart"), action)
@@ -1549,6 +1621,10 @@ class CaptureWorkflow:
                 lambda: driver.command("settings_page_state"),
                 lambda value: value.get("settings", {}).get("title") == "Settings",
                 "settings root",
+            )
+            _require_ok(
+                driver.command("settings_page_select", label="Interface"),
+                "Interface",
             )
             if action.startswith("launcher_add_"):
                 root_label = "Launcher"
@@ -1665,7 +1741,7 @@ class CaptureWorkflow:
                     == expected_preset,
                     expected_preset,
                 )
-            if control == "page_browser_grid":
+            if control in ("page_browser_grid", "page_browser_carousel"):
                 _require_ok(driver.command("activate_reader_control", name="page_browser"), control)
                 _wait_for(
                     lambda: driver.command("page_browser_state"),

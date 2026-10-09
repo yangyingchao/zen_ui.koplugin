@@ -2,6 +2,7 @@ describe("reader module initialization", function()
     local patch_names = {
         "library_navigation",
         "page_browser",
+        "stable_page_statistics",
         "opening_banner",
         "book_status",
         "status_on_open",
@@ -11,6 +12,7 @@ describe("reader module initialization", function()
         "reader_footer_cbz_hide",
         "margin_hold_guard",
         "bookmarks",
+        "highlight_names",
         "dict_quick_lookup",
         "highlight_menu",
         "reader_top_status_bar",
@@ -32,6 +34,10 @@ describe("reader module initialization", function()
     before_each(function()
         _G.__ZEN_UI_PLUGIN = nil
         _G.__ZEN_UI_RUNTIME_PATCHES = nil
+        ZenSpec.replace("device", {
+            isKindle = function() return false end,
+            hasColorScreen = function() return false end,
+        })
     end)
 
     after_each(function()
@@ -49,6 +55,7 @@ describe("reader module initialization", function()
         assert.same({
             "library_navigation",
             "page_browser",
+            "stable_page_statistics",
             "opening_banner",
             "book_status",
             "status_on_open",
@@ -58,6 +65,7 @@ describe("reader module initialization", function()
             "reader_footer_cbz_hide",
             "margin_hold_guard",
             "bookmarks",
+            "highlight_names",
             "dict_quick_lookup",
             "highlight_menu",
         }, calls)
@@ -65,7 +73,7 @@ describe("reader module initialization", function()
         assert.is_nil(_G.__ZEN_UI_RUNTIME_PATCHES.reader_top_status_bar)
 
         assert.is_true(Reader.init(logger, plugin))
-        assert.are.equal(13, #calls)
+        assert.are.equal(15, #calls)
     end)
 
     it("records a successfully enabled runtime status-bar patch", function()
@@ -99,6 +107,20 @@ describe("reader module initialization", function()
         assert.is_true(_G.__ZEN_UI_RUNTIME_PATCHES.reader_themes)
     end)
 
+    it("loads reader refresh handling on color Kindles with themes disabled", function()
+        local calls = {}
+        local Reader = prepare_patches(calls)
+        local logger = { dbg = function() end, warn = function() end }
+        ZenSpec.replace("device", {
+            isKindle = function() return true end,
+            hasColorScreen = function() return true end,
+        })
+
+        Reader.init(logger, { config = { features = { reader_themes = false } } })
+        assert.are.equal("reader_themes", calls[#calls])
+        assert.is_true(_G.__ZEN_UI_RUNTIME_PATCHES.reader_themes)
+    end)
+
     it("isolates a failed patch, restores the prior plugin, and continues initialization", function()
         local calls, warnings = {}, {}
         local Reader = prepare_patches(calls, "book_status")
@@ -113,7 +135,7 @@ describe("reader module initialization", function()
 
         assert.is_true(Reader.init(logger, { config = { features = {} } }))
         assert.are.equal(previous, _G.__ZEN_UI_PLUGIN)
-        assert.are.equal("status_on_open", calls[5])
+        assert.are.equal("status_on_open", calls[6])
         assert.are.equal(1, #warnings)
         assert.are.equal("grouped reader feature failed", warnings[1][1])
         assert.are.equal("book_status", warnings[1][2])

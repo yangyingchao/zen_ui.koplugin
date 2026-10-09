@@ -10,6 +10,8 @@
 --       value_min  = 0,
 --       value_max  = 100,
 --       on_change  = function(v) ... end,
+--       on_drag_start = function() ... end,
+--       on_drag_end   = function() ... end,
 --   }
 --
 -- API:
@@ -248,6 +250,7 @@ function ZenSlider:handlePan(ges)
     local dir = ges.direction
     if dir == "north" or dir == "south" then return false end
     if not self:_isNearKnob(ges.pos.x) then return false end
+    if self.on_drag_start then self.on_drag_start() end
     self._dragging = true
     self.hide_knob = true
     self:applyPosition(ges.pos.x)
@@ -260,6 +263,7 @@ function ZenSlider:handlePanRelease(ges, show_parent, dirty_dimen)
     self._dragging = false
     self.hide_knob = false
     self:applyPosition(ges.pos.x)
+    if self.on_drag_end then self.on_drag_end() end
     UIManager:setDirty(show_parent, "ui", dirty_dimen)
     return true
 end
@@ -288,6 +292,7 @@ function ZenSlider:handleSwipe(ges, show_parent, dirty_dimen)
         if not self:_isNearKnob(ges.pos.x) then return false end
     end
     local was_dragging = self._dragging
+    if not was_dragging and self.on_drag_start then self.on_drag_start() end
     self._dragging = false
     self.hide_knob = false
     if not was_dragging then
@@ -298,6 +303,7 @@ function ZenSlider:handleSwipe(ges, show_parent, dirty_dimen)
         -- Pan events already positioned the knob; repaint to restore it.
         UIManager:setDirty(show_parent, "ui", dirty_dimen)
     end
+    if self.on_drag_end then self.on_drag_end() end
     return true
 end
 
@@ -306,6 +312,7 @@ function ZenSlider:handleMultiSwipe(ges, show_parent, dirty_dimen)
     if not self._dragging then return false end
     self._dragging = false
     self.hide_knob = false
+    if self.on_drag_end then self.on_drag_end() end
     UIManager:setDirty(show_parent, "ui", dirty_dimen)
     return true
 end
@@ -325,20 +332,25 @@ function ZenSlider.installTouchMenuHooks(TouchMenu, opts)
     local is_locked = opts.is_locked
     local swipe_fb  = opts.swipe_fallback
     local mswipe_fb = opts.multiswipe_fallback
+    local orig_onPan = TouchMenu.onPan
 
     function TouchMenu:onPanCloseAllMenus(arg, ges_ev)
-        if not in_panel(self) then return end
+        if not in_panel(self) then
+            if orig_onPan then return orig_onPan(self, arg, ges_ev) end
+            return
+        end
         if is_locked(self) then
             -- A pan arrived while the input lock is active (e.g. the same
             -- gesture that opened the menu). Mark it so the release is also
             -- consumed once the lock expires.
             self._zen_panel_opening_pan = true
-            return
+            return true
         end
         self._zen_panel_opening_pan = false  -- clear stale flag once unlocked
         for _i, sl in ipairs(get_sl(self)) do
             if sl:handlePan(ges_ev) then return true end
         end
+        if orig_onPan then return orig_onPan(self, arg, ges_ev) end
     end
 
     function TouchMenu:onPanReleaseCloseAllMenus(arg, ges_ev)

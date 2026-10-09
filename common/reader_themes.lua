@@ -1,4 +1,5 @@
 local UIManager = require("ui/uimanager")
+local cre_inverts_colors = (require("version"):getNormalizedCurrentVersion() or 0) >= 202607000000
 
 local M = {}
 
@@ -45,14 +46,50 @@ local function normalize_color(value)
     return value:match("^#%x%x%x%x%x%x$") and value or nil
 end
 
+local function color_to_hsv(value)
+    local color = normalize_color(value)
+    if not color then return end
+    local r = tonumber(color:sub(2, 3), 16) / 255
+    local g = tonumber(color:sub(4, 5), 16) / 255
+    local b = tonumber(color:sub(6, 7), 16) / 255
+    local max = math.max(r, g, b)
+    local min = math.min(r, g, b)
+    local delta = max - min
+    local hue = 0
+    if delta > 0 then
+        if max == r then
+            hue = 60 * (((g - b) / delta) % 6)
+        elseif max == g then
+            hue = 60 * (((b - r) / delta) + 2)
+        else
+            hue = 60 * (((r - g) / delta) + 4)
+        end
+    end
+    return hue, max == 0 and 0 or delta / max, max
+end
+
 local function valid_color(value)
     return normalize_color(value) ~= nil
 end
 
-local function display_color(value)
+local function display_color(value, document)
     local color = normalize_color(value)
     if not color or not is_dark_mode() then return color end
+    -- Recent CRe already pre-inverts non-gray CSS colors in color rendering.
+    if cre_inverts_colors and document and document.render_color and document._nightmode_images
+            and (color:sub(2, 3) ~= color:sub(4, 5) or color:sub(2, 3) ~= color:sub(6, 7)) then
+        return color
+    end
     return string.format("#%06x", 0xffffff - tonumber(color:sub(2), 16))
+end
+
+local function blitbuffer_color(value)
+    local color = display_color(value)
+    if not color then return nil end
+    local r = tonumber(color:sub(2, 3), 16)
+    local g = tonumber(color:sub(4, 5), 16)
+    local b = tonumber(color:sub(6, 7), 16)
+    return require("ffi/blitbuffer").ColorRGB32(r, g, b, 0xFF)
 end
 
 local function theme_for(plugin, dark_mode)
@@ -78,14 +115,14 @@ local function without_zen_css(css)
     return start and css:sub(1, start - 1) or css
 end
 
-function M.appendCss(plugin, css)
+function M.appendCss(plugin, css, document)
     local base = without_zen_css(css)
     if not is_enabled(plugin) then return base end
 
     local theme = theme_for(plugin)
     if not theme then return base end
-    local background = display_color(theme.background)
-    local text = display_color(theme.text)
+    local background = display_color(theme.background, document)
+    local text = display_color(theme.text, document)
     return base .. "\n" .. CSS_START .. "\n"
         .. "html, body { background-color: " .. background .. " !important; }\n"
         .. "body, body * { color: " .. text .. " !important; }\n"
@@ -110,12 +147,12 @@ end
 
 function M.getTextColor(plugin)
     local theme = theme_for(plugin)
-    if not theme then return nil end
-    local text = display_color(theme.text)
-    local r = tonumber(text:sub(2, 3), 16)
-    local g = tonumber(text:sub(4, 5), 16)
-    local b = tonumber(text:sub(6, 7), 16)
-    return require("ffi/blitbuffer").ColorRGB32(r, g, b, 0xFF)
+    return theme and blitbuffer_color(theme.text) or nil
+end
+
+function M.getBackgroundColor(plugin)
+    local theme = theme_for(plugin)
+    return theme and blitbuffer_color(theme.background) or nil
 end
 
 function M.applyFont(reader, plugin)
@@ -159,7 +196,7 @@ function M.applyCurrent(plugin)
     local styletweak = reader.styletweak
     if type(typeset.css) == "string" and styletweak
         and type(styletweak.getCssText) == "function" then
-        reader.document:setStyleSheet(typeset.css, M.appendCss(plugin, styletweak:getCssText()))
+        reader.document:setStyleSheet(typeset.css, M.appendCss(plugin, styletweak:getCssText(), reader.document))
     elseif type(typeset.onApplyStyleSheet) == "function" then
         reader.typeset:onApplyStyleSheet()
     end
@@ -183,6 +220,21 @@ function M.applyCurrent(plugin)
     return true
 end
 
+function M.refreshFull(widget)
+    local Screen = require("device").screen
+    UIManager:setDirty(widget, "full")
+    if is_dark_mode() and Screen.waveform_full then
+        -- Night waveforms can leave UI ghosting on a themed background.
+        local flashnight = Screen.waveform_flashnight
+        Screen.waveform_flashnight = Screen.waveform_full
+        local ok, err = pcall(UIManager.forceRePaint, UIManager)
+        Screen.waveform_flashnight = flashnight
+        if not ok then error(err, 0) end
+    else
+        UIManager:forceRePaint()
+    end
+end
+
 function M.isEnabled(plugin)
     return is_enabled(plugin)
 end
@@ -193,6 +245,10 @@ end
 
 function M.normalizeColor(value)
     return normalize_color(value)
+end
+
+function M.colorToHsv(value)
+    return color_to_hsv(value)
 end
 
 function M.isActive(plugin)

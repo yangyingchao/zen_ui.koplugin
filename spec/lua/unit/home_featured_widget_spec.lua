@@ -4,6 +4,7 @@ describe("home featured widget", function()
     local description_split
     local empty_sources
     local cover_ratio
+    local html_content
 
     local function widget_class(kind)
         return {
@@ -60,6 +61,7 @@ describe("home featured widget", function()
         description_split = nil
         empty_sources = {}
         cover_ratio = 2 / 3
+        html_content = nil
         rawset(_G, "__ZEN_UI_SET_OPENING_BANNER_COVER", nil)
         ZenSpec.replace("common/ui/background", { tile_bg = function(color) return color end })
         ZenSpec.replace("ffi/blitbuffer", {
@@ -84,6 +86,15 @@ describe("home featured widget", function()
         }) do
             ZenSpec.replace(name, widget_class(name))
         end
+        ZenSpec.replace("ui/widget/htmlboxwidget", {
+            new = function(_self, values)
+                local widget = widget_class("ui/widget/htmlboxwidget"):new(values)
+                widget.setContent = function(_widget, body, css, font_size)
+                    html_content = { body = body, css = css, font_size = font_size }
+                end
+                return widget
+            end,
+        })
         ZenSpec.replace("ui/gesturerange", widget_class("gesture"))
         ZenSpec.replace("device", {
             screen = {
@@ -167,6 +178,16 @@ describe("home featured widget", function()
         end
     end
 
+    local function progress_bar_height(left_text, right_text)
+        for _i, widget in ipairs(created) do
+            if widget.kind == "ui/widget/horizontalgroup"
+                    and widget[1] and widget[1].text == left_text
+                    and widget[5] and widget[5].text == right_text then
+                return widget[3] and widget[3].dimen and widget[3].dimen.h
+            end
+        end
+    end
+
     it("renders the recent book cover, title, author, and description", function()
         local opened
         local actions
@@ -244,6 +265,45 @@ describe("home featured widget", function()
         assert.is_true(has_text("120 pages"))
         assert.is_true(actions.activate())
         assert.are.equal(book.path, opened)
+    end)
+
+    it("registers only its embedded status row for minute repaint", function()
+        local refresh
+        local repaint_widget
+        local status_builds = 0
+        local expected_regions = {{ x = 4, y = 0, w = 20, h = 14 }}
+        local Featured = require("modules/filebrowser/patches/home/widgets/featured_common")
+        Featured.build({
+            width = 600,
+            height = 220,
+            module_cfg = { show_status_bar = true },
+            data = {
+                getFeaturedBook = function()
+                    return { path = "/library/alpha.epub", title = "Alpha", status = "new" }
+                end,
+            },
+            buildStatusRow = function(width)
+                status_builds = status_builds + 1
+                return widget_class("status"):new{ width = width, height = 14 }
+            end,
+            statusRowRefreshRegions = function(previous, current)
+                assert.is_table(previous)
+                assert.is_table(current)
+                return expected_regions
+            end,
+            registerClockRefresh = function(callback, target)
+                refresh = callback
+                repaint_widget = target
+            end,
+        }, "recently_read")
+
+        assert.is_function(refresh)
+        assert.are.equal("ui/widget/container/framecontainer", repaint_widget.kind)
+        assert.are.equal(14, repaint_widget.height)
+        local did_refresh, regions = refresh({ "time", "battery" })
+        assert.is_true(did_refresh)
+        assert.are.equal(expected_regions, regions)
+        assert.are.equal(2, status_builds)
     end)
 
     it("caps the cover width and keeps the default layout at cover height", function()
@@ -345,11 +405,12 @@ describe("home featured widget", function()
         assert.is_table(top_row)
         assert.is_true(description_split.used)
         assert.is_nil(description_split.probe_line_height)
-        assert.are.same({ 294, 317 }, description_split.probe_heights)
+        assert.are.same({ 299, 317 }, description_split.probe_heights)
         assert.are.equal(342, text_widget("Upper text fascinating science.").width)
         assert.are.equal(584, text_widget("Lower continuation fills the remaining width.").width)
-        assert.are.equal(207, text_widget("Lower continuation fills the remaining width.").height)
+        assert.are.equal(212, text_widget("Lower continuation fills the remaining width.").height)
         assert.are.equal(490, progress_bar_width("25%", "120 pages"))
+        assert.are.equal(7, progress_bar_height("25%", "120 pages"))
     end)
 
     it("keeps the description and progress beside the cover by default", function()
@@ -444,6 +505,89 @@ describe("home featured widget", function()
         assert.is_true(series.bold)
     end)
 
+    it("hides author and series independently", function()
+        local Featured = require("modules/filebrowser/patches/home/widgets/featured_common")
+        Featured.build({
+            width = 600,
+            height = 220,
+            module_cfg = { show_author = false, show_series = false },
+            data = {
+                getFeaturedBook = function()
+                    return {
+                        path = "/library/alpha.epub",
+                        title = "Alpha",
+                        authors = "Zen Author",
+                        series = "Zen Chronicles",
+                        series_index = 3,
+                        status = "new",
+                    }
+                end,
+            },
+        }, "recently_read")
+
+        assert.is_false(has_text("Zen Author"))
+        assert.is_false(has_text("Zen Chronicles #3"))
+    end)
+
+    it("justifies plain descriptions", function()
+        local Featured = require("modules/filebrowser/patches/home/widgets/featured_common")
+        Featured.build({
+            width = 600,
+            height = 220,
+            module_cfg = { justify_description_text = true },
+            data = {
+                getFeaturedBook = function()
+                    return {
+                        path = "/library/alpha.epub",
+                        title = "Alpha",
+                        description = "A justified description.",
+                        status = "new",
+                    }
+                end,
+            },
+        }, "recently_read")
+
+        assert.is_true(text_widget("A justified description.").justified)
+    end)
+
+    it("renders wrapped description HTML intact when enabled", function()
+        description_split = {
+            text = "A formatted description.",
+            width = 342,
+            upper_end = 5,
+            lower_start = 7,
+        }
+        local Featured = require("modules/filebrowser/patches/home/widgets/featured_common")
+        Featured.build({
+            width = 600,
+            height = 600,
+            module_cfg = {
+                format_description_html = true,
+                justify_description_text = true,
+                wrap_description_text = true,
+                text_styles = {
+                    description = { font_face = "/fonts/Description.ttf", font_size = 16 },
+                },
+            },
+            data = {
+                getFeaturedBook = function()
+                    return {
+                        path = "/library/alpha.epub",
+                        title = "Alpha",
+                        description = "<p>A <strong>formatted</strong> description.</p>",
+                        status = "new",
+                    }
+                end,
+            },
+        }, "recently_read")
+
+        assert.is_true(description_split.used)
+        assert.are.equal("<p>A <strong>formatted</strong> description.</p>", html_content.body)
+        assert.matches("/fonts/Description%.ttf", html_content.css)
+        assert.matches("text%-align: justify", html_content.css)
+        assert.are.equal(16, html_content.font_size)
+    end)
+
     it("uses the configured unified source", function()
         local requested_source
         local Featured = require("modules/filebrowser/patches/home/widgets/featured_common")
@@ -497,6 +641,37 @@ describe("home featured widget", function()
             end
         end
         assert.equals(2, labels)
+    end)
+
+    it("uses saved progress with stable page labels", function()
+        local BookProgress = require("common/ui/book_progress")
+        local progress_bar = spy.on(BookProgress, "bar")
+        local Featured = require("modules/filebrowser/patches/home/widgets/featured_common")
+        Featured.build({
+            width = 600,
+            height = 220,
+            module_cfg = { progress_meta = { left = "percent", right = "current_total" } },
+            data = {
+                getFeaturedBook = function()
+                    return {
+                        path = "/library/alpha.epub",
+                        title = "Alpha",
+                        status = "reading",
+                        percent = 0.25,
+                        stable_current_page = 45,
+                        stable_pages = 120,
+                        stable_current_label = "45",
+                        stable_last_label = "120",
+                    }
+                end,
+            },
+        }, "recently_read")
+
+        assert.is_true(has_text("25%"))
+        assert.is_true(has_text("45 / 120"))
+        assert.spy(progress_bar).was_called_with(0.25,
+            progress_bar_width("25%", "45 / 120"),
+            progress_bar_height("25%", "45 / 120"))
     end)
 
     it("hides the complete progress row when disabled", function()

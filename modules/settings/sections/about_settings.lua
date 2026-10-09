@@ -7,7 +7,6 @@ local T = require("ffi/util").template
 local UIManager = require("ui/uimanager")
 local utils = require("modules/settings/zen_settings_utils")
 local bugreporter = require("modules/settings/zen_bugreporter")
-local advanced_section = require("modules/settings/sections/advanced_settings")
 local icons = require("common/inline_icon_map")
 local IconItem = require("common/ui/icon_menu_item")
 
@@ -70,6 +69,7 @@ function M.build(ctx)
                     if type(ctx.config._meta) ~= "table" then ctx.config._meta = {} end
                     ctx.config._meta.quickstart_completed = true
                     ctx.config._meta.quickstart_menu_tour_pending = true
+                    ctx.config._meta.quickstart_reader_tour_pending = true
                     plugin:saveConfig()
                     UIManager:nextTick(function()
                         local reinject = _G.__ZEN_UI_REINJECT_FM_NAVBAR
@@ -97,16 +97,10 @@ function M.build(ctx)
         keep_menu_open = true,
     })
 
-    table.insert(items, {
-        text = _("Advanced"),
-        sub_item_table = advanced_section.build(ctx),
-    })
-
     IconItem.decorate(items[1], icons.details)
     IconItem.decorate(items[2], icons.settings_device)
     IconItem.decorate(items[3], icons.settings_setup)
     IconItem.decorate(items[4], icons.settings_bug)
-    IconItem.decorate(items[5], icons.settings_advanced)
 
     return items
 end

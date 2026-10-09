@@ -12,9 +12,12 @@ local function apply_book_status()
 
     -- Always use the ZenOS custom Book Status layout (home + close buttons, cleaner stats)
     local BookStatusWidget = require("ui/widget/bookstatuswidget")
+    local archive_actions = require("common/archive_actions")
     local book_status = require("common/book_status")
     local library_navigation = require("common/library_navigation")
     local utils = require("common/utils")
+    local Event = require("ui/event")
+    local UIManager = require("ui/uimanager")
 
     local _icons_dir
     local plugin_root = require("common/plugin_root")
@@ -23,6 +26,7 @@ local function apply_book_status()
         .. "/resources/icons/mdlight/"
 
     local function resolve_icon(name)
+        if type(name) == "string" and name:sub(1, 1) == "/" then return name end
         return utils.resolveIcon(_icons_dir, name)
             or utils.resolveLocalIcon(utils.getUserIconsDir(), name)
             or utils.resolveLocalIcon(_stock_icons_dir, name)
@@ -65,6 +69,33 @@ local function apply_book_status()
         end
     end
 
+    -- Closing Book Status does not emit CloseDocument, so KOSync misses the final page.
+    if ok_reader_status and not ReaderStatus._zen_end_of_book_progress_sync
+            and type(ReaderStatus.onEndOfBook) == "function" then
+        ReaderStatus._zen_end_of_book_progress_sync = true
+        local original_onEndOfBook = ReaderStatus.onEndOfBook
+        function ReaderStatus:onEndOfBook(...)
+            local result = original_onEndOfBook(self, ...)
+            local status_widget = UIManager:getTopmostVisibleWidget()
+            if getmetatable(status_widget) == BookStatusWidget then
+                local original_onCloseWidget = status_widget.onCloseWidget
+                function status_widget:onCloseWidget(...)
+                    local kosync = self.ui and self.ui.kosync
+                    local settings = kosync and kosync.settings
+                    if self.summary and self.summary.status == "complete"
+                            and settings and settings.auto_sync
+                            and settings.username and settings.userkey then
+                        UIManager:broadcastEvent(Event:new("KOSyncPushProgress"))
+                    end
+                    if original_onCloseWidget then
+                        return original_onCloseWidget(self, ...)
+                    end
+                end
+            end
+            return result
+        end
+    end
+
     BookStatusWidget.getStatusContent = function(self, width)
         local _ = require("gettext")
         local Size = require("ui/size")
@@ -73,13 +104,11 @@ local function apply_book_status()
         local ZenIconButton = require("common/ui/zen_icon_button")
         local Button = require("ui/widget/button")
         local CenterContainer = require("ui/widget/container/centercontainer")
-        local Event = require("ui/event")
         local Geom = require("ui/geometry")
         local HorizontalGroup = require("ui/widget/horizontalgroup")
         local HorizontalSpan = require("ui/widget/horizontalspan")
         local VerticalGroup = require("ui/widget/verticalgroup")
         local VerticalSpan = require("ui/widget/verticalspan")
-        local UIManager = require("ui/uimanager")
         local is_landscape = Screen:getScreenMode() == "landscape"
 
         -- Build a custom header row instead of TitleBar so both icons share the
@@ -177,11 +206,9 @@ local function apply_book_status()
             VerticalSpan:new{ width = Size.padding.default },
         }
 
-        -- Reduce the large top gap above the Statistics header (was Size.item.height_default ~48px)
         local stats_header = self:genHeader(_("Statistics"))
-        if stats_header and stats_header[1] then
-            stats_header[1].width = Size.span.vertical_default
-        end
+        local review_header = self:genHeader(_("Review"))
+        local status_header = self:genHeader(self.readonly and _("Book Status") or _("Update Status"))
 
         -- Keep actions beside the stars in landscape so KOReader's fixed-height
         -- book-info panel does not overflow into the Statistics section.
@@ -217,18 +244,41 @@ local function apply_book_status()
                 callback = open_next_file_callback,
             }
         end
+        local file = self.ui and self.ui.document and self.ui.document.file
+        local archive_button
+        if not self.readonly and archive_actions.canArchive(file) then
+            archive_button = Button:new{
+                text = _("Archive"),
+                width = action_width,
+                show_parent = self,
+                callback = function()
+                    local reader_status = self.ui and self.ui.status
+                    if reader_status then
+                        archive_actions.markCompleteAndArchive(reader_status, self)
+                    end
+                end,
+            }
+        end
         local orig_generateRateGroup = BookStatusWidget.generateRateGroup
         self.generateRateGroup = function(s, w, h, rating)
+            local restart_stack = restart_book_btn
+            if archive_button then
+                restart_stack = VerticalGroup:new{
+                    restart_book_btn,
+                    VerticalSpan:new{ width = action_gap },
+                    archive_button,
+                }
+            end
             local btn_row
             if next_file_btn then
                 btn_row = HorizontalGroup:new{
                     align = "center",
-                    restart_book_btn,
+                    restart_stack,
                     HorizontalSpan:new{ width = action_gap },
                     next_file_btn,
                 }
             else
-                btn_row = restart_book_btn
+                btn_row = restart_stack
             end
             if is_landscape then
                 local btn_row_width = action_width
@@ -252,6 +302,9 @@ local function apply_book_status()
             end
             local stars = orig_generateRateGroup(s, w, h, rating)
             local btn_h = restart_book_btn:getSize().h
+            if archive_button then
+                btn_h = btn_h + action_gap + archive_button:getSize().h
+            end
             return VerticalGroup:new{
                 CenterContainer:new{
                     dimen = Geom:new{ w = w, h = btn_h },
@@ -282,18 +335,65 @@ local function apply_book_status()
         table.insert(self.layout, 1, { close_btn, home_btn })
         table.insert(self.layout, 2, { restart_book_btn })
         self.selected.y = self.selected.y + 2
+        if archive_button then
+            table.insert(self.layout, 3, { archive_button })
+            self.selected.y = self.selected.y + 1
+        end
 
-        return VerticalGroup:new{
+        local content_items = {
             align = "left",
             title_bar,
             book_info_group,
+        }
+        for _i, widget in ipairs({
             stats_header,
             self:genStatisticsGroup(width),
-            self:genHeader(_("Review")),
+            review_header,
             summary_group,
-            self:genHeader(self.readonly and _("Book Status") or _("Update Status")),
+            status_header,
             switch_group,
-        }
+        }) do
+            content_items[#content_items + 1] = widget
+        end
+        local content = VerticalGroup:new(content_items)
+
+        local headers = { stats_header, review_header, status_header }
+        for _i, header in ipairs(headers) do header[1].width = 0 end
+
+        local overflow = content:getSize().h - Screen:getHeight()
+        if overflow > 0 and self.note_widget and self.note_widget.height then
+            local old_note_widget = self.note_widget
+            local note_height = math.max(old_note_widget.line_height_px,
+                old_note_widget.height - overflow)
+            if note_height < old_note_widget.height then
+                local TextBoxWidget = require("ui/widget/textboxwidget")
+                self.note_widget = TextBoxWidget:new{
+                    text = old_note_widget.text,
+                    face = self.medium_font_face,
+                    width = old_note_widget.width,
+                    height = note_height,
+                    scroll = true,
+                    readonly = self.readonly,
+                    parent = self,
+                }
+                self.note_frame[1] = self.note_widget
+                old_note_widget:free()
+                summary_group[2].dimen.h = math.max(self.note_frame:getSize().h,
+                    summary_group[2].dimen.h - old_note_widget.height + note_height)
+                summary_group:resetLayout()
+                content:resetLayout()
+            end
+        end
+
+        local free_height = math.max(0, Screen:getHeight() - content:getSize().h)
+        local gap_height = math.floor(free_height / #headers)
+        local extra = free_height % #headers
+        for _i, header in ipairs(headers) do
+            header[1].width = gap_height + (_i <= extra and 1 or 0)
+            header:resetLayout()
+        end
+        content:resetLayout()
+        return content
     end
 end
 

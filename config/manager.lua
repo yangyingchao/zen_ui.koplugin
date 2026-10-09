@@ -1,12 +1,15 @@
 local defaults = require("config/defaults")
 local HomePresets = require("modules/filebrowser/patches/home/home_presets")
 local PresetStore = require("config/preset_store")
+local HardcoverToken = require("config/hardcover_token")
+local GoogleBooksKey = require("config/google_books_key")
 local HomeQuotes = require("modules/filebrowser/patches/home/home_quotes")
 local utils = require("common/utils")
 local FontLanguage = require("common/font_language")
 local LibraryFontPath = require("common/library_font_path")
 local plugin_root = require("common/plugin_root") or ""
 local BrandMigration = require("common/brand_migration")
+local PluginScan = require("modules/menu/app_launcher/plugin_scan")
 
 local LEGACY_KEY = "zen_ui_config"  -- legacy G_reader_settings key; cleanup only
 local HYPERREADABLE_LIBRARY_FONT = LibraryFontPath.BUNDLED_DEFAULT
@@ -15,6 +18,17 @@ local _zen_settings_file = nil  -- cached LuaSettings instance
 local _current_config    = nil  -- in-memory cache for M.get()
 
 local M = {}
+
+local function same_table(left, right)
+    if type(left) ~= "table" or type(right) ~= "table" then return false end
+    for key, value in pairs(left) do
+        if right[key] ~= value then return false end
+    end
+    for key, value in pairs(right) do
+        if left[key] ~= value then return false end
+    end
+    return true
+end
 
 local function get_settings_path()
     return PresetStore.rootDir() .. "/config.lua"
@@ -54,11 +68,7 @@ local function migrate_brand_plugin_paths(stored)
 end
 
 local function merged_with_defaults(stored)
-    local cfg = utils.deepcopy(defaults)
-    if type(stored) == "table" then
-        utils.deepmerge(stored, cfg)
-        cfg = stored
-    end
+    local cfg = type(stored) == "table" and stored or {}
     utils.deepmerge(cfg, defaults)
     return cfg
 end
@@ -94,6 +104,13 @@ local function normalize_renamed_keys(cfg)
     if cfg.features.browser_hide_up_folder == nil
        and cfg.features.browser_up_folder ~= nil then
         cfg.features.browser_hide_up_folder = cfg.features.browser_up_folder
+        changed = true
+    end
+
+    if cfg.features.status_bar == false then
+        cfg.features.status_bar = true
+        cfg.status_bar = type(cfg.status_bar) == "table" and cfg.status_bar or {}
+        cfg.status_bar.left_order, cfg.status_bar.center_order, cfg.status_bar.right_order = {}, {}, {}
         changed = true
     end
 
@@ -437,6 +454,37 @@ local function migrate_legacy_group_view_keys(cfg)
     return cfg, (changed or removed_legacy)
 end
 
+local function migrate_legacy_owned_keys(cfg)
+    local g = rawget(_G, "G_reader_settings")
+    if not g or type(cfg) ~= "table" then return cfg, false end
+
+    local changed = false
+    local removed_legacy = false
+    local ratio = g:readSetting("uniform_cover_ratio")
+    if ratio ~= nil then
+        if cfg.uniform_cover_ratio == nil and type(ratio) == "string" and ratio ~= "" then
+            cfg.uniform_cover_ratio = ratio
+            changed = true
+        end
+        g:delSetting("uniform_cover_ratio")
+        removed_legacy = true
+    end
+
+    local default_url = g:readSetting("opds_default_url")
+    if default_url ~= nil then
+        if type(cfg.opds) ~= "table" then cfg.opds = {} end
+        if cfg.opds.default_url == nil and type(default_url) == "string" and default_url ~= "" then
+            cfg.opds.default_url = default_url
+            changed = true
+        end
+        g:delSetting("opds_default_url")
+        removed_legacy = true
+    end
+
+    if removed_legacy then pcall(g.flush, g) end
+    return cfg, (changed or removed_legacy)
+end
+
 local function migrate_legacy_substring_search(cfg)
     local g = rawget(_G, "G_reader_settings")
     if not g or type(cfg) ~= "table" then return cfg, false end
@@ -562,6 +610,26 @@ local function migrate_folder_path_settings(cfg)
     if type(cfg.folder_display_mode) ~= "table" then
         cfg.folder_display_mode = {}
         changed = true
+    end
+    if type(cfg.folder_cover_paths) ~= "table" then
+        cfg.folder_cover_paths = {}
+        changed = true
+    end
+    for folder, slots in pairs(cfg.folder_cover_paths) do
+        if type(slots) == "table" then
+            local was_empty = next(slots) == nil
+            for slot, cover_path in pairs(slots) do
+                local extension = type(cover_path) == "string"
+                    and cover_path:lower():match("%.([^./]+)$") or nil
+                if extension ~= "jpg" and extension ~= "jpeg" then
+                    slots[slot] = nil
+                    changed = true
+                end
+            end
+            if not was_empty and next(slots) == nil then
+                cfg.folder_cover_paths[folder] = nil
+            end
+        end
     end
 
     local g = rawget(_G, "G_reader_settings")
@@ -810,23 +878,27 @@ end
 local function migrate_page_browser_layout(cfg)
     if type(cfg) ~= "table" then return false end
 
+    local function valid_layout(layout)
+        return layout == "single" or layout == "carousel" or layout == "grid"
+    end
+
     local store = PresetStore.loadStore("reader")
     if type(store) ~= "table" then return false end
     if type(store.settings) ~= "table" then store.settings = {} end
 
     local changed = false
     local layout = store.settings.page_browser_layout
-    if layout ~= "single" and layout ~= "grid" then
+    if not valid_layout(layout) then
         local legacy_config = type(cfg.reader_page_browser) == "table"
             and cfg.reader_page_browser.layout
         local g = rawget(_G, "G_reader_settings")
         local legacy_global = g and g:readSetting("zen_page_browser_layout")
-        if legacy_config == "single" or legacy_config == "grid" then
+        if valid_layout(legacy_config) then
             layout = legacy_config
-        elseif legacy_global == "single" or legacy_global == "grid" then
+        elseif valid_layout(legacy_global) then
             layout = legacy_global
         end
-        if layout == "single" or layout == "grid" then
+        if valid_layout(layout) then
             store.settings.page_browser_layout = layout
             PresetStore.saveStore("reader", store)
             changed = true
@@ -971,6 +1043,12 @@ local function migrate_settings_files()
         screensaver = capture_screensaver_settings(),
     })
     if HomeQuotes.ensureFile() then
+        changed = true
+    end
+    if HardcoverToken.ensureFile() then
+        changed = true
+    end
+    if GoogleBooksKey.ensureFile() then
         changed = true
     end
     if migrate_home_quote_font_size() then
@@ -1135,11 +1213,17 @@ function M.load()
     end
 
     local migrated_rakuyomi = migrate_legacy_rakuyomi_keys(stored)
+    local migrated_group, migrated_owned
+    stored, migrated_group = migrate_legacy_group_view_keys(stored)
+    stored, migrated_owned = migrate_legacy_owned_keys(stored)
     local cfg = merged_with_defaults(stored)
+    local installed_plugins = PluginScan.installed()
+    local installed_plugins_changed = installed_plugins ~= nil
+        and not same_table(cfg._meta.installed_plugins, installed_plugins)
+    if installed_plugins then cfg._meta.installed_plugins = installed_plugins end
     local migrated_renamed
     cfg, migrated_renamed = normalize_renamed_keys(cfg)
-    local migrated_group, migrated_substring, migrated_updater, migrated_folder_paths, migrated_fbc, migrated_bim
-    cfg, migrated_group   = migrate_legacy_group_view_keys(cfg)
+    local migrated_substring, migrated_updater, migrated_folder_paths, migrated_fbc, migrated_bim
     cfg, migrated_substring = migrate_legacy_substring_search(cfg)
     cfg, migrated_updater = migrate_legacy_updater_keys(cfg)
     cfg, migrated_folder_paths = migrate_folder_path_settings(cfg)
@@ -1155,35 +1239,57 @@ function M.load()
     local initialized_brand_marker = fresh_config
         and plugin_root:match("/" .. BrandMigration.PLUGIN_DIR .. "$") ~= nil
         and BrandMigration.markConfigMigrationComplete(cfg)
+    local g = rawget(_G, "G_reader_settings")
+    local has_legacy_config = g and g:readSetting(LEGACY_KEY) ~= nil
     if migrated_renamed or migrated_group or migrated_substring or migrated_updater or migrated_fbc or migrated_bim
             or migrated_reader_backup or migrated_qs or migrated_qs_completion or migrated_file_config
             or migrated_settings_files or migrated_reader_presets
             or migrated_changed_defaults or migrated_home_lock
             or migrated_folder_paths or migrated_rakuyomi or migrated_page_browser
-            or migrated_brand_paths or initialized_brand_marker
-            or recovered_fresh_config then
-        M.save(cfg)
-    end
-    if migrated_file_config then
-        local g = rawget(_G, "G_reader_settings")
-        if g and type(g.delSetting) == "function" then -- luacheck: ignore 542
-            -- TODO: re-enable to delete legacy zen_ui_config key from settings.reader.lua
-            -- pcall(g.delSetting, g, LEGACY_KEY)
-            -- pcall(g.flush, g)
+            or migrated_brand_paths or migrated_owned or initialized_brand_marker
+            or recovered_fresh_config or installed_plugins_changed or has_legacy_config then
+        local saved = M.save(cfg, has_legacy_config)
+        if saved and has_legacy_config and type(g.delSetting) == "function" then
+            pcall(g.delSetting, g, LEGACY_KEY)
+            pcall(g.flush, g)
         end
     end
     _current_config = cfg
     return cfg
 end
 
-function M.save(config)
+function M.save(config, verify)
     local f = open_zen_file()
     f.data = config
-    f:flush()
+
+    local ok, saved, err = pcall(function()
+        if verify and type(f.file) == "string" and type(f.backup) == "function" then
+            local dump = require("dump")
+            local file_util = require("util")
+            local serialized = dump(config, nil, true)
+            local directory_updated = f:backup()
+            local write_ok, write_err = file_util.writeToFile(
+                serialized, f.file, true, true, directory_updated)
+            if not write_ok then return nil, write_err end
+            local stored, read_err = file_util.readFromFile(f.file)
+            local expected = "-- " .. f.file .. "\nreturn " .. serialized .. "\n"
+            if stored ~= expected then
+                return nil, read_err or "settings verification failed"
+            end
+            return true
+        end
+
+        local result = f:flush()
+        if result == false then return nil, "settings flush failed" end
+        return true
+    end)
+    if not ok then return nil, saved end
+    if not saved then return nil, err end
     _current_config = config
+    return true
 end
 
-function M.moveFolderPathSettings(from_path, to_path)
+function M.movePathSettings(from_path, to_path)
     if type(from_path) ~= "string" or type(to_path) ~= "string" then return false end
 
     local paths = require("common/paths")
@@ -1200,7 +1306,9 @@ function M.moveFolderPathSettings(from_path, to_path)
     if type(cfg) ~= "table" then cfg = M.load() end
     local changed = false
 
-    for _i, map_name in ipairs({ "folder_sort", "folder_display_mode" }) do
+    for _i, map_name in ipairs({
+        "folder_sort", "folder_display_mode", "folder_cover_paths",
+    }) do
         local settings = cfg[map_name]
         if type(settings) == "table" then
             local moves = {}
@@ -1227,9 +1335,29 @@ function M.moveFolderPathSettings(from_path, to_path)
         end
     end
 
-    if changed then M.save(cfg) end
-    return changed
+    local cover_paths = cfg.folder_cover_paths
+    if type(cover_paths) == "table" then
+        for _folder, slots in pairs(cover_paths) do
+            if type(slots) == "table" then
+                for slot, image_path in pairs(slots) do
+                    if type(image_path) == "string" then
+                        local normalized_path = normalize(image_path)
+                        if normalized_path == source
+                                or normalized_path:sub(1, #source + 1) == source .. "/" then
+                            slots[slot] = destination .. normalized_path:sub(#source + 1)
+                            changed = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if changed then return M.save(cfg, true) == true end
+    return false
 end
+
+M.moveFolderPathSettings = M.movePathSettings
 
 -- Kept for deletePluginSettings: identifies the legacy G_reader_settings key
 -- so it can be cleaned up alongside the dedicated file.

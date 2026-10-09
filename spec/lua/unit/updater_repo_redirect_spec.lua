@@ -13,6 +13,7 @@ describe("updater repository redirects", function()
     local config
     local logs
     local network_up
+    local release_body
     local requests
     local scheduled
     local asset_name
@@ -32,6 +33,7 @@ describe("updater repository redirects", function()
         original_uimanager = package.loaded["ui/uimanager"]
         logs = {}
         network_up = true
+        release_body = nil
         requests = {}
         scheduled = {}
         asset_name = "zenos.koplugin.zip"
@@ -115,16 +117,16 @@ describe("updater repository redirects", function()
                         location = "https://api.github.com/repositories/1194031944/releases?per_page=100",
                     }, "HTTP/1.1 301 Moved Permanently"
                 end
-                request.sink(string.format([[
+                request.sink(release_body or string.format([[
                     [{
-                        "url":"https://api.github.com/repos/AnthonyGress/zen-ui/releases/12345",
+                        "url":"https://api.github.com/repos/xZenLabs/zen-os-renamed/releases/12345",
                         "tag_name":"v999.0.0",
                         "prerelease":false,
                         "body":"Renamed repository release",
                         "published_at":"2026-07-12T00:00:00Z",
                         "assets":[{
                             "name":"%s",
-                            "browser_download_url":"https://github.com/AnthonyGress/zen-ui/releases/download/v999.0.0/%s",
+                            "browser_download_url":"https://github.com/xZenLabs/zen-os-renamed/releases/download/v999.0.0/%s",
                             "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                         }]
                     }]
@@ -157,7 +159,7 @@ describe("updater repository redirects", function()
         assert.are.equal("ok", updater.check_for_update())
         assert.are.equal(2, #requests)
         assert.are.equal(
-            "https://api.github.com/repos/AnthonyGress/zen_ui.koplugin/releases?per_page=100",
+            "https://api.github.com/repos/xZenLabs/zen-os/releases?per_page=100",
             requests[1]
         )
         assert.are.equal(
@@ -179,6 +181,35 @@ describe("updater repository redirects", function()
         assert.is_true(updater.has_update())
     end)
 
+    it("ignores alpha releases on the beta channel", function()
+        config.updater.update_channel = "beta"
+        release_body = string.format([[
+            [{
+                "tag_name":"v3.3.0-alpha1",
+                "prerelease":true,
+                "published_at":"2026-09-03T00:00:00Z",
+                "assets":[{
+                    "name":"%s",
+                    "browser_download_url":"https://github.com/xZenLabs/zen-os/releases/download/v3.3.0-alpha1/%s",
+                    "digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }]
+            },{
+                "tag_name":"v3.3.0-beta7",
+                "prerelease":true,
+                "published_at":"2026-09-02T00:00:00Z",
+                "assets":[{
+                    "name":"%s",
+                    "browser_download_url":"https://github.com/xZenLabs/zen-os/releases/download/v3.3.0-beta7/%s",
+                    "digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }]
+            }]
+        ]], asset_name, asset_name, asset_name, asset_name)
+        local updater = require("modules/settings/zen_updater")
+
+        assert.are.equal("ok", updater.check_for_update())
+        assert.are.equal("3.3.0-beta7", updater.latest_version())
+    end)
+
     it("clears the update marker after a version change is acknowledged", function()
         local updater = require("modules/settings/zen_updater")
         assert.are.equal("ok", updater.check_for_update())
@@ -190,6 +221,21 @@ describe("updater repository redirects", function()
         assert.is_false(updater.has_update())
         assert.is_nil(updater.latest_version())
         assert.is_false(config.updater.update_available)
+    end)
+
+    it("builds an outlined settings-header action for an available update", function()
+        local updater = require("modules/settings/zen_updater")
+        local plugin = {}
+        assert.is_nil(updater.build_update_available_action(plugin))
+        assert.are.equal("ok", updater.check_for_update())
+
+        local action = updater.build_update_available_action(plugin)
+        assert.is_true(action.zen_button)
+        assert.are.equal(require("common/inline_icon_map").upgrade .. "  Update available", action.text)
+        local received
+        updater.run_update = function(value) received = value end
+        action.callback()
+        assert.are.equal(plugin, received)
     end)
 
     it("builds the changelog from the bundled file without a network request", function()

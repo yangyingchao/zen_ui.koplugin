@@ -106,24 +106,73 @@ describe("app launcher book switcher page", function()
         local cfg = Store.load()
         assert.is_false(cfg.show_book_switcher)
         assert.is_false(cfg.book_switcher_reader_only)
+        assert.are.equal(4, cfg.book_switcher_count)
+        assert.is_true(cfg.book_switcher_hide_finished)
+        assert.are.same({}, cfg.book_switcher_hidden)
         assert.is_false(cfg.show_book_details)
         assert.are.same({ "book_details", "book_switcher", "buttons" }, cfg.page_order)
+        assert.are.same({
+            "read_time", "time_remaining", "pages_today", "time_today", "pages", "progress",
+        }, cfg.book_details_order)
+        assert.are.same({
+            read_time = true,
+            time_remaining = true,
+            pages_today = false,
+            time_today = false,
+            pages = true,
+            progress = true,
+        }, cfg.book_details_enabled)
 
         cfg.show_book_switcher = true
         cfg.book_switcher_first = true
         cfg.book_switcher_reader_only = true
+        cfg.book_switcher_count = 20
+        cfg.book_switcher_hide_finished = false
+        cfg.book_switcher_hidden = { ["/books/hidden.epub"] = true }
         cfg.show_book_details = true
         cfg.book_details_first = true
         cfg.page_order = { "buttons", "unknown", "buttons" }
+        cfg.book_details_order = { "pages", "unknown", "pages", "read_time" }
+        cfg.book_details_enabled = {
+            read_time = false,
+            time_remaining = "invalid",
+            pages = false,
+            unknown = false,
+        }
         Store.save(cfg)
         assert.is_true(settings_file.flushed)
         assert.is_true(settings_file.data.show_book_switcher)
         assert.is_true(settings_file.data.book_switcher_reader_only)
+        assert.are.equal(8, settings_file.data.book_switcher_count)
+        assert.is_false(settings_file.data.book_switcher_hide_finished)
+        assert.is_true(settings_file.data.book_switcher_hidden["/books/hidden.epub"])
         assert.is_true(settings_file.data.show_book_details)
         assert.is_nil(settings_file.data.book_switcher_first)
         assert.is_nil(settings_file.data.book_details_first)
         assert.are.same({ "buttons", "book_details", "book_switcher" },
             settings_file.data.page_order)
+        assert.are.same({
+            "pages", "read_time", "time_remaining", "pages_today", "time_today", "progress",
+        }, settings_file.data.book_details_order)
+        assert.are.same({
+            read_time = false,
+            time_remaining = true,
+            pages_today = false,
+            time_today = false,
+            pages = false,
+            progress = true,
+        }, settings_file.data.book_details_enabled)
+        assert.is_nil(settings_file.data.book_details_enabled.unknown)
+        for _i, value in ipairs({ -1, 0, 1, 3.8, 8, 9, "invalid" }) do
+            cfg.book_switcher_count = value
+            Store.save(cfg)
+            assert.are.equal(({ 1, 1, 1, 3, 8, 8, 4 })[_i], cfg.book_switcher_count)
+        end
+        cfg.book_switcher_hide_finished = "invalid"
+        cfg.book_switcher_hidden = false
+        Store.save(cfg)
+        assert.is_true(cfg.book_switcher_hide_finished)
+        assert.are.same({}, cfg.book_switcher_hidden)
     end)
 
     it("migrates the removed first-page preference into page order", function()
@@ -141,9 +190,12 @@ describe("app launcher book switcher page", function()
         local cfg = require("modules/menu/app_launcher/store").load()
         assert.are.same({ "book_switcher", "buttons", "book_details" }, cfg.page_order)
         assert.is_nil(cfg.book_switcher_first)
+        assert.are.equal(4, cfg.book_switcher_count)
+        assert.is_true(cfg.book_switcher_hide_finished)
+        assert.are.same({}, cfg.book_switcher_hidden)
     end)
 
-    it("loads four switcher alternatives with cover metadata", function()
+    it("filters recent books before loading covers and fills up to eight slots", function()
         local reload_args
         local freed = 0
         local copied = 0
@@ -158,20 +210,42 @@ describe("app launcher book switcher page", function()
         end
         replace("readhistory", {
             hist = {
+                { file = "/downloads/outside.epub" },
+                { file = "/books/cover.JPEG" },
+                { file = "/books/finished.epub" },
+                { file = "/books/hidden.epub" },
+                { file = "/kindle/cache.epub" },
                 { file = "/books/one.epub" },
                 { file = "/books/missing.epub" },
                 { file = "/books/one.epub" },
-                { file = "/books/two.cbz" },
+                { file = "/additional/two.cbz" },
                 { file = "/books/three.pdf" },
                 { file = "/books/four.epub" },
                 { file = "/books/five.epub" },
+                { file = "/books/six.epub" },
+                { file = "/books/seven.epub" },
+                { file = "/books/eight.epub" },
             },
             reload = function(_, value) reload_args = value end,
         })
         replace("libs/libkoreader-lfs", {
             attributes = function(path)
-                if path == "/books/missing.epub" then return nil end
+                if path == "/books/missing.epub" or path == "/kindle/cache.epub" then
+                    return nil
+                end
                 return "file"
+            end,
+        })
+        replace("common/paths", {
+            isInHomeDir = function(path)
+                return path:sub(1, 7) == "/books/"
+                    or path:sub(1, 12) == "/additional/"
+            end,
+        })
+        replace("common/book_status", {
+            isImageFile = function(path) return path:lower():match("%.jpeg$") ~= nil end,
+            getEffectiveStatusFromFile = function(path)
+                return path == "/books/finished.epub" and "complete" or "reading"
             end,
         })
         replace("bookinfomanager", {
@@ -190,29 +264,47 @@ describe("app launcher book switcher page", function()
         })
         replace("modules/filebrowser/patches/rakuyomi", {
             getMetadata = function(path)
-                if path == "/books/two.cbz" then return { title = "Chapter Two" } end
+                if path == "/additional/two.cbz" then return { title = "Chapter Two" } end
             end,
+        })
+        replace("modules/filebrowser/patches/kindle_virtual_library", {
+            isBookPath = function(path) return path == "/kindle/cache.epub" end,
         })
 
         local Page = require("modules/menu/app_launcher/book_switcher_page")
-        local books = Page.loadBooks(4, "/books/one.epub")
+        local cfg = { book_switcher_hidden = { ["/books/hidden.epub"] = true } }
+        local books = Page.loadBooks(4, "/books/one.epub", cfg)
 
         assert.is_false(reload_args)
         assert.are.same({
-            "/books/two.cbz", "/books/three.pdf", "/books/four.epub", "/books/five.epub",
+            "/kindle/cache.epub", "/additional/two.cbz", "/books/three.pdf", "/books/four.epub",
         }, { books[1].path, books[2].path, books[3].path, books[4].path })
-        assert.are.equal("Chapter Two", books[1].title)
+        assert.are.equal("Chapter Two", books[2].title)
         assert.are.same({ copied = true }, books[1].cover_bb)
         assert.are.equal(4, copied)
         assert.are.equal(4, freed)
+        books = Page.loadBooks(8, "/books/one.epub", cfg)
+        assert.are.equal(8, #books)
+        assert.are.equal("/books/eight.epub", books[8].path)
+        cfg.book_switcher_hidden["/kindle/cache.epub"] = true
+        books = Page.loadBooks(4, "/books/one.epub", cfg)
+        assert.are.equal("/additional/two.cbz", books[1].path)
+        assert.are.equal("/books/five.epub", books[4].path)
+        cfg.book_switcher_hide_finished = false
+        books = Page.loadBooks(1, "/books/one.epub", cfg)
+        assert.are.equal(1, #books)
+        assert.are.equal("/books/finished.epub", books[1].path)
     end)
 
-    it("ties the opening banner to the selected cover", function()
+    it("fits one or two rows and handles book taps and removal holds", function()
         local created = {}
         local cover_options = {}
         local banner_cover
         local banner_released
         local opened
+        local dialog
+        local closed
+        local removed
         local InputContainer = widget_class("input", created)
         local names = {
             "ui/widget/container/centercontainer",
@@ -241,7 +333,12 @@ describe("app launcher book switcher page", function()
         replace("ui/font", {
             getFace = function(_, name, size) return { name = name, size = size } end,
         })
-        replace("ui/uimanager", { setDirty = function() end })
+        replace("ui/uimanager", {
+            setDirty = function() end,
+            show = function(_self, widget) dialog = widget end,
+            close = function(_self, widget) closed = widget end,
+        })
+        replace("ui/widget/buttondialog", widget_class("dialog"))
         replace("modules/filebrowser/patches/library_font", {
             getFace = function(size) return { size = size } end,
             scaleValue = function(value) return value end,
@@ -274,7 +371,7 @@ describe("app launcher book switcher page", function()
             { path = "/books/four.epub", title = "Four", authors = "Fourth" },
         }
         local Page = require("modules/menu/app_launcher/book_switcher_page")
-        local panel, refs = Page.build({
+        local options = {
             width = 600,
             height = 500,
             books = books,
@@ -291,7 +388,9 @@ describe("app launcher book switcher page", function()
                     released = banner_released,
                 }
             end,
-        })
+            remove_book = function(path) removed = path end,
+        }
+        local panel, refs = Page.build(options)
 
         assert.is_table(panel)
         assert.are.equal(16, panel[1].width)
@@ -307,5 +406,38 @@ describe("app launcher book switcher page", function()
         assert.are.equal(books[2].path, opened.path)
         assert.are.equal(opened.cover, opened.banner)
         assert.is_true(opened.released)
+        local selected = opened
+        assert.is_true(refs.buttons[3].widget:onHoldSelect())
+        assert.are.equal("hold", refs.buttons[3].widget.ges_events.HoldSelect[1].ges)
+        assert.is_nil(dialog.title)
+        assert.are.equal(1, #dialog.buttons)
+        assert.are.equal(1, #dialog.buttons[1])
+        assert.are.equal("\u{F0156}  Remove", dialog.buttons[1][1].text)
+        assert.are.equal("left", dialog.buttons[1][1].align)
+        assert.is_nil(removed)
+        dialog.buttons[1][1].callback()
+        assert.are.equal(dialog, closed)
+        assert.are.equal(books[3].path, removed)
+        assert.are.equal(selected, opened)
+        refs.buttons[2].hold_callback()
+        assert.is_nil(dialog.title)
+
+        for index = 5, 9 do
+            books[index] = { path = "/books/" .. index .. ".epub", title = tostring(index) }
+        end
+        options.height = 350
+        for count = 1, 8 do
+            options.launcher_config = { book_switcher_count = count }
+            panel, refs = Page.build(options)
+            assert.are.equal(count, #refs.buttons)
+            assert.are.equal(count > 4 and 2 or 1, #refs.layout_rows)
+            assert.are.equal(math.min(count, 4), #refs.layout_rows[1])
+            if count > 4 then assert.are.equal(count - 4, #refs.layout_rows[2]) end
+            local total_h = 0
+            for _i, widget in ipairs(panel) do
+                total_h = total_h + widget:getSize().h
+            end
+            assert.is_true(total_h <= options.height)
+        end
     end)
 end)

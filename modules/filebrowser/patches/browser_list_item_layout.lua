@@ -2,6 +2,7 @@ local function apply_browser_list_item_layout()
     -- Capture plugin reference while __ZEN_UI_PLUGIN is still set by run_feature.
     local _plugin_ref = rawget(_G, "__ZEN_UI_PLUGIN")
     local Cover = require("common/cover_utils")
+    local FileManager = require("apps/filemanager/filemanager")
     local RenderCache = require("common/cover_render_cache")
 
     local BD = require("ui/bidi")
@@ -38,6 +39,11 @@ local function apply_browser_list_item_layout()
             or rawget(_G, "__ZEN_UI_SUPPRESS_FILEMANAGER_COVERS") == true
     end
 
+    local function is_selected(entry)
+        local selected = FileManager.instance and FileManager.instance.selected_files
+        return entry and entry.path and selected and selected[entry.path] == true
+    end
+
     local function patchListMenu()
         local ListMenu = require("listmenu")
         local ListMenuItem = Cover.getUpvalue(ListMenu._updateItemsBuildUI, "ListMenuItem")
@@ -49,6 +55,15 @@ local function apply_browser_list_item_layout()
 
         local original_update = ListMenuItem.update
 
+        local function update_original(item)
+            if not is_selected(item.entry) then return original_update(item) end
+            item.entry.dim = nil
+            local ok, result = pcall(original_update, item)
+            item.entry.dim = true
+            if not ok then error(result) end
+            return result
+        end
+
         function ListMenuItem:update()
             local is_dir = not (self.entry.is_file or self.entry.file)
             -- Intercept list mode (no covers) to fix directory text wrapping
@@ -57,7 +72,7 @@ local function apply_browser_list_item_layout()
                 if is_dir and not self.entry.is_go_up then
                     self.text = FolderCover.title(self.entry, self.text, self.menu)
                 end
-                original_update(self)
+                update_original(self)
                 self.text = original_text
                 if is_dir then
                     -- Fix folder name widget (TextBoxWidget) overflowing to 3+ lines in list mode
@@ -264,7 +279,7 @@ local function apply_browser_list_item_layout()
             -- filepath set in ListMenuItem:init()
             local filepath = self.filepath
             if not filepath then
-                return original_update(self)
+                return update_original(self)
             end
 
             local underline_h = 1 -- matches self.underline_h in ListMenuItem:init()
@@ -293,7 +308,7 @@ local function apply_browser_list_item_layout()
             -- If not yet indexed fall back to the original renderer so the
             -- loading hint ("…") is shown and the item queues for extraction.
             if not bookinfo then
-                return original_update(self)
+                return update_original(self)
             end
 
             -- Set cover_specs early so that when we fall through to original_update
@@ -311,7 +326,7 @@ local function apply_browser_list_item_layout()
             -- Mirror stock CoverBrowser: if cover hasn't been fetched yet, defer so
             -- the item is added to items_to_update and extraction is queued.
             if self.do_cover_image and not bookinfo.cover_fetched then
-                return original_update(self)
+                return update_original(self)
             end
 
             -- Re-fetch with cover only when in cover-image mode and cover exists.
@@ -328,10 +343,10 @@ local function apply_browser_list_item_layout()
                and bookinfo.cover_bb
                and BookInfoManager.isCachedCoverInvalid(bookinfo, cover_specs) then
                 bookinfo.cover_bb:free()
-                return original_update(self)
+                return update_original(self)
             end
 
-            local file_deleted = self.entry.dim
+            local file_deleted = self.entry.dim and not is_selected(self.entry)
             local fgcolor = file_deleted and Blitbuffer.COLOR_DARK_GRAY or nil
 
             -- ── Cover image (left zone) ──────────────────────────────────────
@@ -413,7 +428,7 @@ local function apply_browser_list_item_layout()
             self.been_opened = book_info.been_opened
 
             local filename = select(2, util.splitFilePathName(filepath))
-            local filename_without_suffix = filemanagerutil.splitFileNameType(filename)
+            local filename_without_suffix, filetype = filemanagerutil.splitFileNameType(filename)
             local has_description = bookinfo.description ~= nil
             self.has_description = has_description
 
@@ -429,21 +444,15 @@ local function apply_browser_list_item_layout()
             local series_str
             if series then
                 series = BD.auto(series)
-                if series_index then
-                    series_str = string.format("#%.4g – %s", series_index, series)
-                else
-                    series_str = series
-                end
+                series_index = tonumber(series_index)
+                series_str = series_index and string.format("#%.4g – %s", series_index, series) or series
             end
 
             -- ── Progress / right widget ───────────────────────────────────────
-            local percent_finished = book_info.percent_finished
-            local status = book_info.status
+            local status_data = book_status.getFileStatusData(filepath, book_info)
+            local percent_finished = status_data.percent_finished
             local pages = zen_utils.getStablePageCount(filepath, book_info.pages or bookinfo.pages)
-            local effective_status = book_status.getComputedStatus(
-                filepath, status, percent_finished
-            )
-            local display_status = book_status.getDisplayStatus(filepath, effective_status)
+            local display_status = status_data.display_status or status_data.effective_status
             local is_new = display_status == "new"
             self._zen_effective_status = display_status
 
@@ -539,13 +548,25 @@ local function apply_browser_list_item_layout()
                 pages_probe:free()
             end
 
+            local wright_filetype
+            if not self.do_filename_only and filetype ~= "" then
+                wright_filetype = TextWidget:new{
+                    text    = filetype:upper(),
+                    face    = library_font.getFace(fs_pages),
+                    fgcolor = Blitbuffer.COLOR_GRAY_3,
+                    padding = 0,
+                }
+            end
+
             -- Clamp right-column width so oversized fonts do not push content outside row.
             local right_available = math.max(0, self.width - left_offset - 2 * pad_right)
             local max_right_w = math.floor(right_available * 0.45)
-            local wright_w = math.max(status_nat_w, pages_nat_w)
+            local wright_w = math.max(status_nat_w, pages_nat_w,
+                wright_filetype and wright_filetype:getWidth() or 0)
             if max_right_w > 0 then
                 wright_w = math.min(wright_w, max_right_w)
             end
+            if wright_filetype then wright_filetype:setMaxWidth(math.max(1, wright_w)) end
 
             -- ── Step 2: build right-column widgets with clamped width ─────────
             local wright_status, wright_pages
@@ -704,7 +725,7 @@ local function apply_browser_list_item_layout()
                 table.insert(widget, 1, wleft)
             end
 
-            if wright_status or wright_pages then
+            if wright_status or wright_pages or wright_filetype then
                 if wright_status and wright_pages then
                     local right_h = wright_status:getSize().h + wright_pages:getSize().h
                     if right_h > content_h then
@@ -712,10 +733,19 @@ local function apply_browser_list_item_layout()
                         wright_pages = nil
                     end
                 end
+                if wright_filetype then
+                    local right_h = (wright_status and wright_status:getSize().h or 0)
+                        + (wright_pages and wright_pages:getSize().h or 0)
+                    if right_h + wright_filetype:getSize().h > content_h then
+                        wright_filetype:free()
+                        wright_filetype = nil
+                    end
+                end
                 local right_stack = VerticalGroup:new{ align = "right" }
                 table.insert(right_stack, VerticalSpan:new{ width = text_safe_pad_top })
                 if wright_status then table.insert(right_stack, wright_status) end
                 if wright_pages  then table.insert(right_stack, wright_pages)  end
+                if wright_filetype then table.insert(right_stack, wright_filetype) end
                 table.insert(widget, RightContainer:new{
                     dimen = row_dimen,
                     HorizontalGroup:new{
@@ -766,13 +796,23 @@ local function apply_browser_list_item_layout()
         if orig_paintTo then
             function ListMenuItem:paintTo(bb, x, y)
                 local plug = _plugin_ref or rawget(_G, "__ZEN_UI_PLUGIN")
+                local entry = self.entry
+                local config = plug and type(plug.config) == "table" and plug.config or {}
+                local effective_status = (entry and entry._zen_effective_status)
+                    or self._zen_effective_status
+                    or book_status.getEffectiveStatus(
+                        self.status or (entry and entry.status),
+                        self.percent_finished or (entry and entry.percent_finished))
+                local badges = config.browser_cover_badges
+                local dim_finished = type(badges) == "table"
+                    and badges.dim_finished_books == true
+                    and effective_status == "complete"
+                CoverWidget.set_dimmed_border(self._cover_frame, dim_finished)
                 local saved_do_hint = self.do_hint_opened
                 self.do_hint_opened = false
                 orig_paintTo(self, bb, x, y)
                 self.do_hint_opened = saved_do_hint
 
-                local entry = self.entry
-                local config = plug and type(plug.config) == "table" and plug.config or {}
                 local folder = config.browser_folder_cover or {}
                 if self.do_cover_image and folder.show_spine_lines == true
                         and entry and not entry.is_go_up
@@ -783,16 +823,23 @@ local function apply_browser_list_item_layout()
                         rounded = features.browser_cover_rounded_corners == true,
                     })
                 end
-                local effective_status = (entry and entry._zen_effective_status)
-                    or self._zen_effective_status
-                    or book_status.getEffectiveStatus(
-                        self.status or (entry and entry.status),
-                        self.percent_finished or (entry and entry.percent_finished))
-                local badges = plug and type(plug.config) == "table"
-                    and plug.config.browser_cover_badges
-                if type(badges) == "table" and badges.dim_finished_books == true
-                        and effective_status == "complete" and self.width and self.height then
-                    bb:lightenRect(x, y, self.width, self.height, 0.3)
+                local frame = self._cover_frame
+                if dim_finished and frame and frame.dimen then
+                    local border = frame.bordersize or 0
+                    local width = frame.dimen.w - 2 * border
+                    local height = frame.dimen.h - 2 * border
+                    if width > 0 and height > 0 then
+                        bb:lightenRect(frame.dimen.x + border, frame.dimen.y + border,
+                            width, height, 0.4)
+                    end
+                end
+                if is_selected(entry) then
+                    local border = math.max(3, Screen:scaleBySize(3))
+                    local inset = math.max(border, Screen:scaleBySize(4))
+                    local radius = CoverWidget.rounded_enabled() and Screen:scaleBySize(8) or 0
+                    bb:paintBorder(x + inset, y + inset,
+                        self.width - 2 * inset, self.height - 2 * inset,
+                        border, Blitbuffer.COLOR_BLACK, radius)
                 end
             end
         end
@@ -861,7 +908,6 @@ local function apply_browser_list_item_layout()
 
     -- Hook FileManager:setupLayout as a safety-net fallback (e.g., listmenu loads later
     -- or we return from the reader and layout is re-run). patchListMenu() is idempotent.
-    local FileManager = require("apps/filemanager/filemanager")
     local orig_fm_setupLayout = FileManager.setupLayout
 
     FileManager.setupLayout = function(self)
@@ -885,9 +931,7 @@ local function apply_browser_list_item_layout()
             end
             -- setupLayout already called updateItems before our wrapper was installed,
             -- so strip the current item_group now (covers return-from-reader).
-            local UIManager = require("ui/uimanager")
             stripListBorders(fc)
-            UIManager:setDirty(fc, "ui")
         end
     end
 

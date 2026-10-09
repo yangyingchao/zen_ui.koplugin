@@ -2,6 +2,9 @@ describe("config manager folder-path migration", function()
     local Manager
     local settings_file
     local stores
+    local written_settings
+    local write_error
+    local google_key_ensures
 
     local function reload_manager(language)
         _G.G_reader_settings = ZenSpec.memorySettings(language and { language = language } or {})
@@ -12,6 +15,9 @@ describe("config manager folder-path migration", function()
 
     before_each(function()
         settings_file = { data = {}, flush = function() end }
+        written_settings = nil
+        write_error = nil
+        google_key_ensures = 0
         stores = {
             home = { settings = {}, presets = {} },
             reader = { settings = {}, presets = {} },
@@ -19,6 +25,14 @@ describe("config manager folder-path migration", function()
         ZenSpec.replace("luasettings", { open = function() return settings_file end })
         ZenSpec.replace("util", {
             tableDeepCopy = function(value) return value end,
+            writeToFile = function(data, path)
+                if write_error then return nil, write_error end
+                written_settings = "-- " .. path .. "\nreturn " .. data .. "\n"
+                return true
+            end,
+            readFromFile = function()
+                return written_settings
+            end,
         })
         ZenSpec.replace("config/preset_store", {
             rootDir = function() return "/tmp/zen-ui-spec" end,
@@ -30,6 +44,15 @@ describe("config manager folder-path migration", function()
                 return true
             end,
             migrateStores = function() return false end,
+        })
+        ZenSpec.replace("config/hardcover_token", {
+            ensureFile = function() return false end,
+        })
+        ZenSpec.replace("config/google_books_key", {
+            ensureFile = function()
+                google_key_ensures = google_key_ensures + 1
+                return false
+            end,
         })
         ZenSpec.replace("modules/filebrowser/patches/home/home_presets", {
             DEFAULT_PRESET_NAME = "Zen Default",
@@ -48,13 +71,173 @@ describe("config manager folder-path migration", function()
         local config = Manager.load()
 
         assert.is_true(config.features.navbar)
+        assert.is_true(config.navbar.active_tab_underline)
+        assert.is_false(config.navbar.active_tab_filled)
+        assert.are.same({ 255, 255, 255 }, config.navbar.filled_outline_color)
+        assert.are.same({ 0x4F, 0x6F, 0x8F }, config.navbar.filled_background_color)
+        assert.are.equal(60, config.navbar.filled_background_opacity)
         assert.is_true(config.features.quick_settings)
         assert.is_true(config.features.app_launcher)
         assert.is_true(config.features.zen_mode)
         assert.is_true(config.features.status_bar)
+        assert.is_true(config.features.reader_status_bar_margins)
+        assert.are.same({ "bluetooth", "wifi", "battery" }, config.status_bar.right_order)
         assert.are.equal("90", config.quick_settings.rotate_action)
+        assert.are.equal("", config.quick_settings.gyro_label)
+        assert.are.equal("quick_rotate", config.quick_settings.gyro_icon)
+        assert.is_true(config.quick_settings.unified_light_slider)
+        assert.is_false(config.quick_settings.tailscale_toggle_wifi)
         assert.are.equal("number", config.reader_footer.chapter_time_format)
+        assert.is_false(config.reader_top_status_bar.wifi_hide_when_off)
+        assert.are.equal(18, config.page_browser.toc_font_size)
+        assert.are.equal(18, config.page_browser.bookmarks_font_size)
+        assert.are.same({}, config.folder_cover_paths)
+        assert.is_false(config.search.substring)
+        assert.is_true(config.metadata.hardcover_enabled)
+        assert.is_true(config.metadata.google_books_enabled)
+        assert.is_true(config.metadata.open_library_enabled)
+        assert.is_true(config.metadata.hardcover_auto_match)
+        assert.is_false(config.metadata.epub_backup)
+        assert.are.equal(1, google_key_ensures)
         assert.is_false(config._meta.quickstart_shown_for_version)
+    end)
+
+    it("preserves disabled reader margin alignment", function()
+        settings_file.data = { features = { reader_status_bar_margins = false } }
+        assert.is_false(Manager.load().features.reader_status_bar_margins)
+    end)
+
+    it("preserves existing default status layouts", function()
+        settings_file.data = {
+            status_bar = { left_order = { "time" }, center_order = {}, right_order = { "wifi", "battery" } },
+        }
+        local config = Manager.load()
+        assert.are.same({ "time" }, config.status_bar.left_order)
+        assert.are.same({}, config.status_bar.center_order)
+        assert.are.same({ "wifi", "battery" }, config.status_bar.right_order)
+    end)
+
+    it("preserves customized status layouts when applying new defaults", function()
+        settings_file.data = {
+            status_bar = { left_order = { "bluetooth", "time" }, center_order = {}, right_order = { "wifi", "battery" } },
+        }
+        local config = Manager.load()
+        assert.are.same({ "bluetooth", "time" }, config.status_bar.left_order)
+        assert.are.same({ "wifi", "battery" }, config.status_bar.right_order)
+    end)
+
+    it("defaults search matching for the interface script", function()
+        reload_manager("zh_CN")
+        assert.is_true(Manager.load().search.substring)
+
+        settings_file.data = { search = { substring = true } }
+        reload_manager("en_US")
+        assert.is_true(Manager.load().search.substring)
+    end)
+
+    it("fills missing defaults without sharing them or replacing saved arrays", function()
+        settings_file.data = { navbar = { order = { "home" } }, folder_cover_paths = {} }
+        local defaults = require("config/defaults")
+        local config = Manager.load()
+        assert.are.same({ "home" }, config.navbar.order)
+        assert.are.same({}, config.folder_cover_paths)
+        assert.is_true(config.features.navbar)
+        config.features.navbar = false
+        assert.is_true(defaults.features.navbar)
+        assert.are.equal(config, Manager.load())
+        assert.is_false(config.features.navbar)
+    end)
+
+    it("reports a verified settings write failure", function()
+        settings_file.file = "/tmp/zen-ui-spec/config.lua"
+        settings_file.backup = function() return false end
+        write_error = "disk full"
+
+        local saved, err = Manager.save({ folder_cover_paths = {} }, true)
+
+        assert.is_nil(saved)
+        assert.are.equal("disk full", err)
+        assert.is_nil(Manager.get())
+    end)
+
+    it("removes the legacy reader config after saving it to the dedicated file", function()
+        local flushes = 0
+        settings_file.file = "/tmp/zen-ui-spec/config.lua"
+        settings_file.backup = function() return false end
+        _G.G_reader_settings:saveSetting("zen_ui_config", {
+            navbar = { icon_size = 42 },
+        })
+        _G.G_reader_settings.flush = function()
+            assert.are.equal(42, settings_file.data.navbar.icon_size)
+            assert.is_string(written_settings)
+            flushes = flushes + 1
+        end
+
+        assert.are.equal(42, Manager.load().navbar.icon_size)
+
+        assert.is_nil(G_reader_settings:readSetting("zen_ui_config"))
+        assert.are.equal(1, flushes)
+    end)
+
+    it("cleans up a leftover legacy config without replacing the current config", function()
+        settings_file.data = { navbar = { icon_size = 38 } }
+        _G.G_reader_settings:saveSetting("zen_ui_config", {
+            navbar = { icon_size = 42 },
+        })
+        Manager.load()
+        _G.G_reader_settings:saveSetting("zen_ui_config", {
+            navbar = { icon_size = 42 },
+        })
+
+        assert.are.equal(38, Manager.load().navbar.icon_size)
+
+        assert.is_nil(G_reader_settings:readSetting("zen_ui_config"))
+    end)
+
+    it("keeps the legacy config when saving the dedicated file fails", function()
+        _G.G_reader_settings:saveSetting("zen_ui_config", {
+            navbar = { icon_size = 42 },
+        })
+        settings_file.flush = function() return false end
+
+        Manager.load()
+
+        assert.are.equal(42, G_reader_settings:readSetting("zen_ui_config").navbar.icon_size)
+    end)
+
+    it("keeps the legacy config when a verified migration write fails", function()
+        _G.G_reader_settings:saveSetting("zen_ui_config", {
+            navbar = { icon_size = 42 },
+        })
+        settings_file.file = "/tmp/zen-ui-spec/config.lua"
+        settings_file.backup = function() return false end
+        write_error = "disk full"
+
+        Manager.load()
+
+        assert.are.equal(42, G_reader_settings:readSetting("zen_ui_config").navbar.icon_size)
+    end)
+
+    it("keeps the legacy config when migration readback verification fails", function()
+        _G.G_reader_settings:saveSetting("zen_ui_config", {
+            navbar = { icon_size = 42 },
+        })
+        settings_file.file = "/tmp/zen-ui-spec/config.lua"
+        settings_file.backup = function() return false end
+        require("util").readFromFile = function() return "truncated" end
+
+        Manager.load()
+
+        assert.are.equal(42, G_reader_settings:readSetting("zen_ui_config").navbar.icon_size)
+    end)
+
+    it("accepts a verified settings write only after reading it back", function()
+        settings_file.file = "/tmp/zen-ui-spec/config.lua"
+        settings_file.backup = function() return false end
+        local config = { folder_cover_paths = {} }
+
+        assert.is_true(Manager.save(config, true))
+        assert.are.equal(config, Manager.get())
     end)
 
     it("migrates verbose chapter time settings to display formats", function()
@@ -101,6 +284,24 @@ describe("config manager folder-path migration", function()
         assert.are.equal("cycle", config.quick_settings.rotate_action)
     end)
 
+    it("migrates a disabled status bar to empty item lists", function()
+        settings_file.data = {
+            features = { status_bar = false },
+            status_bar = {
+                left_order = { "time" },
+                center_order = { "date" },
+                right_order = { "wifi", "battery" },
+            },
+        }
+
+        local config = Manager.load()
+
+        assert.is_true(config.features.status_bar)
+        assert.are.same({}, config.status_bar.left_order)
+        assert.are.same({}, config.status_bar.center_order)
+        assert.are.same({}, config.status_bar.right_order)
+    end)
+
     it("recovers the sparse config created by the fresh-install merge bug", function()
         settings_file.data = {
             _meta = {
@@ -127,7 +328,35 @@ describe("config manager folder-path migration", function()
         assert.is_false(config._meta.quickstart_completed)
     end)
 
-    it("moves sort and display overrides for a renamed folder subtree", function()
+    it("keeps JPG and JPEG folder-cover references while preserving clear tombstones", function()
+        settings_file.data = {
+            folder_cover_paths = {
+                ["/library/mixed"] = {
+                    [1] = "/images/first.jpg",
+                    [2] = "/images/second.JPG",
+                    [3] = "/images/legacy.jpeg",
+                    [4] = "/images/legacy.png",
+                },
+                ["/library/unsupported"] = {
+                    [1] = "/images/legacy.webp",
+                    [2] = "/images/legacy.gif",
+                },
+                ["/library/cleared"] = {},
+            },
+        }
+
+        local config = Manager.load()
+
+        assert.are.same({
+            [1] = "/images/first.jpg",
+            [2] = "/images/second.JPG",
+            [3] = "/images/legacy.jpeg",
+        }, config.folder_cover_paths["/library/mixed"])
+        assert.is_nil(config.folder_cover_paths["/library/unsupported"])
+        assert.are.same({}, config.folder_cover_paths["/library/cleared"])
+    end)
+
+    it("moves path settings and rewrites cover references for a renamed subtree", function()
         Manager.save({
             folder_sort = {
                 ["/library/old"] = { collate = "title", reverse = true },
@@ -137,6 +366,21 @@ describe("config manager folder-path migration", function()
                 ["/library/old"] = "mosaic",
                 ["/unrelated"] = "list",
             },
+            folder_cover_paths = {
+                ["/library/old"] = {
+                    [1] = "/library/old/art/first.jpg",
+                    [3] = "/shared/third.jpg",
+                },
+                ["/library/old/nested"] = {
+                    [2] = "/library/old/nested/second.jpg",
+                },
+                ["/library/other"] = {
+                    [1] = "/library/old/shared.jpg",
+                },
+                ["/unrelated"] = {
+                    [1] = "/elsewhere/poster.jpg",
+                },
+            },
         })
         assert.is_true(Manager.moveFolderPathSettings("/library/old/", "/library/new"))
         local config = Manager.get()
@@ -145,11 +389,42 @@ describe("config manager folder-path migration", function()
         assert.are.same({ collate = "access", reverse = false }, config.folder_sort["/library/new/nested"])
         assert.are.equal("mosaic", config.folder_display_mode["/library/new"])
         assert.are.equal("list", config.folder_display_mode["/unrelated"])
+        assert.is_nil(config.folder_cover_paths["/library/old"])
+        assert.is_nil(config.folder_cover_paths["/library/old/nested"])
+        assert.are.same({
+            [1] = "/library/new/art/first.jpg",
+            [3] = "/shared/third.jpg",
+        }, config.folder_cover_paths["/library/new"])
+        assert.are.same({
+            [2] = "/library/new/nested/second.jpg",
+        }, config.folder_cover_paths["/library/new/nested"])
+        assert.are.equal("/library/new/shared.jpg",
+            config.folder_cover_paths["/library/other"][1])
+        assert.are.equal("/elsewhere/poster.jpg",
+            config.folder_cover_paths["/unrelated"][1])
     end)
 
     it("does not rewrite identical normalized paths", function()
         Manager.save({ folder_sort = { ["/library/same"] = { collate = "title" } } })
         assert.is_false(Manager.moveFolderPathSettings("/library/same/", "/library/same"))
+    end)
+
+    it("rewrites a cover reference when its image file moves", function()
+        Manager.save({
+            folder_cover_paths = {
+                ["/library/series"] = {
+                    [1] = "/images/old.jpg",
+                    [2] = "/images/other.jpg",
+                },
+            },
+        })
+
+        assert.is_true(Manager.movePathSettings(
+            "/images/old.jpg", "/artwork/new.jpg"))
+        assert.are.same({
+            [1] = "/artwork/new.jpg",
+            [2] = "/images/other.jpg",
+        }, Manager.get().folder_cover_paths["/library/series"])
     end)
 
     it("migrates missing and legacy quote font sizes to 12", function()
@@ -309,7 +584,7 @@ describe("config manager folder-path migration", function()
     end)
 
     it("keeps the Library default for locales unsupported by bundled fonts", function()
-        reload_manager("ja_JP")
+        reload_manager("vi_VN")
         settings_file.data = {
             library_font = { font_face = "default", font_size = 20 },
         }
@@ -322,7 +597,7 @@ describe("config manager folder-path migration", function()
     end)
 
     it("resets the bundled Library font after switching to an unsupported locale", function()
-        reload_manager("ja_JP")
+        reload_manager("vi_VN")
         settings_file.data = {
             _meta = { library_font_hyperreadable_default_migrated = true },
             library_font = {
@@ -364,5 +639,45 @@ describe("config manager folder-path migration", function()
         assert.are.equal("single", stores.reader.settings.page_browser_layout)
         assert.is_nil(G_reader_settings:readSetting("substring_search"))
         assert.is_nil(G_reader_settings:readSetting("zen_page_browser_layout"))
+    end)
+
+    it("moves Zen-owned globals into the dedicated config", function()
+        _G.G_reader_settings = ZenSpec.memorySettings({
+            uniform_cover_ratio = "3:4",
+            opds_default_url = "https://catalog.example",
+            zen_series_display_mode = "mosaic_text",
+            zen_series_reverse = true,
+            zen_tags_global_collate = "access",
+            zen_tags_global_reverse = true,
+            zen_series_detail_collate_Saga = "title",
+            zen_series_detail_reverse_Saga = true,
+        })
+
+        local config = Manager.load()
+
+        assert.are.equal("3:4", config.uniform_cover_ratio)
+        assert.are.equal("https://catalog.example", config.opds.default_url)
+        assert.are.equal("mosaic_text", config.group_view.display_mode.series)
+        assert.is_true(config.group_view.group_reverse.series)
+        assert.are.equal("access", config.group_view.tags_global.collate)
+        assert.is_true(config.group_view.tags_global.reverse)
+        assert.are.equal("title", config.group_view.detail_collate.series.Saga)
+        assert.is_true(config.group_view.detail_reverse.series.Saga)
+        for _i, key in ipairs({
+            "uniform_cover_ratio", "opds_default_url",
+            "zen_series_display_mode", "zen_series_reverse",
+            "zen_tags_global_collate", "zen_tags_global_reverse",
+            "zen_series_detail_collate_Saga", "zen_series_detail_reverse_Saga",
+        }) do
+            assert.is_nil(G_reader_settings:readSetting(key), key)
+        end
+    end)
+
+    it("preserves the carousel page-browser layout", function()
+        stores.reader.settings.page_browser_layout = "carousel"
+
+        Manager.load()
+
+        assert.are.equal("carousel", stores.reader.settings.page_browser_layout)
     end)
 end)

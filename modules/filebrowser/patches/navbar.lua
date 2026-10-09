@@ -12,6 +12,7 @@ local function apply_navbar()
     local InputContainer = require("ui/widget/container/inputcontainer")
     local LineWidget = require("ui/widget/linewidget")
     local TextWidget = require("ui/widget/textwidget")
+    local ColorTextWidget = require("common/ui/color_text_widget")
     local Event = require("ui/event")
     local ffiUtil = require("ffi/util")
     local UIManager = require("ui/uimanager")
@@ -23,6 +24,7 @@ local function apply_navbar()
     local MemoryPolicy = require("common/memory_policy")
     local SharedState = require("common/shared_state")
     local ButtonModel = require("common/nav_button_model")
+    local Kindle = require("modules/filebrowser/patches/kindle_virtual_library")
     local StandalonePage = require("modules/filebrowser/patches/standalone_page")
     local NativeMenu = require("modules/menu/app_launcher/native_menu")
     local PluginScan = require("modules/menu/app_launcher/plugin_scan")
@@ -96,7 +98,9 @@ local function apply_navbar()
     local config_default = {
         show_tabs = {
             books = true,
+            archive = false,
             folder = false,
+            kindle = false,
             manga = true,
             news = true,
             continue = true,
@@ -135,6 +139,10 @@ local function apply_navbar()
         colored = false,
         active_tab_color = {0x33, 0x99, 0xFF}, -- blue
         active_tab_underline = true,
+        active_tab_filled = false,
+        filled_outline_color = {0xFF, 0xFF, 0xFF},
+        filled_background_color = {0x4F, 0x6F, 0x8F},
+        filled_background_opacity = 60,
         underline_above = false,
         show_top_border = false,
         layout_version = 2,
@@ -233,9 +241,19 @@ local function apply_navbar()
             icon = "library",
         },
         {
+            id = "archive",
+            label = _("Archive"),
+            icon = utils.resolveLocalIcon(_icons_dir, "archive"),
+        },
+        {
             id = "folder",
             label = getFolderLabel(),
             icon = getFolderIcon(),
+        },
+        {
+            id = "kindle",
+            label = _("Kindle Library"),
+            icon = utils.resolveLocalIcon(_icons_dir, "library"),
         },
         {
             id = "manga",
@@ -355,7 +373,7 @@ local function apply_navbar()
     end
 
     local skip_tabs_for_state = {
-        books = true, manga = true, news = true,
+        books = true, kindle = true, manga = true, news = true,
         folder = true, continue = true, search = true, stats = true, exit = true,
     }
     local group_view_tabs = {
@@ -368,6 +386,16 @@ local function apply_navbar()
             if type(tab) == "table" and tab.id == tab_id and tab.type == "tag"
                     and type(tab.tag) == "string"
                     and tab.tag ~= "" then
+                return tab
+            end
+        end
+    end
+
+    local function getCustomStatusTab(tab_id)
+        if type(config.custom_tabs) ~= "table" then return nil end
+        for _i, tab in ipairs(config.custom_tabs) do
+            if type(tab) == "table" and tab.id == tab_id and tab.type == "status"
+                    and ButtonModel.statusLabel(tab.status) then
                 return tab
             end
         end
@@ -396,10 +424,13 @@ local function apply_navbar()
 
     local function isGroupViewTab(tab_id)
         return group_view_tabs[tab_id] == true or getCustomTagTab(tab_id) ~= nil
+            or getCustomStatusTab(tab_id) ~= nil
     end
 
     local function getGroupViewTab(tab_id)
-        return getCustomTagTab(tab_id) and "tags" or tab_id
+        if getCustomTagTab(tab_id) then return "tags" end
+        if getCustomStatusTab(tab_id) then return "status" end
+        return tab_id
     end
 
     -- Forward declarations; defined later
@@ -435,6 +466,7 @@ local function apply_navbar()
     local function tabStaysInFileManager(id)
         local custom_folder = getCustomFolderTab(id)
         return id == "books"
+            or (id == "archive" and paths.getArchiveDir() ~= nil)
             or (id == "folder" and normalizeFolderPath(config.folder_path) ~= nil)
             or (id == "manga" and config.manga_action == "folder" and config.manga_folder ~= "")
             or (id == "news" and config.news_action == "folder" and config.news_folder ~= "")
@@ -1028,7 +1060,9 @@ local function apply_navbar()
     end
 
     local function revealFileManager(fm, fc)
-        local was_hidden = fileManagerIsHidden(fm, fc)
+        local revealed = fileManagerIsHidden(fm, fc)
+            or fm and fm._zen_hidden_home_startup == true
+            or fc and fc._zen_hidden_home_startup == true
         local fm_parent = fm and fm.show_parent
         local fc_parent = fc and fc.show_parent
         local function reveal(widget)
@@ -1041,7 +1075,7 @@ local function apply_navbar()
         reveal(fc)
         reveal(fm_parent)
         reveal(fc_parent)
-        return was_hidden
+        return revealed
     end
 
     local function onTabBooks()
@@ -1153,18 +1187,25 @@ local function apply_navbar()
         local function buildFolder()
             fc._zen_needs_full_listing = nil
             fc._zen_needs_cover_refresh = nil
+            local archive_root = normalizeFolderPath(paths.getArchiveDir())
+            local direct_archive = tab_id == "archive" and paths.isArchiveRoot(folder_path)
+            fc._zen_direct_archive_root = direct_archive and archive_root or nil
             local current_path = normalizeFolderPath(fc.path)
+            local archive_dirty = tab_id == "archive"
+                and rawget(_G, "__ZEN_UI_ARCHIVE_LISTING_DIRTY") == true
             if current_path == folder_path then
-                if listing_deferred and type(fc.refreshPath) == "function" then
+                if (listing_deferred or archive_dirty)
+                        and type(fc.refreshPath) == "function" then
                     fc:refreshPath()
                 elseif type(fc.onGotoPage) == "function" then
                     fc:onGotoPage(1)
                 end
             else
                 fc.path_items[folder_path] = nil
+                fc._zen_opening_archive_root = direct_archive or nil
                 fc:changeToPath(folder_path)
             end
-            setActiveTab(tab_id)
+            if tab_id == "archive" then _G.__ZEN_UI_ARCHIVE_LISTING_DIRTY = nil end
         end
         if was_hidden then
             local original_set_dirty = UIManager.setDirty
@@ -1178,13 +1219,36 @@ local function apply_navbar()
 
         local revealed = revealFileManager(fm, fc)
         utils.closeWidgetsAbove(fm_stack_widget or fm)
-        if revealed then UIManager:setDirty(fm_stack_widget or fm, "ui") end
+        if revealed then
+            if type(fc._zen_resume_visible_cover_work) == "function" then
+                fc:_zen_resume_visible_cover_work()
+            end
+        end
+        setActiveTab(tab_id)
         return true, folder_path
     end
 
     local function fallbackToLibrary()
         setActiveTab("books")
         onTabBooks()
+    end
+
+    local function onTabArchive()
+        local archive_dir = paths.getArchiveDir()
+        if not archive_dir then return false end
+        local opened, folder_path = openFileManagerFolder(archive_dir, "archive")
+        if not opened then
+            fallbackToLibrary()
+            local InfoMessage = require("ui/widget/infomessage")
+            UIManager:show(InfoMessage:new{
+                text = ffiUtil.template(_("Archive folder not found: %1"), folder_path),
+            })
+        end
+        return opened
+    end
+
+    local function onTabKindle()
+        return Kindle.open()
     end
 
     local function onTabManga()
@@ -1241,6 +1305,17 @@ local function apply_navbar()
         end
         setActiveTab(tab_id or "tags")
         GroupView.showTagDetail(tag_name, injectStandaloneNavbar, tab_id or "tags")
+        return true
+    end
+
+    local function openStatus(status, label, tab_id)
+        local GroupView = get_shared("group_view")
+        if not (ButtonModel.statusLabel(status) and GroupView
+                and type(GroupView.showStatusView) == "function") then
+            return false
+        end
+        setActiveTab(tab_id)
+        GroupView.showStatusView(status, label, injectStandaloneNavbar, tab_id)
         return true
     end
 
@@ -1504,6 +1579,9 @@ local function apply_navbar()
     end
 
     local function onTabMenu()
+        local stack = UIManager._window_stack
+        local top = type(stack) == "table" and stack[#stack]
+        if Kindle.showContextMenu(top and top.widget) then return end
         local fm = FileManager.instance
         if not fm or not fm.file_chooser then return end
         local fc = fm.file_chooser
@@ -1526,7 +1604,9 @@ local function apply_navbar()
 
     local tab_callbacks = {
         books = onTabBooks,
+        archive = onTabArchive,
         folder = onTabFolder,
+        kindle = onTabKindle,
         manga = onTabManga,
         news = onTabNews,
         continue = onTabContinue,
@@ -1550,7 +1630,9 @@ local function apply_navbar()
 
     local default_tab_whitelist = {
         books = true,
+        archive = true,
         folder = true,
+        kindle = true,
         manga = true,
         news = true,
         history = true,
@@ -1566,7 +1648,9 @@ local function apply_navbar()
 
     local active_tab_whitelist = {
         books = true,
+        archive = true,
         folder = true,
+        kindle = true,
         manga = true,
         news = true,
         authors = true,
@@ -1583,14 +1667,14 @@ local function apply_navbar()
     local function shouldTrackActiveTab(tab_id)
         return active_tab_whitelist[tab_id] == true
             or getCustomTagTab(tab_id) ~= nil
+            or getCustomStatusTab(tab_id) ~= nil
             or getCustomFolderTab(tab_id) ~= nil
     end
 
     local function is_tab_enabled(tab_id)
-        if tab_id:sub(1, 3) == "ct_" then
-            return config.show_tabs[tab_id] == true
-        end
         return config.show_tabs[tab_id] == true
+            and (tab_id ~= "archive" or paths.getArchiveDir() ~= nil)
+            and (tab_id ~= "kindle" or Kindle.isAvailable())
     end
 
     local function first_enabled_default_tab()
@@ -1638,26 +1722,25 @@ local function apply_navbar()
         end)
     end
 
-    local function runTabCallback(tab_id)
+    local function runTabCallback(tab_id, source_tab_id)
         local cb = tab_callbacks[tab_id]
         if not cb then return end
         local stack = UIManager._window_stack
         local top = stack and stack[#stack]
         local top_widget = top and top.widget
-        if tab_id ~= "home"
-                and top_widget
-                and top_widget._zen_navbar_tab_id == tab_id then
+        local source = source_tab_id or (top_widget and top_widget._zen_navbar_tab_id)
+        local same_page = source == tab_id
+        if tab_id ~= "home" and same_page then
             return
         end
         if shouldTrackActiveTab(tab_id) then
             cb()
-            if tab_id ~= "home" and not tabStaysInFileManager(tab_id) then
-                refreshAfterNavbarPageSwitch()
-            end
+            if not same_page then refreshAfterNavbarPageSwitch() end
             return
         end
         local saved_active = active_tab
         cb()
+        if tab_id == "stats" then refreshAfterNavbarPageSwitch() end
         if active_tab ~= saved_active then
             active_tab = saved_active
             syncActiveTabLabel()
@@ -1708,53 +1791,6 @@ local function apply_navbar()
 
     local ok_disp_ct, Dispatcher_ct = pcall(require, "dispatcher")
 
-    -- === Color text support ===
-    -- TextWidget.colorblitFrom converts to grayscale; colorblitFromRGB32 needed for color.
-
-    local RenderText = require("ui/rendertext")
-
-    local ColorTextWidget = TextWidget:extend{}
-
-    function ColorTextWidget:paintTo(bb, x, y)
-        self:updateSize()
-        if self._is_empty then return end
-
-        if not self.fgcolor or Blitbuffer.isColor8(self.fgcolor) or not Screen:isColorScreen() then
-            TextWidget.paintTo(self, bb, x, y)
-            return
-        end
-
-        if not self.use_xtext then
-            TextWidget.paintTo(self, bb, x, y)
-            return
-        end
-
-        if not self._xshaping then
-            self._xshaping = self._xtext:shapeLine(self._shape_start, self._shape_end,
-                                                self._shape_idx_to_substitute_with_ellipsis)
-        end
-
-        local text_width = bb:getWidth() - x
-        if self.max_width and self.max_width < text_width then
-            text_width = self.max_width
-        end
-        local pen_x = 0
-        local baseline = self.forced_baseline or self._baseline_h
-        for _i, xglyph in ipairs(self._xshaping) do
-            if pen_x >= text_width then break end
-            local face = self.face.getFallbackFont(xglyph.font_num)
-            local glyph = RenderText:getGlyphByIndex(face, xglyph.glyph, self.bold)
-            bb:colorblitFromRGB32(
-                glyph.bb,
-                x + pen_x + glyph.l + xglyph.x_offset,
-                y + baseline - glyph.t - xglyph.y_offset,
-                0, 0,
-                glyph.bb:getWidth(), glyph.bb:getHeight(),
-                self.fgcolor)
-            pen_x = pen_x + xglyph.x_advance
-        end
-    end
-
     -- === Colored icon widget ===
     -- Build a mask from the icon, then color-blit through it.
 
@@ -1763,7 +1799,7 @@ local function apply_navbar()
     }
 
     function ColorIconWidget:paintTo(bb, x, y)
-        if not self._tint_color or not Screen:isColorScreen() then
+        if not self._tint_color then
             IconWidget.paintTo(self, bb, x, y)
             return
         end
@@ -1799,7 +1835,8 @@ local function apply_navbar()
             mask:blitFrom(self._bb, 0, 0, self._offset_x, self._offset_y, size.w, size.h)
         end
         mask:invertRect(0, 0, size.w, size.h)
-        bb:colorblitFromRGB32(mask, x, y, 0, 0, size.w, size.h, self._tint_color)
+        local color = Screen.night_mode and self._tint_color:invert() or self._tint_color
+        bb:colorblitFromRGB32(mask, x, y, 0, 0, size.w, size.h, color)
     end
 
     function ColorIconWidget:free()
@@ -1843,9 +1880,16 @@ local function apply_navbar()
 
     local function createTabWidget(tab, label_max_w, is_active, font_size, is_focused)
         local styled = is_active and tab.dim ~= true
-        local use_color = styled and config.colored and Screen:isColorScreen()
+        local filled = styled and config.active_tab_filled == true
+        local use_color = styled and config.active_tab_underline and config.colored and Screen:isColorScreen()
         local active_color
-        if use_color then
+        local fill_color
+        if filled then
+            local c = config.filled_outline_color
+            active_color = Blitbuffer.ColorRGB32(c[1], c[2], c[3], 0xFF)
+            c = config.filled_background_color
+            fill_color = Blitbuffer.ColorRGB32(c[1], c[2], c[3], 0xFF)
+        elseif use_color then
             local c = config.active_tab_color
             if c and type(c) == "table" then
                 active_color = Blitbuffer.ColorRGB32(c[1], c[2], c[3], 0xFF)
@@ -1857,7 +1901,8 @@ local function apply_navbar()
 
         local icon
         if show_icon then
-            local icon_path = utils.resolveIcon(_icons_dir, tab.icon)
+            local icon_path = tab.icon:sub(1, 1) == "/" and tab.icon
+                or utils.resolveIcon(_icons_dir, tab.icon)
             if active_color then
                 icon = ColorIconWidget:new{
                     icon   = icon_path and nil or tab.icon,
@@ -1877,17 +1922,58 @@ local function apply_navbar()
                     dim = tab.dim == true,
                 }
             end
+            if config.active_tab_filled then
+                local h_pad = math.floor(navbar_icon_size / 5 + 0.5)
+                local v_pad = math.floor(navbar_icon_size / 8 + 0.5)
+                icon = require("ui/widget/container/framecontainer"):new{
+                    background = fill_color,
+                    bordersize = 0,
+                    padding = 0,
+                    margin = 0,
+                    padding_left = h_pad,
+                    padding_right = h_pad,
+                    padding_top = v_pad,
+                    padding_bottom = v_pad,
+                    radius = math.floor((navbar_icon_size + v_pad * 2) / 4 + 0.5),
+                    icon,
+                }
+                local opacity = math.max(0, math.min(100,
+                    tonumber(config.filled_background_opacity) or 60))
+                if filled then
+                    local paint = icon.paintTo
+                    local color = fill_color
+                    if opacity < 100 then
+                        color = color:getColorRGB32()
+                        color.alpha = math.floor(opacity * 255 / 100 + 0.5)
+                    end
+                    function icon:paintTo(bb, x, y)
+                        local background = Screen.night_mode and color:invert() or color
+                        if opacity > 0 and opacity < 100 then
+                            local size = self:getSize()
+                            local fill = Blitbuffer.new(size.w, size.h, Blitbuffer.TYPE_BBRGB32)
+                            fill:paintRectRGB32(0, 0, size.w, size.h, Blitbuffer.ColorRGB32(0, 0, 0, 0))
+                            fill:paintRoundedRectRGB32(0, 0, size.w, size.h, background, self.radius)
+                            bb:alphablitFrom(fill, x, y, 0, 0, size.w, size.h)
+                            fill:free()
+                        end
+                        self.background = opacity == 100 and background or nil
+                        paint(self, bb, x, y)
+                        self.background = fill_color
+                    end
+                end
+            end
         end
 
         local size = font_size or navbar_font_size_steps[1]
         local label_face = library_font.getFace(size)
         local label
-        if active_color then
+        local label_color = filled and not show_icon and fill_color or not filled and active_color
+        if label_color then
             label = ColorTextWidget:new{
                 text = tab.label,
                 face = label_face,
                 max_width = label_max_w,
-                fgcolor = active_color,
+                fgcolor = label_color,
             }
         else
             label = TextWidget:new{
@@ -1898,7 +1984,7 @@ local function apply_navbar()
             }
         end
 
-        local show_underline = styled and config.active_tab_underline
+        local show_underline = styled and config.active_tab_underline and not filled
         local underline
         if show_underline then
             local underline_w = show_label and label:getSize().w or icon:getSize().w
@@ -1909,13 +1995,14 @@ local function apply_navbar()
                     underline_color = Blitbuffer.ColorRGB32(c[1], c[2], c[3], 0xFF)
                 end
             end
-            if config.colored and Screen:isColorScreen() then
+            if config.colored then
                 local Widget = require("ui/widget/widget")
                 local color_line = Widget:new{
                     dimen = Geom:new{ w = underline_w, h = underline_thickness },
                 }
                 function color_line:paintTo(bb, x, y)
-                    bb:paintRectRGB32(x, y, self.dimen.w, self.dimen.h, underline_color)
+                    local color = Screen.night_mode and underline_color:invert() or underline_color
+                    bb:paintRectRGB32(x, y, self.dimen.w, self.dimen.h, color)
                 end
                 underline = color_line
             else
@@ -1977,7 +2064,7 @@ local function apply_navbar()
     local function getVisibleTabs()
         local visible = {}
         for _i, id in ipairs(config.tab_order) do
-            if config.show_tabs[id] and tabs_by_id[id] then
+            if is_tab_enabled(id) and tabs_by_id[id] then
                 table.insert(visible, tabs_by_id[id])
                 if #visible >= navbar_max_tabs then break end
             end
@@ -2025,6 +2112,7 @@ local function apply_navbar()
                     end
                     entry.label = (ct.label ~= nil and ct.label ~= "") and ct.label
                         or ct.tag
+                        or (ct.type == "status" and ButtonModel.statusLabel(ct.status))
                         or (ct.type == "folder" and ButtonModel.label(nil, ct))
                         or ct.plugin_title
                         or (ct.koreader_menu and ct.koreader_menu.title)
@@ -2059,6 +2147,13 @@ local function apply_navbar()
                         local tab_id = ct.id
                         tab_callbacks[ct.id] = function()
                             openTag(tag_name, tab_id)
+                        end
+                    elseif ct.type == "status" and ButtonModel.statusLabel(ct.status) then
+                        local status = ct.status
+                        local label = entry.label
+                        local tab_id = ct.id
+                        tab_callbacks[tab_id] = function()
+                            openStatus(status, label, tab_id)
                         end
                     elseif ct.type == "folder" and type(ct.folder) == "string"
                             and ct.folder ~= "" then
@@ -2181,6 +2276,12 @@ local function apply_navbar()
                         range = Geom:new{ x = 0, y = 0, w = screen_w, h = Screen:getHeight() },
                     },
                 },
+                HoldNavBar = {
+                    GestureRange:new{
+                        ges = "hold",
+                        range = Geom:new{ x = 0, y = 0, w = screen_w, h = Screen:getHeight() },
+                    },
+                },
             },
         }
 
@@ -2212,6 +2313,18 @@ local function apply_navbar()
                 setActiveTab(tapped_id)
             end
             runTabCallback(tapped_id)
+            return true
+        end
+
+        navbar.onHoldNavBar = function(self, _, ges)
+            if not self:getTappedTabId(ges.pos) then return false end
+            local fm = FileManager.instance
+            local fc = fm and fm.file_chooser
+            if not (fc and fc.path) or paths.isInHomeDir(fc.path)
+                    or type(fm.onShowPlusMenu) ~= "function" then
+                return false
+            end
+            fm:onShowPlusMenu()
             return true
         end
 
@@ -2254,6 +2367,7 @@ local function apply_navbar()
         series_detail = true,
         languages_detail = true,
         tags_detail = true,
+        status_detail = true,
         stats = true,
     }
 
@@ -2289,11 +2403,13 @@ local function apply_navbar()
             return true
         end
         return standalone_view_names[widget.name] == true
+            or Kindle.isLibraryView(widget)
             or isRakuyomiView(widget)
             or widget._zen_standalone_navbar_injected == true
     end
 
     local function getStandaloneNextTickTabId(menu)
+        if Kindle.isLibraryView(menu) then return "kindle" end
         local Rakuyomi = getRakuyomi()
         if type(Rakuyomi.getStandaloneTabId) == "function" then
             return Rakuyomi.getStandaloneTabId(menu)
@@ -2321,9 +2437,13 @@ local function apply_navbar()
 
     local function isStandaloneNavbarView(menu)
         if standalone_view_names[menu.name] then return true end
+        if Kindle.isLibraryView(menu) then return true end
         if isRakuyomiView(menu) then return true end
-        -- Collections list has no name but has these flags
-        if not menu.name and menu.covers_fullscreen and menu.is_borderless and menu.title_bar_fm_style then
+        -- Collections list has no name but has these flags. PathChooser also
+        -- has them, so exclude its explicit selection contract.
+        if not menu.name
+                and menu.select_directory == nil and menu.select_file == nil
+                and menu.covers_fullscreen and menu.is_borderless and menu.title_bar_fm_style then
             return true
         end
         return false
@@ -2388,6 +2508,13 @@ local function apply_navbar()
     local function tabForFileManagerPath(path)
         if not path then return end
 
+        local home_dir = paths.getHomeDir()
+                         or require("apps/filemanager/filemanagerutil").getDefaultDir()
+        if home_dir and normalizeFolderPath(path) == normalizeFolderPath(home_dir) then
+            return "books"
+        end
+        if isInFolderPath(path, paths.getArchiveDir()) then return "archive" end
+
         local active_custom, active_folder = getCustomFolderTab(active_tab)
         if active_custom and isInFolderPath(path, active_folder) then
             return active_tab
@@ -2412,8 +2539,6 @@ local function apply_navbar()
             end
         end
 
-        local home_dir = paths.getHomeDir()
-                         or require("apps/filemanager/filemanagerutil").getDefaultDir()
         if home_dir and paths.isInHomeDir(path) then return "books" end
     end
 
@@ -2455,6 +2580,17 @@ local function apply_navbar()
     end
 
     -- Inject navbar into FM after all plugins finish init.
+
+    FileManager.onSetRotationMode = (function(original)
+        return function(self, mode)
+            local rotated = mode ~= nil and mode ~= Screen:getRotationMode()
+            local result = original(self, mode)
+            if rotated and FileManager.instance == self and is_navbar_enabled() then
+                UIManager:setDirty(self, "full")
+            end
+            return result
+        end
+    end)(FileManager.onSetRotationMode)
 
     local function resizeFileChooser(file_chooser, target_height)
         if not file_chooser or target_height <= 0 then
@@ -2806,7 +2942,7 @@ local function apply_navbar()
         end
         if menu._zen_standalone_navbar_injected then return end
         _G.__ZEN_UI_ACTIVE_TAB_LABEL = tabs_by_id[view_tab_id] and tabs_by_id[view_tab_id].label or view_tab_id
-        StandalonePage.enable_gesture_manager_dispatch(menu)
+        StandalonePage.enable_filemanager_dispatch(menu)
         preventStandaloneSwipeClose(menu)
         if not is_navbar_enabled() then
             return
@@ -2843,6 +2979,7 @@ local function apply_navbar()
                     or menu.name == "languages_detail"
                     or menu.name == "tags_detail"
                     or is_collection_detail
+                local page_changed = is_detail or (menu.page or 1) ~= 1
                 if is_collection_detail and type(menu.onReturn) == "function" then
                     menu:onReturn()
                     local features = zen_plugin.config and zen_plugin.config.features
@@ -2866,6 +3003,7 @@ local function apply_navbar()
                     menu.page = 1
                     menu:updateItems()
                 end
+                if page_changed then refreshAfterNavbarPageSwitch() end
                 return true
             end
 
@@ -2873,7 +3011,7 @@ local function apply_navbar()
                 if shouldCloseStandaloneBeforeAction(menu, tapped_id) then
                     closeStandaloneView(menu)
                 end
-                runTabCallback(tapped_id)
+                runTabCallback(tapped_id, view_tab_id)
                 return true
             end
 
@@ -2884,7 +3022,7 @@ local function apply_navbar()
                         or not retainHomeBelowFileManager(FileManager.instance, menu) then
                     closeStandaloneView(menu)
                 end
-                runTabCallback(tapped_id)
+                runTabCallback(tapped_id, view_tab_id)
                 return true
             end
 
@@ -2898,7 +3036,7 @@ local function apply_navbar()
             end
 
             -- Execute the tapped tab's callback
-            runTabCallback(tapped_id)
+            runTabCallback(tapped_id, view_tab_id)
 
             return true
         end
@@ -2995,9 +3133,11 @@ local function apply_navbar()
                 or menu.name == "series_detail"
                 or menu.name == "languages_detail"
                 or menu.name == "tags_detail"
+                or menu.name == "status_detail"
             local is_booklist_view = view_tab_id == "history"
                 or view_tab_id == "favorites"
                 or view_tab_id == "collections"
+                or view_tab_id == "kindle"
             if new_h ~= old_h
                     and (is_group_view or is_booklist_view)
                     and reopenStandaloneAfterResize then
@@ -3007,6 +3147,7 @@ local function apply_navbar()
             menu._zen_navbar_height = new_h
             vg[2] = new_nb
             resizeStandaloneBody(new_h)
+            menu[1].background = Blitbuffer.COLOR_WHITE -- Wallpaper painting clears this retained fill.
             UIManager:setDirty(menu, "ui")
         end
 
@@ -3108,13 +3249,16 @@ local function apply_navbar()
                 if not tab then return end
                 local tapped_id = tab.id
                 if tapped_id == view_tab_id then
-                    menu.page = 1; menu:updateItems(); return
+                    local page_changed = (menu.page or 1) ~= 1
+                    menu.page = 1; menu:updateItems()
+                    if page_changed then refreshAfterNavbarPageSwitch() end
+                    return
                 end
                 if not shouldTrackActiveTab(tapped_id) then
                     if shouldCloseStandaloneBeforeAction(menu, tapped_id) then
                         closeStandaloneView(menu)
                     end
-                    runTabCallback(tapped_id)
+                    runTabCallback(tapped_id, view_tab_id)
                     return
                 end
                 if tapped_id == "books" then
@@ -3123,14 +3267,14 @@ local function apply_navbar()
                             or not retainHomeBelowFileManager(FileManager.instance, menu) then
                         closeStandaloneView(menu)
                     end
-                    runTabCallback(tapped_id)
+                    runTabCallback(tapped_id, view_tab_id)
                     return
                 end
                 closeStandaloneView(menu)
                 if shouldTrackActiveTab(tapped_id) then
                     setActiveTab(tapped_id)
                 end
-                runTabCallback(tapped_id)
+                runTabCallback(tapped_id, view_tab_id)
             end
 
             local function moveStandaloneNavbar(m, dx, dy)
@@ -3241,7 +3385,7 @@ local function apply_navbar()
                     if not retainHomeBelowFileManager(fm, m) then
                         closeStandaloneView(m)
                     end
-                    runTabCallback("books")
+                    runTabCallback("books", view_tab_id)
                     return true
                 end
                 if m.close_callback then m.close_callback()
@@ -3259,7 +3403,7 @@ local function apply_navbar()
                     if not retainHomeBelowFileManager(fm, m) then
                         closeStandaloneView(m)
                     end
-                    runTabCallback("books")
+                    runTabCallback("books", view_tab_id)
                     return true
                 end
                 if m.close_callback then m.close_callback()
@@ -3282,6 +3426,12 @@ local function apply_navbar()
 
         -- Top south swipe → open KOReader menu is handled globally by
         -- menu_top_swipe (class-level patch on Menu.onSwipe).
+    end
+
+    local orig_fm_onClose = FileManager.onClose
+    function FileManager:onClose(...)
+        utils.closeWidgetsAbove(self)
+        return orig_fm_onClose(self, ...)
     end
 
     -- Save current library view state just before the reader takes over.
@@ -3384,6 +3534,7 @@ local function apply_navbar()
                 or rawget(_G, "__ZEN_UI_OPEN_TARGET_TAB") ~= nil
                 or rawget(_G, "__ZEN_UI_OPEN_TARGET_FOLDER") ~= nil
                 or rawget(_G, "__ZEN_UI_OPEN_TARGET_TAG") ~= nil
+                or rawget(_G, "__ZEN_UI_KEEP_BOOK_LOCATION") == true
                 or rawget(_G, "__ZEN_UI_LIBRARY_STATE") ~= nil then
             return false
         end
@@ -3421,11 +3572,6 @@ local function apply_navbar()
             end)
         else
             injectNavbar(self)
-        end
-        -- On reinit (FM already in the window stack), dirty-mark so the updated navbar
-        -- is painted. On fresh init, UIManager:show(fm) inside showFiles handles it.
-        if FileManager.instance == self and not self.invisible then
-            UIManager:setDirty(self, "ui")
         end
     end
 
@@ -3510,7 +3656,7 @@ local function apply_navbar()
                 or FileManager.instance ~= fm then
             return false
         end
-        if resolve_default_tab() == "books" then
+        if resolve_default_tab() == "books" and active_tab == "books" then
             fm._zen_default_tab_bootstrapped = true
             return false
         end
@@ -3789,7 +3935,9 @@ local function apply_navbar()
         end
         -- If a detail view was open, open it synchronously too (stack: [fm, group_menu, detail_menu]).
         -- _repaint will then start from detail_menu and never show the intermediate views.
-        if state.detail_group and gv and gv.restoreDetail and not getCustomTagTab(state.tab) then
+        if state.detail_group and gv and gv.restoreDetail
+                and not getCustomTagTab(state.tab)
+                and not getCustomStatusTab(state.tab) then
             gv.restoreDetail(state.detail_group, state.tab, injectStandaloneNavbar)
         end
     end
@@ -3921,14 +4069,14 @@ local function apply_navbar()
                 if not tapped_id then return false end
                 if tapped_id == "news" then return true end
                 if not shouldTrackActiveTab(tapped_id) then
-                    runTabCallback(tapped_id)
+                    runTabCallback(tapped_id, "news")
                     return true
                 end
                 self:onClose()
                 if shouldTrackActiveTab(tapped_id) then
                     setActiveTab(tapped_id)
                 end
-                runTabCallback(tapped_id)
+                runTabCallback(tapped_id, "news")
                 return true
             end
 

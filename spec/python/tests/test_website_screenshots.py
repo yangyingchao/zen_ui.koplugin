@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import sqlite3
@@ -105,12 +106,12 @@ def _color_cover_epub(
         archive.writestr("OPS/cover.png", cover.getvalue())
 
 
-def test_catalog_is_the_canonical_22_image_inventory() -> None:
+def test_catalog_is_the_canonical_27_image_inventory() -> None:
     catalog = load_catalog()
-    assert len(catalog) == 22
+    assert len(catalog) == 27
     assert {scenario.id for scenario in catalog} == EXPECTED_IDS
     assert [scenario.id for scenario in catalog if scenario.id.startswith("page_browser")] == [
-        "page_browser_grid"
+        "page_browser_grid", "page_browser_carousel"
     ]
     assert "update_available" not in {scenario.id for scenario in catalog}
     assert "opds" not in {scenario.id for scenario in catalog}
@@ -138,6 +139,36 @@ def test_catalog_is_the_canonical_22_image_inventory() -> None:
     assert launcher.options["navbar"] == "library_home_icons"
     quicksettings = next(scenario for scenario in catalog if scenario.id == "quicksettings")
     assert quicksettings.options["navbar"] == "library_home_icons"
+    minimal_controls = next(
+        scenario for scenario in catalog if scenario.id == "quicksettings_minimal"
+    )
+    assert minimal_controls.action == "menu_tab"
+    assert minimal_controls.options["tab"] == "quicksettings"
+    assert minimal_controls.options["minimal_controls"] is True
+    network_switcher = next(
+        scenario for scenario in catalog if scenario.id == "network_switcher"
+    )
+    assert network_switcher.action == "network_switcher"
+    assert network_switcher.options["wifi_names"] == [
+        "Moonlit Library",
+        "Pixel Harbor",
+        "Cedar & Static",
+        "Orbital Guest",
+        "Coffee Then Wi-Fi",
+        "NebulaNet",
+    ]
+    bluetooth_switcher = next(
+        scenario for scenario in catalog if scenario.id == "bluetooth_switcher"
+    )
+    assert bluetooth_switcher.action == "bluetooth_switcher"
+    assert bluetooth_switcher.options["device_names"] == [
+        "Luna Headphones",
+        "Paper Lantern Speaker",
+        "Cedar Keyboard",
+        "Pixel Stylus",
+        "Orbit Remote",
+        "Harbor Earbuds",
+    ]
     bookshelf = next(scenario for scenario in catalog if scenario.id == "home_bookshelf")
     assert bookshelf.options["navbar"] == "library_home_text"
     home_simple = next(scenario for scenario in catalog if scenario.id == "home_simple")
@@ -153,6 +184,12 @@ def test_catalog_is_the_canonical_22_image_inventory() -> None:
     ]
     context_menu = next(scenario for scenario in catalog if scenario.id == "context_menu")
     assert context_menu.options["navbar"] == "few_items"
+    metadata_editor = next(
+        scenario for scenario in catalog if scenario.id == "metadata_editor"
+    )
+    assert metadata_editor.action == "metadata_editor"
+    assert metadata_editor.options["book_title"] == "Deep Work"
+    assert metadata_editor.docs == ("docs/library.md",)
     launcher_add = next(
         scenario for scenario in catalog if scenario.id == "launcher_add_plugin_menu"
     )
@@ -271,7 +308,7 @@ def test_showcase_background_is_staged_inside_the_emulator_home(tmp_path: Path) 
     assert destination.read_bytes() == SHOWCASE_BACKGROUND.read_bytes()
     with Image.open(destination) as image:
         assert image.format == "JPEG"
-        assert image.size == (4494, 2493)
+        assert image.size == (1264, 1680)
 
 
 def test_showcase_statistics_uses_koreader_enable_key() -> None:
@@ -414,7 +451,9 @@ def test_reader_showcase_sidecar_has_no_seeded_bookmark(tmp_path: Path) -> None:
 
     reader_sidecar = reader_path.with_suffix(".sdr") / "metadata.epub.lua"
     library_sidecar = library_path.with_suffix(".sdr") / "metadata.epub.lua"
-    assert '["bookmarks"]' not in reader_sidecar.read_text(encoding="utf-8")
+    reader_metadata = reader_sidecar.read_text(encoding="utf-8")
+    assert '["bookmarks"]' not in reader_metadata
+    assert hashlib.md5(str(reader_path).encode()).hexdigest() in reader_metadata
     assert '["bookmarks"]' in library_sidecar.read_text(encoding="utf-8")
 
 
@@ -485,11 +524,12 @@ def test_manual_export_copies_pngs_only_into_an_empty_folder(tmp_path: Path) -> 
         export_screenshots(source, destination, ["first.png"])
 
 
-def test_docs_and_gallery_audit_allows_only_the_grid_page_browser(tmp_path: Path) -> None:
+def test_docs_and_gallery_audit_allows_current_page_browser_views(tmp_path: Path) -> None:
     docs = tmp_path / "docs"
     docs.mkdir()
     docs.joinpath("reader.md").write_text(
         "![Grid](/images/zen_os/page_browser_grid.png)\n"
+        "![Carousel](/images/zen_os/page_browser_carousel.png)\n"
         "![Install](/images/zen_os/plugins_folder.png)\n"
         "![OPDS](/images/zen_os/opds.png)\n",
         encoding="utf-8",

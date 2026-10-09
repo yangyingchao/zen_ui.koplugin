@@ -2,6 +2,7 @@ describe("stats settings", function()
     local saved_settings
     local saved_default_font_size
     local saved_font_size
+    local saved_week_start_day
     local saved_edit_mode
     local arrange_options
     local shown_widget
@@ -10,6 +11,8 @@ describe("stats settings", function()
     before_each(function()
         remembered_routes = {}
         local settings = {
+            edit_mode = true,
+            week_start_day = 1,
             widgets = {
                 order = { "today", "this_week", "trend_graph", "goal_progress" },
                 enabled = { today = false, this_week = false, goal_progress = false },
@@ -24,6 +27,7 @@ describe("stats settings", function()
             MAX_WIDGET_SLOTS = 6,
             load = function() return settings end,
             save = function(current)
+                saved_week_start_day = current.week_start_day
                 saved_edit_mode = current.edit_mode
                 local widgets = current.widgets
                 local order, enabled = {}, {}
@@ -103,6 +107,9 @@ describe("stats settings", function()
                 return true
             end,
             show = function() end,
+        })
+        ZenSpec.replace("modules/settings/zen_settings_apply", {
+            defer_until_settings_close = function() end,
         })
         ZenSpec.unload("modules/settings/sections/stats_settings")
     end)
@@ -192,11 +199,38 @@ describe("stats settings", function()
         assert.are.equal(19, saved_default_font_size)
     end)
 
+    it("persists Sunday and Monday as the week reset day", function()
+        local section = require("modules/settings/sections/stats_settings").build({})
+        local days = section.sub_item_table[5].sub_item_table_func()
+        assert.is_true(days[1].checked_func())
+        days[2].callback()
+        assert.are.equal(2, saved_week_start_day)
+        assert.is_true(days[2].checked_func())
+        assert.is_false(days[1].checked_func())
+        days[1].callback()
+        assert.are.equal(1, saved_week_start_day)
+    end)
+
+    it("enables Edit mode by default and preserves an explicit opt-out", function()
+        local original = package.loaded["modules/filebrowser/patches/stats_settings"]
+        ZenSpec.unload("modules/filebrowser/patches/stats_settings")
+        local settings = require("modules/filebrowser/patches/stats_settings")
+        assert.is_true(settings.defaultSettings().edit_mode)
+        assert.is_true(settings.normalize({}).edit_mode)
+        assert.is_true(settings.load().edit_mode)
+        assert.is_true(settings.normalize({ edit_mode = true }).edit_mode)
+        assert.is_false(settings.normalize({ edit_mode = false }).edit_mode)
+        package.loaded["modules/filebrowser/patches/stats_settings"] = original
+    end)
+
     it("persists edit mode", function()
         local section = require("modules/settings/sections/stats_settings").build({})
         assert.are.equal("edit", section.sub_item_table[2].icon_glyph)
+        assert.is_true(section.sub_item_table[2].checked_func())
         section.sub_item_table[2].callback()
+        assert.is_false(saved_edit_mode)
 
+        section.sub_item_table[2].callback()
         assert.is_true(saved_edit_mode)
     end)
 
@@ -212,6 +246,12 @@ describe("stats settings", function()
         assert.is_nil(arrange_options.item_table._zen_arrange_done_func)
 
         arrange_options.back_callback()
+        local settings_path = {
+            { text = "Extras", occurrence = 1 },
+            { text = "Stats", occurrence = 1 },
+        }
+        assert.are.same(settings_path, remembered_routes[1].path)
+        assert.are.same(settings_path, remembered_routes[2].path)
         assert.are.same({ "trend_graph" }, remembered_routes[1].arrange_path)
         assert.are.same({}, remembered_routes[2].arrange_path)
     end)

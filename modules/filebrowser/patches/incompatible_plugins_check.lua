@@ -86,6 +86,12 @@ local AUTO_DISABLE = {
         folder_key = "simpleui",
     },
     {
+        sentinel = "modules/vos",
+        label = "Visual Overhaul Suite (VOS)",
+        fallback_key = "vos",
+        folder_key = "vos",
+    },
+    {
         sentinel = "quickmenu",
         label = "QuickMenu",
         fallback_key = "quickmenu",
@@ -95,7 +101,20 @@ local AUTO_DISABLE = {
         sentinel = "lib/setting",
         label = "Appearance",
         fallback_key = "appearance",
+        folder_key = "appearance",
         expected_folder_key = "appearance",
+    },
+    {
+        sentinel = "burrow_util",
+        label = "Burrow",
+        fallback_key = "burrow",
+        folder_key = "burrow",
+    },
+    {
+        sentinel = "qui_utils",
+        label = "QuickUI",
+        fallback_key = "quickui",
+        folder_key = "quickui",
     },
     {
         sentinel = "readermenuredesign_installer",
@@ -103,14 +122,40 @@ local AUTO_DISABLE = {
         fallback_key = "zzz-readermenuredesign",
         folder_key = "zzz-readermenuredesign",
     },
+    {
+        sentinel = "custom_shortcut_manager",
+        label = "Shortcuts Toolbar",
+        fallback_key = "shortcutstoolbar",
+        folder_key = "shortcutstoolbar",
+    },
+    {
+        sentinel = "neo_i18n",
+        label = "Neo QuickSettings",
+        fallback_key = "neo_quicksetting",
+        folder_key = "neo_quicksetting",
+        expected_folder_key = "neo_quicksetting",
+    },
 }
 
 local AUTO_DISABLE_PATCHES = {
+    "2---stretched-covers.lua",
+    "2--disable-all-CB-widgets.lua",
+    "2--disable-all-PT-widgets.lua",
+    "2--rounded-covers.lua",
+    "2--stretched-rounded-covers.lua",
+    "2-navbar-vos.lua",
+    "2-new-collections-star.lua",
+    "2-new-progress-bar-colored.lua",
+    "2-new-progress-bar.lua",
+    "2-pages-badge.lua",
+    "2-percent-badge.lua",
+    "2-rounded-folder-covers.lua",
+    "2-series-indicator.lua",
+    "20-faded-finished-books.lua",
     "2-quick-settings.lua",
     "2-automatic-book-series.lua",
     "2-ui-font.lua",
     "2-custom-navbar.lua",
-    "2-page-scrubber.lua",
     "2-browser-double-tap.lua",
     "2-browser-hide-underline.lua",
     "2-browser-up-folder.lua",
@@ -119,6 +164,7 @@ local AUTO_DISABLE_PATCHES = {
     "2-filemanager-titlebar.lua",
     "2-menu-size.lua",
     "2-new-status-icons.lua",
+    "2-non-blocking-wifi.lua",
     "2-screensaver-chapter.lua",
     "2-screensaver-cover.lua",
     "2-series-badge-numbered.lua",
@@ -162,7 +208,7 @@ local function apply_incompatible_plugins_check()
         local folder_enabled = folder_installed and disabled_list[entry.folder_key] == nil
         if sentinel_loaded or folder_enabled then
             local dir = get_dir_from_loaded(entry.sentinel)
-            local folder_key = get_folder_key(dir)
+            local folder_key = folder_enabled and entry.folder_key or get_folder_key(dir)
             if entry.expected_folder_key and folder_key ~= entry.expected_folder_key then
                 logger.dbg("Compatibility state", entry.label,
                     "| loaded=false | source=" .. tostring(dir))

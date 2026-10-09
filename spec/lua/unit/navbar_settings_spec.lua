@@ -2,6 +2,7 @@ describe("navbar settings", function()
     local arrange_options
     local config
     local original_quick_settings
+    local navbar_refreshes
     local saved
     local shown
     local suggested_label
@@ -10,11 +11,14 @@ describe("navbar settings", function()
     local picker_options
     local icon_picker_options
     local input_text
+    local plugin
+    local tbr_order_options
     local dispatcher_update
     local dispatcher_action
     local dispatcher_text
     local choose_folder
     local choose_tag
+    local kindle_available
 
     local function find_arrange_item(id)
         for _i, item in ipairs(arrange_options.item_table) do
@@ -25,6 +29,7 @@ describe("navbar settings", function()
     before_each(function()
         original_quick_settings = rawget(_G, "__ZEN_UI_QUICK_SETTINGS")
         arrange_options = nil
+        navbar_refreshes = 0
         saved = 0
         shown = {}
         suggested_label = nil
@@ -32,11 +37,13 @@ describe("navbar settings", function()
         picker_options = nil
         icon_picker_options = nil
         input_text = nil
+        tbr_order_options = nil
         dispatcher_update = nil
         dispatcher_action = nil
         dispatcher_text = "Nothing"
         choose_folder = nil
         choose_tag = nil
+        kindle_available = false
         touch_menu = {
             item_table = {},
             item_table_stack = {},
@@ -48,6 +55,7 @@ describe("navbar settings", function()
                 self.update_count = (self.update_count or 0) + 1
             end,
         }
+        plugin = { saveConfig = function() saved = saved + 1 end }
         config = {
             navbar = {
                 default_tab = "home",
@@ -80,6 +88,9 @@ describe("navbar settings", function()
         ZenSpec.replace("ui/widget/infomessage", {
             new = function(_self, opts) return opts end,
         })
+        ZenSpec.replace("common/ui/color_wheel_widget", {
+            new = function(_self, opts) return opts end,
+        })
         ZenSpec.replace("ui/widget/pathchooser", {
             new = function(_self, opts) return opts end,
         })
@@ -106,6 +117,7 @@ describe("navbar settings", function()
         })
         ZenSpec.replace("common/paths", {
             getHomeDir = function() return "/home" end,
+            getArchiveDir = function() end,
         })
         ZenSpec.replace("util", {
             splitFilePathName = function(path)
@@ -120,6 +132,10 @@ describe("navbar settings", function()
         })
         ZenSpec.replace("modules/menu/app_launcher/plugin_scan", {
             scan = function() return {} end,
+            exists = function() return false end,
+            installed = function()
+                return kindle_available and { kindle = true } or {}
+            end,
         })
         ZenSpec.replace("modules/menu/app_launcher/native_menu", {
             scan = function(scope)
@@ -130,6 +146,9 @@ describe("navbar settings", function()
             end,
         })
         ZenSpec.replace("common/dispatcher_menu", {
+            addSubMenu = function(dispatcher, ...)
+                return dispatcher:addSubMenu(...)
+            end,
             wrap = function(_items, _caller, on_update)
                 dispatcher_update = on_update
             end,
@@ -138,6 +157,9 @@ describe("navbar settings", function()
             folderLabel = function(path) return path:match("([^/]+)$") or path end,
             chooseFolder = function(callback) choose_folder = callback end,
             chooseTag = function(callback) choose_tag = callback end,
+        })
+        ZenSpec.replace("common/tbr_index", {
+            showOrder = function(options) tbr_order_options = options end,
         })
         ZenSpec.replace("dispatcher", {
             addSubMenu = function(_self, _caller, _items, location, settings)
@@ -165,11 +187,101 @@ describe("navbar settings", function()
     local function build_navbar()
         return require("modules/settings/sections/library_settings/navbar_settings").build({
             config = config,
-            plugin = { saveConfig = function() saved = saved + 1 end },
+            plugin = plugin,
             save_and_apply = function() end,
-            settings_apply = { refresh_navbar_on_menu_close = function() end },
+            settings_apply = {
+                refresh_navbar_on_menu_close = function()
+                    navbar_refreshes = navbar_refreshes + 1
+                end,
+                refresh_tbr_on_menu_close = function() end,
+            },
         })
     end
+
+    it("selects exclusive active-tab styles with their own submenus", function()
+        local items = build_navbar().sub_item_table[2].sub_item_table[3].sub_item_table
+        local underline, filled = items[1], items[2]
+        assert.are.same({ "Underline", "Filled" }, { underline.text, filled.text })
+        assert.is_true(underline.radio)
+        assert.is_true(filled.radio)
+        assert.is_true(underline.checked_func())
+        assert.is_false(filled.checked_func())
+        local above = underline.sub_item_table[1]
+        assert.are.equal("Underline above icon", above.text)
+        above.callback()
+
+        filled.checkmark_callback(touch_menu)
+        assert.is_false(underline.checked_func())
+        assert.is_true(filled.checked_func())
+        assert.is_false(config.navbar.active_tab_underline)
+        assert.is_false(above.enabled_func())
+        filled.checkmark_callback(touch_menu)
+        assert.is_true(filled.checked_func())
+
+        underline.checkmark_callback(touch_menu)
+        assert.is_true(underline.checked_func())
+        assert.is_false(filled.checked_func())
+        assert.is_false(config.navbar.active_tab_filled)
+        assert.is_true(above.enabled_func())
+        assert.is_true(above.checked_func())
+        assert.are.equal(4, saved)
+    end)
+
+    it("only enables the underline outline color with Colored and Underline", function()
+        config.navbar.active_tab_color = { 10, 20, 30 }
+        local items = build_navbar().sub_item_table[2].sub_item_table[3].sub_item_table
+        local outline = items[4]
+        assert.are.equal("Active tab outline color: #0A141E", outline.text_func())
+        assert.is_false(outline.enabled_func())
+        items[3].callback()
+        assert.is_true(outline.enabled_func())
+        items[2].checkmark_callback()
+        assert.is_false(outline.enabled_func())
+        items[1].checkmark_callback()
+        assert.is_true(outline.enabled_func())
+
+        outline.callback(touch_menu)
+        assert.are.equal("Active tab outline color", shown[1].title_text)
+        assert.is_nil(shown[1].opacity)
+        assert.are.equal("#0A141E", shown[1].hex)
+        shown[1].callback("#112233")
+        assert.are.same({ 0x11, 0x22, 0x33 }, config.navbar.active_tab_color)
+        assert.are.equal(1, touch_menu.update_count)
+        assert.are.equal(4, saved)
+    end)
+
+    it("opens filled color wheels with white outline and blue fill defaults", function()
+        local items = build_navbar().sub_item_table[2].sub_item_table[3].sub_item_table[2].sub_item_table
+        assert.are.equal("Outline color: #FFFFFF", items[1].text_func())
+        assert.are.equal("Fill color: #4F6F8F", items[2].text_func())
+        items[1].callback(touch_menu)
+        assert.are.equal("#FFFFFF", shown[1].hex)
+        assert.is_nil(shown[1].opacity)
+        shown[1].callback("#ABCDEF")
+        assert.are.equal(1, navbar_refreshes)
+        items[2].callback(touch_menu)
+        assert.are.equal("Fill color", shown[2].title_text)
+        assert.are.equal("#4F6F8F", shown[2].hex)
+        assert.are.equal(60, shown[2].opacity)
+        shown[2].callback("#123456", 40)
+        assert.are.equal(2, navbar_refreshes)
+        assert.are.same({ 0xAB, 0xCD, 0xEF }, config.navbar.filled_outline_color)
+        assert.are.same({ 0x12, 0x34, 0x56 }, config.navbar.filled_background_color)
+        assert.are.equal(40, config.navbar.filled_background_opacity)
+        assert.are.equal(2, saved)
+        assert.are.equal(2, touch_menu.update_count)
+    end)
+
+    it("reopens the fill picker with fully transparent opacity", function()
+        config.navbar.filled_background_opacity = 0
+        local items = build_navbar().sub_item_table[2].sub_item_table[3].sub_item_table[2].sub_item_table
+        items[2].callback(touch_menu)
+        assert.are.equal(0, shown[1].opacity)
+        shown[1].callback("#123456", 0)
+        assert.are.equal(0, config.navbar.filled_background_opacity)
+        items[2].callback(touch_menu)
+        assert.are.equal(0, shown[2].opacity)
+    end)
 
     it("keeps the default when its tab is hidden", function()
         local navbar = build_navbar()
@@ -197,6 +309,24 @@ describe("navbar settings", function()
         assert.are.equal("home", config.navbar.default_tab)
         assert.are.equal(1, touch_menu.back_count)
         assert.are.equal(1, saved)
+    end)
+
+    it("opens the shared TBR order before delete", function()
+        config.navbar.show_tabs.to_be_read = true
+        config.navbar.tab_order[#config.navbar.tab_order + 1] = "to_be_read"
+        touch_menu._zen_settings_resume = { path = { "Tabs", "To Be Read" } }
+        local navbar = build_navbar()
+        navbar.sub_item_table[1].callback()
+
+        local items = find_arrange_item("to_be_read").sub_item_table_func()
+        assert.are.equal("Order", items[1].text)
+        assert.are.equal("Delete", items[2].text)
+
+        items[1].callback(touch_menu)
+        assert.is_table(tbr_order_options)
+        assert.are.equal(plugin, tbr_order_options.plugin)
+        assert.are.equal(touch_menu._zen_settings_resume, tbr_order_options.settings_resume)
+        assert.is_function(tbr_order_options.on_change)
     end)
 
     it("creates a library-scoped KOReader menu tab", function()
@@ -268,6 +398,33 @@ describe("navbar settings", function()
         assert.are.equal("/home/Fiction", config.navbar.folder_path)
         assert.are.equal(1, touch_menu.update_count)
         assert.are.equal(2, saved)
+    end)
+
+    it("offers Kindle only when installed and can hide its virtual folder", function()
+        local navbar = build_navbar()
+        navbar.sub_item_table[1].callback()
+        arrange_options.add_item_table[1].callback(touch_menu)
+        local kindle
+        for _i, item in ipairs(picker_options.items) do
+            if item.id == "kindle" then kindle = item; break end
+        end
+        assert.is_nil(kindle)
+
+        kindle_available = true
+        arrange_options.add_item_table[1].callback(touch_menu)
+        for _i, item in ipairs(picker_options.items) do
+            if item.id == "kindle" then kindle = item; break end
+        end
+        assert.is_table(kindle)
+        picker_options.on_select(kindle)
+
+        navbar = build_navbar()
+        navbar.sub_item_table[1].callback()
+        local settings = find_arrange_item("kindle").sub_item_table_func()
+        assert.are.equal("Hide Kindle Library folder", settings[1].text)
+        assert.is_false(settings[1].checked_func())
+        settings[1].callback()
+        assert.is_true(config.kindle.hide_library_folder)
     end)
 
     it("changes the label and icon of an existing built-in Folder tab", function()
@@ -360,6 +517,38 @@ describe("navbar settings", function()
         assert.is_true(config.navbar.show_tabs.ct_1)
         assert.is_true(config.navbar.show_tabs.ct_2)
         assert.is_true(config.navbar.show_tabs.ct_3)
+    end)
+
+    it("adds a status tab using the status name", function()
+        local navbar = build_navbar()
+        navbar.sub_item_table[1].callback()
+        local add_types = {}
+        for _i, item in ipairs(arrange_options.add_item_table) do
+            add_types[item.text] = item
+        end
+        assert.is_nil(add_types.Finished)
+        add_types.Tab.callback(touch_menu)
+
+        local add_tabs = {}
+        for _i, item in ipairs(picker_options.items) do add_tabs[item.text] = item end
+        for _i, label in ipairs({
+            "Unread", "Reading", "To Be Read", "On hold", "Finished",
+        }) do assert.is_table(add_tabs[label]) end
+        assert.are.equal("to_be_read", add_tabs["To Be Read"].id)
+        assert.is_nil(add_tabs["To Be Read"].status)
+        assert.is_nil(add_tabs["Filter by status"])
+
+        picker_options.on_select(add_tabs.Finished)
+
+        assert.same({
+            id = "ct_1", type = "status", status = "complete",
+            label = "Finished", label_auto = true, icon = "library",
+        }, config.navbar.custom_tabs[1])
+        assert.is_true(config.navbar.show_tabs.ct_1)
+        assert.are.equal(3, #touch_menu.item_table)
+        assert.are.equal("Icon: library", touch_menu.item_table[1].text_func())
+        assert.are.equal("Label: Finished", touch_menu.item_table[2].text_func())
+        assert.are.equal("Delete", touch_menu.item_table[3].text)
     end)
 
     it("changes labels and icons for folder and specific-tag tabs", function()

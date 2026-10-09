@@ -297,28 +297,45 @@ describe("home component registry", function()
         end
     end)
 
-    it("spreads widgets evenly between matching visual edge insets", function()
+    it("spreads widgets evenly between smaller matching visual edge insets", function()
         local Registry = require("modules/filebrowser/patches/home/components/registry")
         local items = {
-            { row_y = 10, top = 10, bottom = 110, min_shift = 0, max_shift = 0 },
+            { row_y = 10, top = 10, bottom = 110, min_shift = -20, max_shift = 20 },
             { row_y = 250, top = 20, bottom = 120, min_shift = -100, max_shift = 100 },
             { row_y = 500, top = 10, bottom = 110, min_shift = -100, max_shift = 200 },
         }
         local body_h = 721
-        local top_inset = items[1].row_y + items[1].top
+        local top_inset = 30
         local bottom = body_h - top_inset
-        local shifts = Registry.equalSpacingShifts(items, { bottom = bottom })
+        local shifts = Registry.equalSpacingShifts(items, {
+            top = top_inset,
+            bottom = bottom,
+        })
         local first_gap = items[2].row_y + items[2].top + shifts[2]
             - items[1].row_y - items[1].bottom - shifts[1]
         local second_gap = items[3].row_y + items[3].top + shifts[3]
             - items[2].row_y - items[2].bottom - shifts[2]
 
-        assert.are.same({ 0, 40, 91 }, shifts)
-        assert.are.same({ 190, 191 }, { first_gap, second_gap })
+        assert.are.same({ 10, 40, 81 }, shifts)
+        assert.are.same({ 180, 181 }, { first_gap, second_gap })
+        assert.are.equal(top_inset,
+            items[1].row_y + items[1].top + shifts[1])
         assert.are.equal(bottom,
             items[3].row_y + items[3].bottom + shifts[3])
         assert.are.equal(top_inset,
             body_h - items[3].row_y - items[3].bottom - shifts[3])
+    end)
+
+    it("drops the bottom anchor rather than overlapping widgets", function()
+        local Registry = require("modules/filebrowser/patches/home/components/registry")
+        local items = {
+            { row_y = 0, top = 0, bottom = 100, min_shift = 0, max_shift = 0 },
+            { row_y = 130, top = 0, bottom = 100, min_shift = 0, max_shift = 0 },
+            { row_y = 260, top = 0, bottom = 100, min_shift = -100, max_shift = 100 },
+        }
+
+        assert.are.same({ 0, 0, 0 },
+            Registry.equalSpacingShifts(items, { bottom = 200 }))
     end)
 
     it("equalizes gaps when content is taller than its row", function()

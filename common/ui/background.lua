@@ -119,13 +119,14 @@ function M.setMissingLibraryBackgroundHandler(handler)
     schedule_missing_background_work()
 end
 
-local function is_jpeg_path(path)
+local function is_supported_image_path(path)
     if type(path) ~= "string" then return false end
     local lower = path:lower()
     return lower:sub(-4) == ".jpg" or lower:sub(-5) == ".jpeg"
+        or lower:sub(-4) == ".png"
 end
 
-M.isJpegPath = is_jpeg_path
+M.isSupportedImagePath = is_supported_image_path
 
 -- Native (unscaled) image dimensions, or nil on failure.
 local function native_size(path)
@@ -141,14 +142,14 @@ end
 
 -- Validate that a path can be used as a background image. Returns (true) on
 -- success, or (false, reason_code) on failure. "Can be used" means: it's a
--- JPG/JPEG, the file exists, and the decoder can read its size. The caller
+-- JPG/JPEG/PNG, the file exists, and the decoder can read its size. The caller
 -- maps reason_code to a translated message.
 function M.validateImage(path)
     if type(path) ~= "string" or path == "" then
         return false, "none"
     end
-    if not is_jpeg_path(path) then
-        return false, "not_jpeg"
+    if not is_supported_image_path(path) then
+        return false, "unsupported"
     end
     if not file_exists(path) then
         return false, "missing"
@@ -185,6 +186,8 @@ local function get_widget(path, w, h)
         center_x_ratio = 0.5,
         center_y_ratio = 0.5,
         file_do_cache = false,
+        alpha = true,
+        original_in_nightmode = false,
     }
     _cache[key] = iw
     return iw
@@ -198,7 +201,7 @@ function M.paint(bb, x, y, w, h, path)
         local iw = get_widget(path, w, h)
         if not iw then return end
         iw:paintTo(bb, x, y)
-        if Screen.night_mode then
+        if Screen.night_mode and not M.library_invert_with_dark_mode() then
             bb:invertRect(x, y, w, h)
         end
         painted = true
@@ -210,13 +213,17 @@ function M.paint(bb, x, y, w, h, path)
 end
 
 local function get_screen_buffer(path, w, h, bb_type)
-    if not ImageWidget or not file_exists(path) or w <= 0 or h <= 0 then
+    if not ImageWidget or w <= 0 or h <= 0 then
         return nil
     end
     local night_key = Screen.night_mode and "night" or "day"
-    local key = string.format("%s|%d|%d|%s|%s", path, w, h, tostring(bb_type), night_key)
+    local opacity = M.library_opacity()
+    local preinvert = Screen.night_mode and not M.library_invert_with_dark_mode()
+    local key = string.format("%s|%d|%d|%s|%s|%d|%s", path, w, h,
+        tostring(bb_type), night_key, opacity, tostring(preinvert))
     local cached = _buffer_cache[key]
     if cached then return cached end
+    if not file_exists(path) then return nil end
 
     local out
     local ok = pcall(function()
@@ -225,8 +232,16 @@ local function get_screen_buffer(path, w, h, bb_type)
         local iw = get_widget(path, w, h)
         if not iw then error("no background widget") end
         iw:paintTo(out, 0, 0)
-        if Screen.night_mode then
+        if preinvert then
             out:invertRect(0, 0, w, h)
+        end
+        if opacity < 100 then
+            local fade = 1 - opacity / 100
+            if preinvert then
+                out:darkenRect(0, 0, w, h, fade)
+            else
+                out:lightenRect(0, 0, w, h, fade)
+            end
         end
     end)
     if not ok or not out then
@@ -301,6 +316,7 @@ function M.renderToBuffer(path, w, h)
             center_x_ratio = 0.5,
             center_y_ratio = 0.5,
             file_do_cache = false,
+            alpha = true,
         }
         iw:paintTo(out, 0, 0)
         iw:free()
@@ -315,8 +331,7 @@ end
 -- True when a library background image is configured. Home/standalone widget
 -- tiles use this to switch their opaque fill to nil (transparent) so the
 -- background painted behind the page shows through.
-function M.library_path(plugin)
-    schedule_missing_background_work()
+local function library_config(plugin)
     plugin = plugin or rawget(_G, "__ZEN_UI_PLUGIN")
     local cfg = plugin and plugin.config
     if type(cfg) ~= "table" then
@@ -326,11 +341,31 @@ function M.library_path(plugin)
         end)
         cfg = ok and loaded or nil
     end
+    return cfg, plugin
+end
+
+function M.library_opacity(plugin)
+    local cfg = library_config(plugin)
+    local bg = type(cfg) == "table" and cfg.library_background
+    local opacity = type(bg) == "table" and tonumber(bg.opacity) or 100
+    return math.max(0, math.min(100, math.floor(opacity + 0.5)))
+end
+
+function M.library_invert_with_dark_mode(plugin)
+    local cfg = library_config(plugin)
+    local bg = type(cfg) == "table" and cfg.library_background
+    return type(bg) ~= "table" or bg.invert_with_dark_mode ~= false
+end
+
+function M.library_path(plugin)
+    schedule_missing_background_work()
+    local cfg, resolved_plugin = library_config(plugin)
     local bg = type(cfg) == "table" and cfg.library_background
     local path = type(bg) == "table" and type(bg.path) == "string" and bg.path or ""
-    if type(bg) == "table" and bg.enabled == true and is_jpeg_path(path) then
+    if type(bg) == "table" and bg.enabled == true
+            and is_supported_image_path(path) then
         if not file_exists(path) then
-            disable_missing_library_background(plugin, cfg, bg, path)
+            disable_missing_library_background(resolved_plugin, cfg, bg, path)
             return ""
         end
         return path

@@ -1,7 +1,10 @@
 local logger = require("common/zen_logger").new("home_page")
+local author_sort = require("common/author_sort")
+local title_sort = require("common/title_sort")
 local ConfigManager = require("config/manager")
 local book_status = require("common/book_status")
 local Blitbuffer = require("ffi/blitbuffer")
+local constants = require("common/constants")
 local DecodeCache = require("common/cover_decode_cache")
 local RenderCache = require("common/cover_render_cache")
 local HomeQuotes = require("modules/filebrowser/patches/home/home_quotes")
@@ -13,6 +16,7 @@ local PresetStore = require("config/preset_store")
 local Registry = require("modules/filebrowser/patches/home/components/registry")
 local StandalonePage = require("modules/filebrowser/patches/standalone_page")
 local SharedState = require("common/shared_state")
+local LibraryPaths = require("common/paths")
 local utils = require("common/utils")
 local WidgetResources = require("common/widget_resources")
 local UIManager = require("ui/uimanager")
@@ -50,6 +54,7 @@ local HOME_DATASET_TTL = 120
 local HOME_STRIP_MAX_BOOKS = 40
 local HOME_STATS_TTL = 60
 local _home_stats_cache = { key = nil, value = nil, expires_at = 0 }
+local _home_goal_stats_cache = { key = nil, value = nil, expires_at = 0 }
 
 local function copy_home_strip_pages(state)
     local copy = {}
@@ -74,6 +79,11 @@ local function copy_home_strip_state(state)
     local drill = source.drill
     if type(drill) == "table" and type(drill.label) == "string" then
         copy.source.drill = { label = drill.label }
+        if type(drill.path) == "string" then copy.source.drill.path = drill.path end
+        if drill.series == true then copy.source.drill.series = true end
+        if type(drill.parent) == "table" then
+            copy.source.drill.parent = { label = drill.parent.label }
+        end
         if type(drill.files) == "table" then
             copy.source.drill.files = utils.deepcopy(drill.files)
         end
@@ -152,6 +162,87 @@ local function request_home_repaint(menu, refresh)
     return true
 end
 
+local function refresh_home_clock_widgets(menu, suppress_repaint, item_keys)
+    if not menu or menu._zen_home_closing then return end
+    local can_repaint = suppress_repaint ~= true
+        and rawequal(menu, _home_menu)
+        and menu._zen_home_suspended ~= true
+        and home_is_on_top(menu)
+    local needs_full_repaint = false
+
+    for _i, entry in ipairs(menu._zen_home_clock_refreshers or {}) do
+        local refresh = type(entry) == "table" and entry.refresh or entry
+        local widget = type(entry) == "table" and entry.widget or nil
+        local refresh_keys = type(entry) == "table" and entry.keys or nil
+        local dimen = widget and widget.dimen
+        local region
+        if dimen and dimen.x ~= nil and dimen.y ~= nil and dimen.w and dimen.h then
+            region = require("ui/geometry"):new{
+                x = dimen.x, y = dimen.y, w = dimen.w, h = dimen.h,
+            }
+        end
+
+        local matches = type(item_keys) ~= "table" or type(refresh_keys) ~= "table"
+        if not matches then
+            local wanted = {}
+            for _j, key in ipairs(item_keys) do wanted[key] = true end
+            for _j, key in ipairs(refresh_keys) do
+                if wanted[key] then matches = true; break end
+            end
+        end
+
+        if matches and type(refresh) == "function" then
+            local ok, did_refresh, relative_regions = pcall(refresh, item_keys)
+            if not ok then
+                logger.warn("embedded clock refresh failed:", tostring(did_refresh))
+            elseif did_refresh and suppress_repaint ~= true then
+                if can_repaint and region and type(UIManager.widgetRepaint) == "function" then
+                    local regions = { region }
+                    if type(relative_regions) == "table" and #relative_regions > 0 then
+                        regions = {}
+                        local Geom = require("ui/geometry")
+                        for _j, relative in ipairs(relative_regions) do
+                            if type(relative) == "table" and relative.x ~= nil
+                                    and relative.y ~= nil and relative.w and relative.h then
+                                regions[#regions + 1] = Geom:new{
+                                    x = region.x + relative.x,
+                                    y = region.y + relative.y,
+                                    w = relative.w,
+                                    h = relative.h,
+                                }
+                            end
+                        end
+                        if #regions == 0 then regions[1] = region end
+                    end
+                    local Screen = require("device").screen
+                    local bb = Screen.bb
+                    if bb then
+                        local bg_path = type(Background.library_path) == "function"
+                            and Background.library_path(_zen_plugin) or ""
+                        for _j, dirty_region in ipairs(regions) do
+                            if bg_path == "" or not Background.paintScreenRegion(bb,
+                                    dirty_region.x, dirty_region.y,
+                                    dirty_region.x, dirty_region.y,
+                                    dirty_region.w, dirty_region.h, bg_path) then
+                                bb:paintRect(dirty_region.x, dirty_region.y,
+                                    dirty_region.w, dirty_region.h, Blitbuffer.COLOR_WHITE)
+                            end
+                        end
+                    end
+                    UIManager:widgetRepaint(widget, region.x, region.y)
+                    for _j, dirty_region in ipairs(regions) do
+                        UIManager:setDirty(nil, "ui", dirty_region, menu.dithered)
+                    end
+                else
+                    needs_full_repaint = true
+                end
+            end
+        end
+    end
+
+    if needs_full_repaint then request_home_repaint(menu, "ui") end
+end
+
 local function new_home_dataset()
     _home_dataset_generation = _home_dataset_generation + 1
     return {
@@ -176,6 +267,7 @@ local function clear_home_dataset_derived(dataset)
     if not dataset then return end
     dataset.ordered_paths = {}
     dataset.strip_paths = {}
+    dataset.kindle_paths = nil
     dataset.tbr = nil
 end
 
@@ -310,18 +402,12 @@ local function cache_home_book(key, book)
     trim_home_book_cache()
 end
 
--- Home-screen widgets (featured/strip) can render covers much larger than the
--- file browser's list/mosaic cells. BookInfoManager's cache only ever grows a
--- cached cover, never shrinks it, so a cover first cached for a small list row
--- stays small (and gets pixelated when upscaled here) until something asks for
--- bigger. A third of the screen's linear size comfortably covers the largest
--- home-screen cover (the featured widget); extraction is still bounded by the
--- source cover's own resolution, so this never costs more than the book has.
--- Returns the {max_cover_w, max_cover_h} spec table to extract/cache covers at
--- for home-screen display, derived from the current screen size.
+-- Default extraction bounds before layout supplies a cover's actual size.
 local function home_cover_specs()
     local Screen = require("device").screen
-    return { max_cover_w = math.floor(Screen:getWidth() / 3), max_cover_h = math.floor(Screen:getHeight() / 3) }
+    local short_side = math.min(Screen:getWidth(), Screen:getHeight())
+    local long_side = math.max(Screen:getWidth(), Screen:getHeight())
+    return { max_cover_w = math.floor(short_side / 3), max_cover_h = math.floor(long_side / 3) }
 end
 
 -- cover_sizetag stores the native (original) image dimensions, e.g. "600x900".
@@ -359,14 +445,15 @@ local _cover_upgrade_consumers = {}
 local _inflight_cover_upgrade_paths = {}
 
 -- Takes everything queued in _pending_cover_upgrade_paths and launches a
--- single extractInBackground() batch for them at home-screen cover size, then
+-- single extractInBackground() batch at each path's requested cover size, then
 -- polls until each path's extraction completes (or the subprocess dies),
 -- invalidating that book's home-cache entry and notifying the consumers as
 -- results land.
 local function flush_cover_upgrade_queue()
     _cover_upgrade_scheduled = false
+    local pending = _pending_cover_upgrade_paths
     local paths = {}
-    for path in pairs(_pending_cover_upgrade_paths) do
+    for path in pairs(pending) do
         paths[#paths + 1] = path
     end
     _pending_cover_upgrade_paths = {}
@@ -393,17 +480,16 @@ local function flush_cover_upgrade_queue()
     end
     if BookInfoManager:isExtractingInBackground() then
         for _i, path in ipairs(paths) do
-            _pending_cover_upgrade_paths[path] = true
+            _pending_cover_upgrade_paths[path] = pending[path]
         end
         _cover_upgrade_scheduled = true
         require("ui/uimanager"):scheduleIn(1, flush_cover_upgrade_queue)
         return
     end
 
-    local specs = home_cover_specs()
     local files = {}
     for _i, path in ipairs(paths) do
-        files[#files + 1] = { filepath = path, cover_specs = specs }
+        files[#files + 1] = { filepath = path, cover_specs = pending[path] }
         _inflight_cover_upgrade_paths[path] = true
     end
 
@@ -469,11 +555,8 @@ local function flush_cover_upgrade_queue()
     UIManager:scheduleIn(1, poll)
 end
 
--- Adds `path` to the pending cover-upgrade queue (unless it's already
--- pending or mid-extraction) and schedules a debounced
--- flush_cover_upgrade_queue() call so several books queued in quick
--- succession are batched into one extraction run.
-local function queue_cover_upgrade(path, consumer)
+-- Merge queued size requests without restarting an in-flight extraction.
+local function queue_cover_upgrade(path, consumer, specs)
     if type(path) ~= "string" or path == "" then return end
     local consumers = _cover_upgrade_consumers[path]
     if not consumers then
@@ -481,8 +564,15 @@ local function queue_cover_upgrade(path, consumer)
         _cover_upgrade_consumers[path] = consumers
     end
     consumers[consumer == "strip" and "strip" or "full"] = true
-    if _pending_cover_upgrade_paths[path] or _inflight_cover_upgrade_paths[path] then return end
-    _pending_cover_upgrade_paths[path] = true
+    if _inflight_cover_upgrade_paths[path] then return end
+    specs = specs or home_cover_specs()
+    local queued = _pending_cover_upgrade_paths[path]
+    if queued then
+        queued.max_cover_w = math.max(queued.max_cover_w, specs.max_cover_w)
+        queued.max_cover_h = math.max(queued.max_cover_h, specs.max_cover_h)
+    else
+        _pending_cover_upgrade_paths[path] = specs
+    end
     if not _cover_upgrade_scheduled then
         _cover_upgrade_scheduled = true
         require("ui/uimanager"):scheduleIn(0.3, flush_cover_upgrade_queue)
@@ -570,8 +660,13 @@ end
 local function ensure_featured_module_cfg(dcfg, module_id)
     local mcfg = ensure_module_cfg(dcfg, module_id)
     mcfg.order = normalize_order(mcfg.order)
+    if mcfg.show_author == nil then mcfg.show_author = true end
+    if mcfg.show_series == nil then mcfg.show_series = true end
     if mcfg.show_description == nil then mcfg.show_description = true end
+    if mcfg.show_progress == nil then mcfg.show_progress = true end
     if mcfg.wrap_description_text == nil then mcfg.wrap_description_text = false end
+    if mcfg.justify_description_text == nil then mcfg.justify_description_text = false end
+    if mcfg.format_description_html == nil then mcfg.format_description_html = false end
     if mcfg.interactive == nil then mcfg.interactive = true end
     if mcfg.show_status_bar == nil then mcfg.show_status_bar = false end
     if mcfg.status_bar_show_bottom_border == nil then mcfg.status_bar_show_bottom_border = true end
@@ -692,7 +787,7 @@ local function ensure_home_cfg()
     dcfg.rows = Registry.normalizeRows(dcfg.rows, DEFAULT_ROW_ORDER, DEFAULT_ROW_ENABLED)
 
     if dcfg.show_status_bar == nil then dcfg.show_status_bar = true end
-    dcfg.edit_mode = dcfg.edit_mode == true
+    dcfg.edit_mode = dcfg.edit_mode ~= false
     dcfg.font_size = nil
     dcfg.font_size_override = nil
 
@@ -847,15 +942,37 @@ end
 local function build_data_provider(cfg, dcfg, strip_page_state)
     local provider = {}
     local dataset = get_home_dataset()
+    local rakuyomi_cfg = type(cfg) == "table" and cfg.rakuyomi or nil
+    local exclude_rakuyomi = type(rakuyomi_cfg) == "table"
+        and rakuyomi_cfg.exclude_from_home == true
+    if dataset.exclude_rakuyomi ~= exclude_rakuyomi then
+        dataset.exclude_rakuyomi = exclude_rakuyomi
+        dataset.history = nil
+        clear_home_dataset_derived(dataset)
+    end
     local cover_badges = type(cfg) == "table" and type(cfg.browser_cover_badges) == "table"
         and cfg.browser_cover_badges or {}
     local wants_favorite_badge = cover_badges.show_favorite_badge == true
     local stats_cached = nil
     local stats_cached_key = nil
+    local goal_stats_cached = nil
+    local goal_stats_cached_key = nil
     local strip_offsets = copy_home_strip_pages(strip_page_state)
     local book_cache_hits = 0
     local book_cache_misses = 0
     local book_lookup_ms = 0
+    local quote_select_ms = 0
+    local quote_annotation_ms = 0
+    local quote_annotation_books = 0
+    local quote_annotation_cache_hits = 0
+    local quote_annotation_cache_misses = 0
+    local quote_sidecar_cache_hits = 0
+    local quote_sidecar_cache_misses = 0
+    local quote_state_writes = 0
+    local quote_layout_ms = 0
+    local quote_layout_cache_hits = 0
+    local quote_layout_cache_misses = 0
+    local quote_layout_probes = 0
     local tbr_index
     local tbr_index_checked = false
     local current_quote
@@ -875,35 +992,51 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         if requested == configured then return "featured" end
     end
 
-    local function get_stats(fields)
-        if stats_cached then return stats_cached end
-        local key = stats_fields_key(fields)
-        if _home_stats_cache.value and _home_stats_cache.key == key
-                and os.time() < _home_stats_cache.expires_at then
-            stats_cached = _home_stats_cache.value
-            return stats_cached
-        end
-        local ok_stats, StatsDB = pcall(require, "common/db_stats")
-        if ok_stats and StatsDB and type(StatsDB.queryHomeStats) == "function" then
-            stats_cached = StatsDB.queryHomeStats(fields) or {}
-        elseif ok_stats and StatsDB and type(StatsDB.queryStats) == "function" then
-            stats_cached = StatsDB.queryStats() or {}
+    local function add_finished_counts(stats, fields, exclude_cbz_cbr)
+        if not (fields and (fields.finished_this_month or fields.finished_this_year)) then return end
+        local ok_library, LibraryDB = pcall(require, "common/db_library")
+        local counts = ok_library and LibraryDB and LibraryDB.getBookCounts
+            and LibraryDB.getBookCounts(exclude_cbz_cbr) or {}
+        stats.finished_this_month = fields.finished_this_month
+            and (counts.finished_this_month or 0) or 0
+        stats.finished_this_year = fields.finished_this_year
+            and (counts.finished_this_year or 0) or 0
+    end
+
+    local function get_stats(fields, exclude_cbz_cbr)
+        local result
+        if exclude_cbz_cbr then
+            result = goal_stats_cached
         else
-            stats_cached = {}
+            result = stats_cached
         end
-        _home_stats_cache.key = key
-        _home_stats_cache.value = stats_cached
-        _home_stats_cache.expires_at = os.time() + HOME_STATS_TTL
-        if fields and (fields.finished_this_month or fields.finished_this_year) then
-            local ok_library, LibraryDB = pcall(require, "common/db_library")
-            local counts = ok_library and LibraryDB and LibraryDB.getBookCounts
-                and LibraryDB.getBookCounts() or {}
-            stats_cached.finished_this_month = fields.finished_this_month
-                and (counts.finished_this_month or 0) or 0
-            stats_cached.finished_this_year = fields.finished_this_year
-                and (counts.finished_this_year or 0) or 0
+        if result then return result end
+        local key = stats_fields_key(fields)
+        local shared_cache = exclude_cbz_cbr and _home_goal_stats_cache or _home_stats_cache
+        if shared_cache.value and shared_cache.key == key
+                and os.time() < shared_cache.expires_at then
+            result = shared_cache.value
+        else
+            local ok_stats, StatsDB = pcall(require, "common/db_stats")
+            if ok_stats and StatsDB and type(StatsDB.queryHomeStats) == "function" then
+                result = StatsDB.queryHomeStats(fields, exclude_cbz_cbr) or {}
+            elseif not exclude_cbz_cbr and ok_stats and StatsDB
+                    and type(StatsDB.queryStats) == "function" then
+                result = StatsDB.queryStats() or {}
+            else
+                result = {}
+            end
+            add_finished_counts(result, fields, exclude_cbz_cbr)
+            shared_cache.key = key
+            shared_cache.value = result
+            shared_cache.expires_at = os.time() + HOME_STATS_TTL
         end
-        return stats_cached
+        if exclude_cbz_cbr then
+            goal_stats_cached = result
+        else
+            stats_cached = result
+        end
+        return result
     end
 
     local function get_history()
@@ -922,7 +1055,8 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
 
         local hist = ReadHistory.hist or {}
         local lfs = require("libs/libkoreader-lfs")
-        local paths = require("common/paths")
+        local ok_kindle, Kindle = pcall(
+            require, "modules/filebrowser/patches/kindle_virtual_library")
         local function is_rakuyomi_history_path(path)
             if path:lower():sub(-4) ~= ".cbz" then return false end
             local Rakuyomi = rawget(_G, "__ZEN_UI_RAKUYOMI")
@@ -936,11 +1070,19 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
 
         for _i, entry in ipairs(hist) do
             local raw_path = entry and entry.file
-            local path = type(raw_path) == "string" and paths.normPath(raw_path) or nil
+            local path = type(raw_path) == "string" and LibraryPaths.normPath(raw_path) or nil
+            local in_library = path ~= nil and LibraryPaths.isInHomeDir(path)
+            local is_kindle = path ~= nil and not in_library and ok_kindle
+                and type(Kindle.isBookPath) == "function"
+                and Kindle.isBookPath(path)
+            local is_rakuyomi = path ~= nil and not is_kindle
+                and (exclude_rakuyomi or not in_library)
+                and is_rakuyomi_history_path(path)
             if path ~= nil
                 and path ~= ""
-                and lfs.attributes(path, "mode") == "file"
-                and (paths.isInHomeDir(path) or is_rakuyomi_history_path(path)) then
+                and (is_kindle or lfs.attributes(path, "mode") == "file")
+                and (is_kindle or in_library or is_rakuyomi)
+                and not (exclude_rakuyomi and is_rakuyomi) then
                 table.insert(dataset.history, path)
                 if #dataset.history >= HOME_STRIP_MAX_BOOKS then break end
             end
@@ -1125,15 +1267,21 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         local status_data
         local partial_md5_checksum = nil
         if metadata_only then
-            status_data = dataset.status_data[path]
+            local badges = cfg and cfg.browser_cover_badges
+            if type(badges) == "table" and badges.dim_finished_books == true then
+                status_data = compact_status_data(
+                    book_status.getFileStatusData(path, book_info))
+            else
+                status_data = dataset.status_data[path]
+            end
             if not status_data then
                 local BookList = package.loaded["ui/widget/booklist"]
                 if BookList and type(BookList.hasBookInfoCache) == "function"
                         and BookList.hasBookInfoCache(path) then
                     status_data = compact_status_data(BookList.getBookInfo(path))
-                    dataset.status_data[path] = status_data
                 end
             end
+            dataset.status_data[path] = status_data
             if status_data then
                 pct = status_data.percent_finished
                 status = status_data.status
@@ -1431,7 +1579,7 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
             local entries = {}
             for _key, entry in pairs(collection) do
                 if type(entry) == "table" and type(entry.file) == "string"
-                        and entry.file ~= "" then
+                        and entry.file ~= "" and LibraryPaths.isInHomeDir(entry.file) then
                     entries[#entries + 1] = entry
                 end
             end
@@ -1683,7 +1831,7 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         local entries = {}
         for _key, entry in pairs(collection) do
             if type(entry) == "table" and type(entry.file) == "string"
-                    and entry.file ~= "" then
+                    and entry.file ~= "" and LibraryPaths.isInHomeDir(entry.file) then
                 entries[#entries + 1] = entry
             end
         end
@@ -1698,7 +1846,7 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         return files
     end
 
-    local function folder_files(path)
+    local function folder_items(path)
         if type(path) ~= "string" or path == "" then return {} end
         local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
         if not ok_lfs or lfs.attributes(path, "mode") ~= "directory" then return {} end
@@ -1708,18 +1856,30 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         local ok_items, items = pcall(chooser.genItemTableFromPath, chooser, path)
         if not ok_items or type(items) ~= "table" then return {} end
         local DocumentRegistry = require("document/documentregistry")
-        local files = {}
+        local entries = {}
         for _i, item in ipairs(items) do
             local item_path = item and (item.path or item.file)
+            local is_directory = item and not item.is_go_up and (item.is_directory == true
+                or type(item.attr) == "table" and item.attr.mode == "directory")
             local is_file = item and (item.is_file == true
                 or type(item.attr) == "table" and item.attr.mode == "file")
-            if is_file and type(item_path) == "string" then
+            if is_directory and type(item_path) == "string" then
+                local label = item.text or item.name
+                    or item_path:gsub("/$", ""):match("([^/]+)$") or item_path
+                entries[#entries + 1] = {
+                    is_group = true,
+                    is_folder = true,
+                    group_kind = "folder",
+                    group_label = tostring(label):gsub("/$", ""),
+                    folder_path = item_path,
+                }
+            elseif is_file and type(item_path) == "string" then
                 local ok_supported, supported = pcall(
                     DocumentRegistry.hasProvider, DocumentRegistry, item_path)
-                if ok_supported and supported then files[#files + 1] = item_path end
+                if ok_supported and supported then entries[#entries + 1] = item_path end
             end
         end
-        return files
+        return entries
     end
 
     local function source_groups(kind)
@@ -1766,13 +1926,67 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
                 groups[#groups + 1] = { label = label, files = files }
             end
         end
+        local group_view = type(cfg.group_view) == "table" and cfg.group_view or {}
+        if kind == "authors" and #groups > 1 then
+            local collate = author_sort.normalize(group_view.authors_collate)
+            table.sort(groups, function(a, b)
+                return author_sort.less(a.label, b.label, collate)
+            end)
+            local reverse = type(group_view.group_reverse) == "table"
+                and group_view.group_reverse.authors == true
+            if reverse then groups = reverse_copy(groups) end
+        elseif (kind == "series" or kind == "languages" or kind == "tags")
+                and #groups > 1 then
+            local collate = type(group_view.group_collate) == "table"
+                and group_view.group_collate[kind] or "title"
+            local natural = collate == "title_natural"
+            table.sort(groups, function(a, b)
+                return title_sort.less(a.label, b.label, natural)
+            end)
+            local reverse = type(group_view.group_reverse) == "table"
+                and group_view.group_reverse[kind] == true
+            if reverse then groups = reverse_copy(groups) end
+        end
         return groups
+    end
+
+    local function group_tag_paths(paths, force)
+        local features = type(cfg) == "table" and cfg.features
+        if not force and not (features and features.automatic_series_grouping ~= false) then
+            return paths
+        end
+        local ok_db, db = pcall(require, "common/db_bookinfo")
+        if not (ok_db and db and type(db.getLightMetadata) == "function"
+                and type(db.groupPathsBySeries) == "function") then
+            return paths
+        end
+        return db.groupPathsBySeries(paths, db.getLightMetadata())
     end
 
     local function resolve_drill_files(request)
         local drill = type(request) == "table" and request.drill or nil
         if type(drill) ~= "table" then return nil end
         if type(drill.files) == "table" then return drill.files end
+        if drill.series == true then
+            local paths = {}
+            if request.kind == "tag" then
+                local ok_db, db = pcall(require, "common/db_bookinfo")
+                paths = ok_db and db and type(db.getTagBooks) == "function"
+                    and db.getTagBooks(request.value) or {}
+            elseif drill.parent then
+                for _i, group in ipairs(source_groups(request.kind)) do
+                    if group.label == drill.parent.label then paths = group.files; break end
+                end
+            end
+            for _i, group in ipairs(group_tag_paths(paths, true)) do
+                if type(group) == "table" and group.series == drill.label then
+                    drill.files = group.files
+                    return drill.files
+                end
+            end
+            drill.files = {}
+            return drill.files
+        end
         for _i, group in ipairs(source_groups(request.kind)) do
             if group.label == drill.label then
                 drill.files = copy_paths(group.files)
@@ -1784,10 +1998,12 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
     end
 
     local function descriptor_key(request, order_key)
-        local drill = type(request.drill) == "table" and request.drill.label or ""
+        local drill = type(request.drill) == "table"
+            and (request.drill.path or request.drill.label) or ""
         return table.concat({
             "strip", tostring(request.kind), tostring(request.value or ""),
-            tostring(drill), normalize_order(order_key),
+            tostring(drill), tostring(request.drill and request.drill.series or ""),
+            normalize_order(order_key),
         }, ":")
     end
 
@@ -1803,6 +2019,13 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
     end
 
     local function descriptor_paths(request)
+        if request.kind == "kindle" then
+            if not dataset.kindle_paths then
+                dataset.kindle_paths = require(
+                    "modules/filebrowser/patches/kindle_virtual_library").getBookPaths()
+            end
+            return copy_paths(dataset.kindle_paths)
+        end
         if request.kind == "favorites" then
             local ok_collection, ReadCollection = pcall(require, "readcollection")
             return ok_collection and ReadCollection
@@ -1813,6 +2036,12 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
             return ok_db and db and type(db.getTagBooks) == "function"
                 and db.getTagBooks(request.value) or {}
         end
+        if request.kind == "status" then
+            if type(request.value) ~= "string" or request.value == "" then return {} end
+            local index = get_tbr_index()
+            return index and type(index.getByStatuses) == "function"
+                and index.getByStatuses({ [request.value] = true }) or {}
+        end
         if request.kind == "custom" then
             if type(request.paths) == "table" then return copy_paths(request.paths) end
             local strip = dcfg and dcfg.modules and dcfg.modules.strip or {}
@@ -1822,20 +2051,49 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         end
     end
 
+    local function books_from_tag_page(page)
+        local books = {}
+        for _i, value in ipairs(page) do
+            local group = type(value) == "table" and value or nil
+            local book = get_book(group and group.files[1] or value, false, true)
+            if book then
+                if group then
+                    book.is_group = true
+                    book.group_kind = "series"
+                    book.group_label = group.series
+                    book.group_count = #group.files
+                    book.group_files = group.files
+                end
+                books[#books + 1] = book
+            end
+        end
+        return books
+    end
+
     function provider:getStripItemsForPage(request, count, order_key, component_id, page_delta)
         request = type(request) == "table" and request or { kind = "recent" }
         local kind = request.kind or "recent"
+        if kind == "folder" then
+            local path = type(request.drill) == "table" and request.drill.path
+                or request.value
+            local page, adjacent = paginate(
+                folder_items(path), request, count, order_key, component_id, page_delta)
+            local items = {}
+            for _i, value in ipairs(page) do
+                local book = type(value) == "table" and value
+                    or get_book(value, false, true)
+                if book then items[#items + 1] = book end
+            end
+            return items, adjacent
+        end
         if type(request.drill) == "table" then
             local paths = copy_paths(resolve_drill_files(request))
             if normalize_order(order_key) == "reverse" then paths = reverse_copy(paths) end
+            local values = (kind == "tags" or kind == "tag")
+                and request.drill.series ~= true and group_tag_paths(paths) or paths
             local page, adjacent = paginate(
-                paths, request, count, order_key, component_id, page_delta)
-            local books = {}
-            for _i, path in ipairs(page) do
-                local book = get_book(path, false, true)
-                if book then books[#books + 1] = book end
-            end
-            return books, adjacent
+                values, request, count, order_key, component_id, page_delta)
+            return books_from_tag_page(page), adjacent
         end
         if kind == "authors" or kind == "series" or kind == "languages"
                 or kind == "tags"
@@ -1858,28 +2116,14 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
             end
             return items, adjacent
         end
-        if kind == "folder" then
-            local paths = folder_files(request.value)
-            local page, adjacent = paginate(
-                paths, request, count, order_key, component_id, page_delta)
-            local books = {}
-            for _i, path in ipairs(page) do
-                local book = get_book(path, false, true)
-                if book then books[#books + 1] = book end
-            end
-            return books, adjacent
-        end
-        if kind == "favorites" or kind == "tag" or kind == "custom" then
+        if kind == "kindle" or kind == "favorites" or kind == "tag" or kind == "status"
+                or kind == "custom" then
             local paths = descriptor_paths(request)
             if normalize_order(order_key) == "reverse" then paths = reverse_copy(paths) end
+            if kind == "tag" then paths = group_tag_paths(paths) end
             local page, adjacent = paginate(
                 paths, request, count, order_key, component_id, page_delta)
-            local books = {}
-            for _i, path in ipairs(page) do
-                local book = get_book(path, false, true)
-                if book then books[#books + 1] = book end
-            end
-            return books, adjacent
+            return books_from_tag_page(page), adjacent
         end
         local source = kind == "to_be_read" and "to_be_read" or "recently_read"
         return self:getBooksForStripPage(
@@ -1893,10 +2137,15 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
                 or "recently_read"
             return self:shiftStrip(source, count, order_key, direction, component_id, refresh)
         end
-        local values = request.drill and resolve_drill_files(request)
-            or request.kind == "folder" and folder_files(request.value)
+        local values = request.kind == "folder" and folder_items(
+                type(request.drill) == "table" and request.drill.path or request.value)
+            or request.drill and resolve_drill_files(request)
             or descriptor_paths(request)
             or source_groups(request.kind)
+        if (request.kind == "tags" and request.drill
+                or request.kind == "tag") and not (request.drill and request.drill.series) then
+            values = group_tag_paths(values)
+        end
         local n = math.max(1, tonumber(count) or 4)
         if type(values) ~= "table" or #values <= n then return false end
         local key = tostring(component_id or "strip") .. ":" .. descriptor_key(request, order_key)
@@ -1937,6 +2186,50 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         return true
     end
 
+    -- Paging state of a strip source as the strip shows it (current page,
+    -- number of pages, item count), for the same request/source, count and
+    -- order the strip passes to getStripItemsForPage()/getBooksForStripPage().
+    -- Reads the cached path lists only; no book is loaded.
+    function provider:getStripPageInfo(request, count, order_key, component_id, page_delta)
+        local n = math.max(1, math.floor(tonumber(count) or 4))
+        local total, key
+        local kind = type(request) == "table" and (request.kind or "recent") or request
+        if type(request) == "table" and kind ~= "recent" and kind ~= "to_be_read" then
+            local values
+            if kind == "folder" then
+                values = folder_items(type(request.drill) == "table"
+                    and request.drill.path or request.value)
+            elseif type(request.drill) == "table" then
+                values = resolve_drill_files(request)
+            elseif kind == "authors" or kind == "series" or kind == "languages"
+                    or kind == "tags" or kind == "collections" then
+                values = source_groups(kind)
+            else
+                values = descriptor_paths(request)
+            end
+            total = type(values) == "table" and #values or 0
+            key = tostring(component_id or "strip") .. ":" .. descriptor_key(request, order_key)
+        else
+            local source_key = kind == "to_be_read" and "to_be_read" or "recently_read"
+            local index = source_key == "to_be_read" and get_tbr_index() or nil
+            if index then
+                total = math.min(index.getCount(tbr_sort_options(order_key, true)), HOME_STRIP_MAX_BOOKS)
+                key = tostring(component_id or source_key)
+                    .. ":" .. source_key .. ":" .. normalize_order(order_key)
+            else
+                local source, paths = get_strip_paths(source_key, n, order_key, component_id)
+                total = #paths
+                key = tostring(component_id or source) .. ":" .. source .. ":" .. normalize_order(order_key)
+            end
+        end
+        local offset = strip_page_offset(total, n, strip_offsets[key], page_delta)
+        return {
+            total = total,
+            total_pages = math.max(1, math.ceil(total / n)),
+            current_page = math.floor(offset / n) + 1,
+        }
+    end
+
     function provider:isStripCoverWorkBusy()
         local ok_bim, BookInfoManager = pcall(require, "bookinfomanager")
         return ok_bim and BookInfoManager
@@ -1962,18 +2255,18 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
             and DecodeCache:getFreshMetadata(path, now(), 30) or nil
         metadata = metadata or BookInfoManager:getBookInfo(path, false)
         if not metadata then return "failed" end
+        local specs = { max_cover_w = width, max_cover_h = height }
         if not metadata.cover_fetched then
-            queue_cover_upgrade(path, "strip")
+            queue_cover_upgrade(path, "strip", specs)
             return "pending"
         end
         if not metadata.has_cover or metadata.ignore_cover then
             invalidate_home_book_cache(path)
             return "ready"
         end
-        local specs = { max_cover_w = width, max_cover_h = height }
         if type(BookInfoManager.isCachedCoverInvalid) == "function"
                 and BookInfoManager.isCachedCoverInvalid(metadata, specs) then
-            queue_cover_upgrade(path, "strip")
+            queue_cover_upgrade(path, "strip", specs)
             return "pending"
         end
 
@@ -1983,7 +2276,7 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         info.cover_bb = nil
         if not info.cover_fetched then
             if source and source.free then pcall(source.free, source) end
-            queue_cover_upgrade(path, "strip")
+            queue_cover_upgrade(path, "strip", specs)
             return "pending"
         end
         if not info.has_cover or info.ignore_cover then
@@ -2022,8 +2315,35 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         if current_quote then return current_quote end
         local quote_cfg = dcfg.quotes or {}
         local rotation = quote_cfg.rotation == "refresh" and "refresh" or "daily"
-        current_quote = HomeQuotes.selectQuote(quote_cfg, rotation)
+        local started_at = os.clock()
+        local perf
+        current_quote, perf = HomeQuotes.selectQuote(quote_cfg, rotation)
+        quote_select_ms = quote_select_ms + (os.clock() - started_at) * 1000
+        if type(perf) == "table" then
+            quote_annotation_ms = quote_annotation_ms + (tonumber(perf.annotation_ms) or 0)
+            quote_annotation_books = quote_annotation_books
+                + (tonumber(perf.annotation_books) or 0)
+            quote_annotation_cache_hits = quote_annotation_cache_hits
+                + (tonumber(perf.annotation_cache_hits) or 0)
+            quote_annotation_cache_misses = quote_annotation_cache_misses
+                + (tonumber(perf.annotation_cache_misses) or 0)
+            quote_sidecar_cache_hits = quote_sidecar_cache_hits
+                + (tonumber(perf.sidecar_cache_hits) or 0)
+            quote_sidecar_cache_misses = quote_sidecar_cache_misses
+                + (tonumber(perf.sidecar_cache_misses) or 0)
+            quote_state_writes = quote_state_writes + (tonumber(perf.state_writes) or 0)
+        end
         return current_quote
+    end
+
+    function provider:recordQuoteLayout(elapsed_ms, cache_hit, probes)
+        quote_layout_ms = quote_layout_ms + (tonumber(elapsed_ms) or 0)
+        quote_layout_probes = quote_layout_probes + (tonumber(probes) or 0)
+        if cache_hit then
+            quote_layout_cache_hits = quote_layout_cache_hits + 1
+        else
+            quote_layout_cache_misses = quote_layout_cache_misses + 1
+        end
     end
 
     function provider:clearQuote()
@@ -2094,6 +2414,7 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
     end
 
     provider.stats = {}
+    provider.goal_stats = provider.stats
 
     function provider:prepareStats(rows, force)
         local fields = collect_stats_fields(rows, dcfg)
@@ -2102,6 +2423,7 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
             stats_cached = {}
             stats_cached_key = key
             self.stats = stats_cached
+            self.goal_stats = self.stats
             return self.stats
         end
         if force or key ~= stats_cached_key then
@@ -2113,6 +2435,24 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
             end
         end
         self.stats = get_stats(fields)
+        self.goal_stats = self.stats
+        local goals = type(dcfg.goals) == "table" and dcfg.goals or {}
+        if goals.exclude_cbz_cbr == true then
+            for _i, component in ipairs(rows or {}) do
+                if component.id == "reading_goals" then
+                    if force or key ~= goal_stats_cached_key then
+                        goal_stats_cached = nil
+                        goal_stats_cached_key = key
+                        if force and _home_goal_stats_cache.key == key then
+                            _home_goal_stats_cache.value = nil
+                            _home_goal_stats_cache.expires_at = 0
+                        end
+                    end
+                    self.goal_stats = get_stats(fields, true)
+                    break
+                end
+            end
+        end
         return self.stats
     end
 
@@ -2127,7 +2467,10 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
     function provider:clearStats()
         stats_cached = nil
         stats_cached_key = nil
+        goal_stats_cached = nil
+        goal_stats_cached_key = nil
         self.stats = {}
+        self.goal_stats = self.stats
         return self.stats
     end
 
@@ -2135,6 +2478,18 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
         book_cache_hits = 0
         book_cache_misses = 0
         book_lookup_ms = 0
+        quote_select_ms = 0
+        quote_annotation_ms = 0
+        quote_annotation_books = 0
+        quote_annotation_cache_hits = 0
+        quote_annotation_cache_misses = 0
+        quote_sidecar_cache_hits = 0
+        quote_sidecar_cache_misses = 0
+        quote_state_writes = 0
+        quote_layout_ms = 0
+        quote_layout_cache_hits = 0
+        quote_layout_cache_misses = 0
+        quote_layout_probes = 0
     end
 
     function provider:getPerformanceStats()
@@ -2142,6 +2497,18 @@ local function build_data_provider(cfg, dcfg, strip_page_state)
             book_cache_hits = book_cache_hits,
             book_cache_misses = book_cache_misses,
             book_lookup_ms = math.floor(book_lookup_ms + 0.5),
+            quote_select_ms = math.floor(quote_select_ms * 10 + 0.5) / 10,
+            quote_annotation_ms = math.floor(quote_annotation_ms * 10 + 0.5) / 10,
+            quote_annotation_books = quote_annotation_books,
+            quote_annotation_cache_hits = quote_annotation_cache_hits,
+            quote_annotation_cache_misses = quote_annotation_cache_misses,
+            quote_sidecar_cache_hits = quote_sidecar_cache_hits,
+            quote_sidecar_cache_misses = quote_sidecar_cache_misses,
+            quote_state_writes = quote_state_writes,
+            quote_layout_ms = math.floor(quote_layout_ms * 10 + 0.5) / 10,
+            quote_layout_cache_hits = quote_layout_cache_hits,
+            quote_layout_cache_misses = quote_layout_cache_misses,
+            quote_layout_probes = quote_layout_probes,
             dataset_generation = dataset.generation,
         }
     end
@@ -2152,6 +2519,16 @@ end
 local function compute_row_heights(rows, body_h, row_gap, capacity, width, modules, config, data)
     local specs = {}
     local row_count = #rows
+    local goal_periods = config and config.goals and config.goals.periods
+    if type(goal_periods) == "table" and #goal_periods >= 3 then
+        local layout_rows = {}
+        for i, comp in ipairs(rows) do
+            layout_rows[i] = comp.id == "reading_goals"
+                and setmetatable({ size = { units = 1 + 0.1 * (#goal_periods - 1) } },
+                    { __index = comp }) or comp
+        end
+        rows = layout_rows
+    end
     local unit_counts = Registry.layoutUnits and Registry.layoutUnits(rows, capacity) or {}
     if #unit_counts == 0 then
         for _i, comp in ipairs(rows) do
@@ -2173,7 +2550,7 @@ local function compute_row_heights(rows, body_h, row_gap, capacity, width, modul
             if ok and tonumber(preferred) then max_heights[i] = preferred end
         end
     end
-    if row_count >= 3 and rows[row_count].id == "quotes" and max_heights[row_count] then
+    if row_count >= 3 then
         local has_flexible_middle = false
         for i = 2, row_count - 1 do
             if not max_heights[i] then has_flexible_middle = true; break end
@@ -2187,10 +2564,9 @@ local function compute_row_heights(rows, body_h, row_gap, capacity, width, modul
     for i = 1, row_count do
         if not max_heights[i] then has_flexible_row = true; break end
     end
-    if row_count ~= 2 or not has_flexible_row then
+    if not has_flexible_row then
         for i, comp in ipairs(rows) do
             if comp.id == "stats_triplet" then
-                -- Only a two-row flexible layout can give all stats slack to its other row.
                 max_heights[i] = nil
                 break
             end
@@ -2268,8 +2644,13 @@ local function wrap_home_focus_target(menu, target, widget, defer_registration)
     frame.paintTo = function(self, bb, x, y)
         orig_paintTo(self, bb, x, y)
         if menu._zen_home_focus_id == target.id then
+            local frame_size = self:getSize()
+            local bounds = target.content_bounds
+            local shift = bounds and bounds.shift or 0
+            local top = bounds and math.min(0, bounds.top + shift - 2) or 0
+            local bottom = bounds and math.max(frame_size.h, bounds.bottom + shift + 2) or frame_size.h
             paint_focus_rect(
-                bb, x, y, self:getSize().w, self:getSize().h, target.focus_color)
+                bb, x, y + top, frame_size.w, bottom - top, target.focus_color)
         end
     end
     target.widget = frame
@@ -2692,6 +3073,10 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
 
     local function show_book_context_menu(path, source, component_id)
         if type(path) ~= "string" or path == "" then return false end
+        if source == "kindle" then
+            return require("modules/filebrowser/patches/kindle_virtual_library")
+                .showBookContextMenu(nil, { file = path, path = path }, M.rebuildActive)
+        end
         local fm = FileManager.instance
         local fc = fm and fm.file_chooser
         if not (fc and type(fc.showFileDialog) == "function") then return false end
@@ -2787,7 +3172,7 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
         end
     end
 
-    local function refresh_strip(swipe)
+    local function refresh_strip(dimen)
         sort_home_focus_targets(menu)
         local restore_i = find_home_focus_index(menu, menu._zen_home_focus_key)
         if restore_i then
@@ -2797,11 +3182,11 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
             menu._zen_home_focus_id = nil
         end
         request_home_repaint(menu, function()
-            return "ui", swipe and swipe.dimen, menu.dithered
+            return "ui", dimen, menu.dithered
         end)
     end
 
-    local top_tap_zone_h = math.max(1, math.floor(Screen:getHeight() * 0.05))
+    local top_tap_zone_h = math.max(1, math.floor(Screen:getHeight() * 0.07))
     local function open_top_menu(ges)
         if not (ges and ges.pos and ges.pos.y < top_tap_zone_h) then return false end
         local fm = FileManager.instance
@@ -2866,9 +3251,14 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
             shiftStrip = shift_strip,
             openTopMenu = open_top_menu,
             buildStatusRow = _zen_shared and _zen_shared.buildStatusRow,
-            registerClockRefresh = function(refresh)
+            statusRowRefreshRegions = _zen_shared and _zen_shared.statusRowRefreshRegions,
+            registerClockRefresh = function(refresh, widget, keys)
                 if type(refresh) == "function" then
-                    table.insert(menu._zen_home_clock_refreshers, refresh)
+                    table.insert(menu._zen_home_clock_refreshers, {
+                        refresh = refresh,
+                        widget = widget,
+                        keys = keys,
+                    })
                 end
             end,
             setWidgetActions = function(actions)
@@ -2904,6 +3294,7 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
             component_id = comp.id,
             module_cfg = module_cfg,
             row_gap_above = i > 1 and row_gap or 0,
+            row_space_below = math.max(0, body_h - row_y - h),
             is_first_row = i == 1,
             is_last_row = i == #rows,
         }
@@ -2924,6 +3315,7 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
                 col = 0,
                 width = content_w,
                 height = h,
+                content_bounds = content_bounds,
                 activate = row_focus_actions.activate,
                 context = row_focus_actions.context,
             }, final_widget)
@@ -2936,14 +3328,12 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
                 final_widget,
             })
             if content_bounds then
+                content_bounds.row_index = i
                 content_bounds.row_y = row_y
-                if i == 1 then
-                    content_bounds.min_shift = 0
-                    content_bounds.max_shift = 0
-                elseif content_bounds.lock_shift ~= true then
-                    -- Borrow surrounding blank space when internal slack is too small.
-                    content_bounds.min_shift = (content_bounds.min_shift or 0) - row_gap * 3
-                    content_bounds.max_shift = (content_bounds.max_shift or 0) + row_gap * 3
+                if content_bounds.lock_shift ~= true then
+                    content_bounds.min_shift = (content_bounds.min_shift or 0) - row_y
+                    content_bounds.max_shift = (content_bounds.max_shift or 0)
+                        + math.max(0, body_h - row_y - h)
                 else
                     content_bounds.min_shift = tonumber(content_bounds.min_shift) or 0
                     content_bounds.max_shift = content_bounds.min_shift
@@ -2969,13 +3359,26 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
     local run = {}
     local function apply_visual_run(anchor_bottom)
         if #run > 1 then
-            local bottom_anchor_offset = anchor_bottom
-                and math.max(0, tonumber(run[#run].bottom_anchor_offset) or 0) or 0
-            local spacing_options = anchor_bottom and {
-                bottom = body_h - top_visual_inset - bottom_anchor_offset,
-            } or nil
+            local full_page = anchor_bottom
+                and run[1].row_index == 1
+                and run[#run].row_index == #rows
+            local spacing_options
+            if full_page then
+                local edge_pad = math.max(page_pad, row_gap * 2)
+                spacing_options = {
+                    top = edge_pad,
+                    bottom = body_h - edge_pad,
+                }
+            elseif anchor_bottom then
+                local bottom_anchor_offset = math.max(
+                    0, tonumber(run[#run].bottom_anchor_offset) or 0)
+                spacing_options = {
+                    bottom = body_h - top_visual_inset - bottom_anchor_offset,
+                }
+            end
             local shifts = Registry.equalSpacingShifts(run, spacing_options)
             for i, shift in ipairs(shifts) do
+                run[i].shift = shift
                 run[i].set_shift(shift)
             end
             if #shifts == #run then
@@ -2983,6 +3386,10 @@ local function build_home_content(menu, zen_config, dcfg, rows, data_provider)
                     menu._zen_home_visual_gaps[#menu._zen_home_visual_gaps + 1] =
                         run[i + 1].row_y + run[i + 1].top + shifts[i + 1]
                         - run[i].row_y - run[i].bottom - shifts[i]
+                end
+                if full_page then
+                    menu._zen_home_top_visual_inset = run[1].row_y + run[1].top
+                        + shifts[1]
                 end
                 if anchor_bottom then
                     local last = run[#run]
@@ -3084,7 +3491,7 @@ local function consume_last_read_file()
     return true
 end
 
-function M.showHomeView(injectNavbar)
+function M.showHomeView(injectNavbar, initial_refresh_type)
     M.setCoverCacheBudget(MemoryPolicy.homeByteBudget())
     if _home_menu and not _home_menu._zen_home_closing then
         return _home_menu, false
@@ -3122,6 +3529,7 @@ function M.showHomeView(injectNavbar)
     menu._zen_home_screen_height = Screen:getHeight()
 
     local rows = resolve_rows(dcfg)
+    menu._zen_home_has_strip = rows_have_component(rows, "strip")
     local data_provider = build_data_provider(cfg, dcfg, _home_strip_page_state)
     local function remember_strip_pages()
         if data_provider and type(data_provider.getStripPageState) == "function" then
@@ -3133,7 +3541,7 @@ function M.showHomeView(injectNavbar)
     local has_date_dependent = rows_have_date_dependent(rows)
     menu._zen_home_has_clock_refreshers = has_clock_refreshers
 
-    local function rebuild(refresh_stats)
+    local function rebuild(refresh_stats, refresh_type)
         local started_at = os.clock()
         local stats_started_at = started_at
         if data_provider and type(data_provider.resetPerformanceStats) == "function" then
@@ -3160,7 +3568,7 @@ function M.showHomeView(injectNavbar)
         menu._zen_home_needs_rebuild = nil
         menu._zen_home_refresh_stats = nil
         menu._zen_home_reload_config = nil
-        request_home_repaint(menu, "ui")
+        request_home_repaint(menu, refresh_type or "ui")
         local perf = data_provider and data_provider.getPerformanceStats
             and data_provider:getPerformanceStats() or {}
         local component_times = {}
@@ -3168,34 +3576,40 @@ function M.showHomeView(injectNavbar)
             component_times[#component_times + 1] = tostring(comp.id) .. ":"
                 .. tostring(menu._zen_home_component_ms[comp.id] or 0)
         end
+        local book_cache = string.format("%d/%d",
+            perf.book_cache_hits or 0, perf.book_cache_misses or 0)
+        local quote_ms = string.format("select:%.1f,annotation:%.1f,layout:%.1f",
+            perf.quote_select_ms or 0,
+            perf.quote_annotation_ms or 0,
+            perf.quote_layout_ms or 0)
+        local quote_cache = string.format(
+            "annotation:%d/%d,sidecar:%d/%d,layout:%d/%d",
+            perf.quote_annotation_cache_hits or 0,
+            perf.quote_annotation_cache_misses or 0,
+            perf.quote_sidecar_cache_hits or 0,
+            perf.quote_sidecar_cache_misses or 0,
+            perf.quote_layout_cache_hits or 0,
+            perf.quote_layout_cache_misses or 0)
+        local quote_work = string.format("books:%d,writes:%d,probes:%d",
+            perf.quote_annotation_books or 0,
+            perf.quote_state_writes or 0,
+            perf.quote_layout_probes or 0)
+        local home_ms = string.format("stats:%.1f,build:%.1f,mount:%.1f",
+            stats_ms, build_ms, mount_ms)
         logger.perf("Home content rebuild completed", (os.clock() - started_at) * 1000,
             "rows=", #rows,
-            "book_cache_hits=", perf.book_cache_hits or 0,
-            "book_cache_misses=", perf.book_cache_misses or 0,
+            "book_cache_hm=", book_cache,
             "book_lookup_ms=", perf.book_lookup_ms or 0,
-            "stats_ms=", math.floor(stats_ms * 10 + 0.5) / 10,
-            "build_ms=", math.floor(build_ms * 10 + 0.5) / 10,
-            "mount_ms=", math.floor(mount_ms * 10 + 0.5) / 10,
+            "quote_ms=", quote_ms,
+            "quote_cache_hm=", quote_cache,
+            "quote_work=", quote_work,
+            "home_ms=", home_ms,
             "component_ms=", table.concat(component_times, ","),
             "dataset_generation=", perf.dataset_generation or 0)
     end
 
-    function menu:_zen_home_refresh_clock_widgets(suppress_repaint)
-        if self._zen_home_closing then return end
-        local refreshed = 0
-        for _i, refresh in ipairs(self._zen_home_clock_refreshers or {}) do
-            if type(refresh) == "function" then
-                local ok, did_refresh = pcall(refresh)
-                if ok and did_refresh then
-                    refreshed = refreshed + 1
-                elseif not ok then
-                    logger.warn("embedded clock refresh failed:", tostring(did_refresh))
-                end
-            end
-        end
-        if refreshed > 0 and suppress_repaint ~= true then
-            request_home_repaint(self, "ui")
-        end
+    function menu:_zen_home_refresh_clock_widgets(suppress_repaint, item_keys)
+        refresh_home_clock_widgets(self, suppress_repaint, item_keys)
     end
 
     local function refresh_home_clock_widgets_if_top()
@@ -3239,7 +3653,8 @@ function M.showHomeView(injectNavbar)
         pcall(function()
             require("common/clock_timer").bind(menu, function(target)
                 if target and target._zen_home_refresh_clock_widgets then
-                    target:_zen_home_refresh_clock_widgets()
+                    target:_zen_home_refresh_clock_widgets(
+                        false, constants.FILEMANAGER_MINUTE_STATUS_ITEMS)
                 end
             end)
         end)
@@ -3317,7 +3732,7 @@ function M.showHomeView(injectNavbar)
         end
     end
 
-    function menu:_home_rebuild(refresh_stats, reload_config)
+    function menu:_home_rebuild(refresh_stats, reload_config, refresh_type)
         if self._zen_home_closing then return false end
         if self._zen_home_suspended == true or not home_is_on_top(self) then
             self._zen_home_needs_rebuild = true
@@ -3340,14 +3755,15 @@ function M.showHomeView(injectNavbar)
             end
         end
         rows = resolve_rows(dcfg)
+        self._zen_home_has_strip = rows_have_component(rows, "strip")
         has_clock_refreshers = rows_have_clock_refreshers(rows, dcfg)
         has_date_dependent = rows_have_date_dependent(rows)
         self._zen_home_has_clock_refreshers = has_clock_refreshers
-        rebuild(refresh_stats == true)
+        rebuild(refresh_stats == true, refresh_type)
         return true
     end
 
-    function menu:_zen_home_resume()
+    function menu:_zen_home_resume(refresh_type)
         if self._zen_home_closing then return false, "closing" end
         if not home_is_on_top(self) then return false, "not_top" end
         if self._zen_home_screen_width ~= Screen:getWidth()
@@ -3416,14 +3832,14 @@ function M.showHomeView(injectNavbar)
 
         local rebuilt = false
         if needs_rebuild then
-            rebuilt = self:_home_rebuild(refresh_stats, reload_config) == true
+            rebuilt = self:_home_rebuild(refresh_stats, reload_config, refresh_type) == true
         end
         if self._zen_status_refresh then
             self:_zen_status_refresh(true)
         elseif has_clock_refreshers and self._zen_home_refresh_clock_widgets then
             self:_zen_home_refresh_clock_widgets(true)
         end
-        if not rebuilt then request_home_repaint(self, "ui") end
+        if not rebuilt then request_home_repaint(self, refresh_type or "ui") end
 
         logger.measure("Home retained view resumed", (now() - started_at) * 1000,
             "rebuilt=", tostring(rebuilt),
@@ -3488,7 +3904,7 @@ function M.showHomeView(injectNavbar)
 
     UIManager:show(menu)
     UIManager:nextTick(function()
-        rebuild(true)
+        rebuild(true, initial_refresh_type)
         if menu._zen_status_refresh then
             menu:_zen_status_refresh()
         end
@@ -3519,7 +3935,7 @@ function M.suspendActive()
     return true
 end
 
-function M.resumeActive()
+function M.resumeActive(refresh_type)
     local menu = _home_menu
     if not menu or menu._zen_home_closing
             or type(menu._zen_home_resume) ~= "function" then
@@ -3533,7 +3949,7 @@ function M.resumeActive()
             return true, "rebuilt"
         end
     end
-    return menu:_zen_home_resume()
+    return menu:_zen_home_resume(refresh_type)
 end
 
 function M.invalidateNavbar()
@@ -3598,6 +4014,7 @@ function M.rebuildActive()
         if _home_menu._zen_home_suspended == true
                 or not home_is_on_top(_home_menu) then
             mark_home_rebuild_needed(true, true)
+            request_home_repaint(_home_menu, "ui")
             return true
         end
         local cfg = load_zen_config()
@@ -3616,6 +4033,16 @@ function M.rebuildActive()
     return false
 end
 
+function M.showTagInStrip(tag)
+    if type(tag) ~= "string" or tag == "" or not _home_menu
+            or _home_menu._zen_home_has_strip ~= true then return false end
+    local state = { source = { kind = "tag", value = tag } }
+    _home_menu._zen_home_strip_runtime = state
+    _home_strip_page_state = nil
+    save_home_strip_state(ensure_home_cfg(), state)
+    return M.rebuildActive()
+end
+
 function M.resetStripPages()
     if not (M.isActiveOnTop() and _home_menu and _home_menu._zen_home_reset_strip_pages) then
         return false
@@ -3623,8 +4050,11 @@ function M.resetStripPages()
     return _home_menu:_zen_home_reset_strip_pages()
 end
 
-function M.refreshDateDependentActive()
+function M.refreshDateDependentActive(force)
     if not (M.isActiveOnTop() and _home_menu and _home_menu._home_rebuild) then
+        return false
+    end
+    if not force and _home_menu._zen_home_built_day == os.date("%Y-%j") then
         return false
     end
     local cfg = load_zen_config()

@@ -1,7 +1,9 @@
 local ConfigManager = require("config/manager")
+local author_sort = require("common/author_sort")
 local book_status = require("common/book_status")
 local HistoryIndex = require("common/history_index")
 local icons = require("common/inline_icon_map")
+local submenu_arrow = icons.arrow_right
 local LanguageName = require("common/language_name")
 local paths = require("common/paths")
 local StandalonePage = require("modules/filebrowser/patches/standalone_page")
@@ -97,29 +99,48 @@ local function save_zen_config(cfg)
     end
 end
 
-local function get_group_display_mode(tab_id, fallback)
+local function rebuild_home()
+    if not _zen_plugin then return end
+    local home = SharedState.get(_zen_plugin, "home")
+    if home and type(home.rebuildActive) == "function" then
+        home.rebuildActive()
+    end
+end
+
+local function get_display_mode(tab_id, group_name, fallback)
     local cfg = load_zen_config()
     local group_view = cfg and cfg.group_view
-    local display_mode = group_view and group_view.display_mode
-    local stored = display_mode and display_mode[tab_id]
+    local detail_display_mode = group_view and group_view.detail_display_mode
+    local tab_detail = detail_display_mode and detail_display_mode[tab_id]
+    local stored = group_name and tab_detail and tab_detail[group_name]
     if type(stored) == "string" and stored ~= "" then
         return stored
     end
-    local g_settings = rawget(_G, "G_reader_settings")
-    local legacy = g_settings and g_settings:readSetting("zen_" .. tab_id .. "_display_mode")
-    if type(legacy) == "string" and legacy ~= "" then
-        return legacy
+    local display_mode = group_view and group_view.display_mode
+    stored = display_mode and display_mode[tab_id]
+    if type(stored) == "string" and stored ~= "" then
+        return stored
     end
     return fallback
 end
 
-local function set_group_display_mode(tab_id, mode)
+local function set_display_mode(tab_id, group_name, mode)
     if type(mode) ~= "string" or mode == "" then return end
     local cfg = load_zen_config()
     if type(cfg) ~= "table" then return end
     if type(cfg.group_view) ~= "table" then cfg.group_view = {} end
-    if type(cfg.group_view.display_mode) ~= "table" then cfg.group_view.display_mode = {} end
-    cfg.group_view.display_mode[tab_id] = mode
+    if group_name then
+        if type(cfg.group_view.detail_display_mode) ~= "table" then
+            cfg.group_view.detail_display_mode = {}
+        end
+        if type(cfg.group_view.detail_display_mode[tab_id]) ~= "table" then
+            cfg.group_view.detail_display_mode[tab_id] = {}
+        end
+        cfg.group_view.detail_display_mode[tab_id][group_name] = mode
+    else
+        if type(cfg.group_view.display_mode) ~= "table" then cfg.group_view.display_mode = {} end
+        cfg.group_view.display_mode[tab_id] = mode
+    end
     save_zen_config(cfg)
 end
 
@@ -131,12 +152,6 @@ local function get_detail_collate(tab_id, group_name, fallback)
     local stored = tab_collate and tab_collate[group_name]
     if type(stored) == "string" and stored ~= "" then
         return stored
-    end
-    local g_settings = rawget(_G, "G_reader_settings")
-    local legacy_key = "zen_" .. tab_id .. "_detail_collate_" .. group_name
-    local legacy = g_settings and g_settings:readSetting(legacy_key)
-    if type(legacy) == "string" and legacy ~= "" then
-        return legacy
     end
     return fallback
 end
@@ -162,17 +177,12 @@ local function get_group_reverse(tab_id)
     if stored ~= nil then
         return stored == true
     end
-    local g_settings = rawget(_G, "G_reader_settings")
-    local legacy_key = tab_id == "authors" and "zen_authors_reverse"
-        or (tab_id == "series" and "zen_series_reverse" or nil)
-    if legacy_key and g_settings then
-        return g_settings:isTrue(legacy_key)
-    end
     return false
 end
 
 local function set_group_reverse(tab_id, reverse)
-    if tab_id ~= "authors" and tab_id ~= "series" and tab_id ~= "languages" then return end
+    if tab_id ~= "authors" and tab_id ~= "series"
+            and tab_id ~= "languages" and tab_id ~= "tags" then return end
     local cfg = load_zen_config()
     if type(cfg) ~= "table" then return end
     if type(cfg.group_view) ~= "table" then cfg.group_view = {} end
@@ -181,6 +191,44 @@ local function set_group_reverse(tab_id, reverse)
     end
     cfg.group_view.group_reverse[tab_id] = reverse == true
     save_zen_config(cfg)
+    rebuild_home()
+end
+
+local function get_authors_collate()
+    local cfg = load_zen_config()
+    local stored = cfg and cfg.group_view and cfg.group_view.authors_collate
+    return author_sort.normalize(stored)
+end
+
+local function set_authors_collate(collate)
+    if not author_sort.isMode(collate) then return end
+    local cfg = load_zen_config()
+    if type(cfg) ~= "table" then return end
+    if type(cfg.group_view) ~= "table" then cfg.group_view = {} end
+    cfg.group_view.authors_collate = collate
+    save_zen_config(cfg)
+    rebuild_home()
+end
+
+local function get_group_collate(tab_id)
+    local cfg = load_zen_config()
+    local group_collate = cfg and cfg.group_view and cfg.group_view.group_collate
+    return group_collate and group_collate[tab_id] == "title_natural"
+        and "title_natural" or "title"
+end
+
+local function set_group_collate(tab_id, collate)
+    if tab_id ~= "series" and tab_id ~= "languages" and tab_id ~= "tags" then return end
+    if collate ~= "title" and collate ~= "title_natural" then return end
+    local cfg = load_zen_config()
+    if type(cfg) ~= "table" then return end
+    if type(cfg.group_view) ~= "table" then cfg.group_view = {} end
+    if type(cfg.group_view.group_collate) ~= "table" then
+        cfg.group_view.group_collate = {}
+    end
+    cfg.group_view.group_collate[tab_id] = collate
+    save_zen_config(cfg)
+    rebuild_home()
 end
 
 local function get_tags_global_collate()
@@ -191,24 +239,7 @@ local function get_tags_global_collate()
     if type(stored) == "string" and stored ~= "" then
         return stored
     end
-    local g_settings = rawget(_G, "G_reader_settings")
-    local legacy = g_settings and g_settings:readSetting("zen_tags_global_collate")
-    if type(legacy) == "string" and legacy ~= "" then
-        return legacy
-    end
     return "title"
-end
-
-local function set_tags_global_collate(collate)
-    if type(collate) ~= "string" or collate == "" then return end
-    local cfg = load_zen_config()
-    if type(cfg) ~= "table" then return end
-    if type(cfg.group_view) ~= "table" then cfg.group_view = {} end
-    if type(cfg.group_view.tags_global) ~= "table" then
-        cfg.group_view.tags_global = {}
-    end
-    cfg.group_view.tags_global.collate = collate
-    save_zen_config(cfg)
 end
 
 local function is_tags_global_reverse()
@@ -218,19 +249,7 @@ local function is_tags_global_reverse()
     if tags_global and tags_global.reverse ~= nil then
         return tags_global.reverse == true
     end
-    local g_settings = rawget(_G, "G_reader_settings")
-    return g_settings and g_settings:isTrue("zen_tags_global_reverse") or false
-end
-
-local function set_tags_global_reverse(reverse)
-    local cfg = load_zen_config()
-    if type(cfg) ~= "table" then return end
-    if type(cfg.group_view) ~= "table" then cfg.group_view = {} end
-    if type(cfg.group_view.tags_global) ~= "table" then
-        cfg.group_view.tags_global = {}
-    end
-    cfg.group_view.tags_global.reverse = reverse == true
-    save_zen_config(cfg)
+    return false
 end
 
 local function get_detail_reverse(tab_id, group_name, fallback)
@@ -241,12 +260,6 @@ local function get_detail_reverse(tab_id, group_name, fallback)
     local stored = tab_reverse and tab_reverse[group_name]
     if stored ~= nil then
         return stored == true
-    end
-    local g_settings = rawget(_G, "G_reader_settings")
-    local legacy_key = "zen_" .. tab_id .. "_detail_reverse_" .. group_name
-    local legacy = g_settings and g_settings:readSetting(legacy_key)
-    if legacy ~= nil then
-        return legacy == true
     end
     return fallback == true
 end
@@ -285,7 +298,7 @@ end
 -- setup_display_mode: mirror fi CoverMenu/MosaicMenu/ListMenu onto menu
 -- Returns "mosaic", "list", or "classic"
 -------------------------------------------------------------------------------
-local function setup_display_mode(menu, is_group_view, tab_id)
+local function setup_display_mode(menu, is_group_view, tab_id, group_name)
     local ok_bim, BookInfoManager = pcall(require, "bookinfomanager")
     if not ok_bim then
         menu.display_mode_type = "classic"
@@ -293,7 +306,7 @@ local function setup_display_mode(menu, is_group_view, tab_id)
     end
     local display_mode
     if tab_id then
-        display_mode = get_group_display_mode(tab_id, "list_image_meta")
+        display_mode = get_display_mode(tab_id, group_name, "list_image_meta")
     else
         display_mode = BookInfoManager:getSetting("filemanager_display_mode")
     end
@@ -315,7 +328,7 @@ local function setup_display_mode(menu, is_group_view, tab_id)
     local display_mode_type = display_mode:gsub("_.*", "")  -- "mosaic" or "list"
 
     menu.updateItems   = CoverMenu.updateItems
-    menu.onCloseWidget = CoverMenu.onCloseWidget
+    menu.onCloseWidget = rawget(menu, "onCloseWidget") or CoverMenu.onCloseWidget
 
     menu.nb_cols_portrait  = BookInfoManager:getSetting("nb_cols_portrait")  or 3
     menu.nb_rows_portrait  = BookInfoManager:getSetting("nb_rows_portrait")  or 3
@@ -374,6 +387,8 @@ local function setup_display_mode(menu, is_group_view, tab_id)
 
     return display_mode_type
 end
+
+M.setupDisplayMode = setup_display_mode
 
 -- clean_nav: suppress back arrow, inject status bar row, set display mode
 -- back_callback: optional function for the status bar back chevron
@@ -439,6 +454,20 @@ local function build_group_item_table(groups, data_type)
             _zen_group  = (data_type == "series") and group or nil,
         })
     end
+
+    if #items > 1 then
+        if data_type == "authors" then
+            local collate = get_authors_collate()
+            table.sort(items, function(a, b)
+                return author_sort.less(a.text, b.text, collate)
+            end)
+        elseif data_type == "series" or data_type == "languages" or data_type == "tags" then
+            local natural = get_group_collate(data_type) == "title_natural"
+            table.sort(items, function(a, b)
+                return title_sort.less(a.text, b.text, natural)
+            end)
+        end
+    end
     if #items == 0 then
         table.insert(items, {
             text                    = empty_message,
@@ -448,8 +477,9 @@ local function build_group_item_table(groups, data_type)
         })
     end
 
-    -- Apply reverse sort if enabled (tags use per-group or global book sort).
-    if (data_type == "authors" or data_type == "series" or data_type == "languages")
+    -- Apply reverse sort if enabled.
+    if (data_type == "authors" or data_type == "series"
+            or data_type == "languages" or data_type == "tags")
             and get_group_reverse(data_type) and #items > 0 then
         -- Reverse the array (skip the placeholder)
         if items[1].text ~= empty_message then
@@ -471,7 +501,7 @@ local showGroupView
 -- showDisplayModeDialog: show display mode selection dialog
 -- menu: optional Menu instance to refresh after mode change
 -------------------------------------------------------------------------------
-local function showDisplayModeDialog(menu, tab_id)
+local function showDisplayModeDialog(menu, tab_id, group_name)
     local _ = require("gettext")
     local ButtonDialog = require("ui/widget/buttondialog")
     local UIManager = require("ui/uimanager")
@@ -481,7 +511,7 @@ local function showDisplayModeDialog(menu, tab_id)
     local ok_bim, bim = pcall(require, "bookinfomanager")
     local cur_mode
     if tab_id then
-        cur_mode = get_group_display_mode(tab_id, "list_image_meta")
+        cur_mode = get_display_mode(tab_id, group_name, "list_image_meta")
     elseif ok_bim and bim then
         local ok3, m = pcall(function()
             return bim:getSetting("filemanager_display_mode")
@@ -491,7 +521,7 @@ local function showDisplayModeDialog(menu, tab_id)
 
     local function apply_mode(mode)
         if tab_id then
-            set_group_display_mode(tab_id, mode)
+            set_display_mode(tab_id, group_name, mode)
         else
             -- Use FM:onSetDisplayMode to update CoverBrowser state and save to BIM.
             local via_fm = false
@@ -504,8 +534,8 @@ local function showDisplayModeDialog(menu, tab_id)
         end
 
         -- Rebuild in-place: swap methods for the new mode, then redraw once.
-        local function _rebuild_menu(m, is_group, t_id)
-            local new_mode_type = setup_display_mode(m, is_group, t_id)
+        local function _rebuild_menu(m, is_group, t_id, detail_group)
+            local new_mode_type = setup_display_mode(m, is_group, t_id, detail_group)
             if new_mode_type ~= "mosaic" and new_mode_type ~= "list" then
                 -- Classic mode: restore base Menu methods
                 local Menu_class = require("ui/widget/menu")
@@ -516,22 +546,12 @@ local function showDisplayModeDialog(menu, tab_id)
             end
             m:updateItems()
         end
-        if menu then
-            _rebuild_menu(menu, menu._zen_group_view or false, tab_id)
+        if menu and (not group_name or menu._zen_group_name == group_name) then
+            _rebuild_menu(menu, menu._zen_group_view or false, tab_id, group_name)
         end
-        -- Also rebuild the root group menu when changing from within a detail view,
-        -- otherwise going back shows stale rendering with the old display mode.
-        if tab_id then
-            local root_menu
-            if tab_id == "authors" then
-                root_menu = _authors_menu
-            elseif tab_id == "languages" then
-                root_menu = _languages_menu
-            elseif tab_id == "tags" then
-                root_menu = _tags_menu
-            else
-                root_menu = _series_menu
-            end
+        -- Rebuild an open root menu when the change came from elsewhere.
+        if tab_id and not group_name then
+            local root_menu = get_root_menu(tab_id)
             if root_menu and root_menu ~= menu then
                 _rebuild_menu(root_menu, true, tab_id)
             end
@@ -566,117 +586,115 @@ end
 
 
 -------------------------------------------------------------------------------
--- showGroupSortDialog: show ascending/descending sort dialog for group view
--- tab_id: "authors" | "series" | "tags"
+-- showGroupSortDialog: show sort dialog for a group view
+-- tab_id: "authors" | "series" | "languages" | "tags"
 -- menu: the Menu instance to refresh after sort change
 -------------------------------------------------------------------------------
 local function showGroupSortDialog(tab_id, menu)
     local _ = require("gettext")
-
-    -- Tags: show the same rich sort dialog as the detail view;
-    -- settings are stored in zen_ui_config and used as defaults for tag detail views.
-    if tab_id == "tags" then
-        local ButtonDialog = require("ui/widget/buttondialog")
-        local UIManager    = require("ui/uimanager")
-
-        local cur_collate = get_tags_global_collate()
-        local cur_reverse = is_tags_global_reverse()
-
-        local SORT_OPTIONS = {
-            { key = "series_index",  text = "\u{F0CB}  " .. _("Series number") },
-            { key = "title",         text = "\u{F031}  " .. _("Title") },
-            { key = "title_natural", text = "\u{F04BB}  " .. _("Title natural") },
-            { key = "strcoll",       text = icons.filename .. "  " .. _("Filename") },
-            { key = "access",        text = "\u{F073}  " .. _("Recently read") },
-        }
-
-        local sort_dialog
-        local sort_buttons = {}
-        for _i, opt in ipairs(SORT_OPTIONS) do
-            local is_active = cur_collate == opt.key
-            table.insert(sort_buttons, {{
-                text     = opt.text .. (is_active and "  \u{2713}" or ""),
-                align    = "left",
-                enabled  = not is_active,
-                callback = function()
-                    set_tags_global_collate(opt.key)
-                    UIManager:close(sort_dialog)
-                end,
-            }})
-        end
-        table.insert(sort_buttons, {{
-            text     = "\u{F0DC}  " .. _("Order") .. "  \u{25B6}",
-            align    = "left",
-            callback = function()
-                UIManager:close(sort_dialog)
-                local order_dialog
-                order_dialog = ButtonDialog:new{
-                    title       = _("Sort order"),
-                    title_align = "center",
-                    buttons     = {
-                        {{
-                            text     = "\u{F15D}  " .. _("Ascending") .. (not cur_reverse and "  \u{2713}" or ""),
-                            align    = "left",
-                            enabled  = cur_reverse,
-                            callback = function()
-                                set_tags_global_reverse(false)
-                                UIManager:close(order_dialog)
-                            end,
-                        }},
-                        {{
-                            text     = "\u{F15E}  " .. _("Descending") .. (cur_reverse and "  \u{2713}" or ""),
-                            align    = "left",
-                            enabled  = not cur_reverse,
-                            callback = function()
-                                set_tags_global_reverse(true)
-                                UIManager:close(order_dialog)
-                            end,
-                        }},
-                    },
-                }
-                UIManager:show(order_dialog)
-            end,
-        }})
-        sort_dialog = ButtonDialog:new{
-            title       = _("Sort books by"),
-            title_align = "center",
-            buttons     = sort_buttons,
-        }
-        UIManager:show(sort_dialog)
-        return
-    end
-
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local UIManager = require("ui/uimanager")
     local ok_fm, FM = pcall(require, "apps/filemanager/filemanager")
     local fm = ok_fm and FM and FM.instance
     if not fm then return end
 
     local title = tab_id == "authors" and _("Sort authors")
-        or tab_id == "languages" and _("Sort languages") or _("Sort series")
+        or tab_id == "languages" and _("Sort languages")
+        or tab_id == "tags" and _("Tags") or _("Sort series")
 
-    fm.file_chooser:showSortOrderDialog({
-        title           = title,
-        current_reverse = get_group_reverse(tab_id),
-        on_select       = function(reverse)
-            set_group_reverse(tab_id, reverse)
-            if menu then
-                local ok, db = pcall(require, "common/db_bookinfo")
-                if ok then
-                    local groups
-                    if tab_id == "authors" then
-                        groups = db.getGroupedByAuthor()
-                    elseif tab_id == "languages" then
-                        groups = db.getGroupedByLanguage()
-                    elseif tab_id == "tags" then
-                        groups = db.getGroupedByTags()
-                    else
-                        groups = db.getGroupedBySeries()
-                    end
-                    menu.item_table = build_group_item_table(groups, tab_id)
-                    menu:updateItems()
-                end
-            end
+    local function rebuild()
+        if not menu then return end
+        local ok, db = pcall(require, "common/db_bookinfo")
+        if not ok then return end
+        local groups
+        if tab_id == "authors" then
+            groups = db.getGroupedByAuthor()
+        elseif tab_id == "languages" then
+            groups = db.getGroupedByLanguage()
+        elseif tab_id == "tags" then
+            groups = db.getGroupedByTags()
+        else
+            groups = db.getGroupedBySeries()
+        end
+        menu.item_table = build_group_item_table(groups, tab_id)
+        menu:updateItems()
+    end
+
+    if tab_id == "authors" then
+        local current = get_authors_collate()
+        local current_reverse = get_group_reverse(tab_id)
+        local sort_dialog
+        local buttons = author_sort.modeButtons(current, _, function(collate)
+            UIManager:close(sort_dialog)
+            set_authors_collate(collate)
+            rebuild()
+        end)
+        buttons[#buttons + 1] = {{
+            text = "\u{F0DC}  " .. _("Order") .. "  " .. submenu_arrow,
+            align = "left",
+            callback = function()
+                UIManager:close(sort_dialog)
+                fm.file_chooser:showSortOrderDialog({
+                    title = title,
+                    current_reverse = current_reverse,
+                    on_select = function(reverse)
+                        set_group_reverse(tab_id, reverse)
+                        rebuild()
+                    end,
+                })
+            end,
+        }}
+        sort_dialog = ButtonDialog:new{
+            title = title,
+            title_align = "center",
+            buttons = buttons,
+        }
+        UIManager:show(sort_dialog)
+        return
+    end
+
+    local current = get_group_collate(tab_id)
+    local current_reverse = get_group_reverse(tab_id)
+    local sort_dialog
+    local buttons = {}
+    local options = {
+        { key = "title", text = "\u{F031}  " .. _("Title") },
+        { key = "title_natural", text = "\u{F04BB}  " .. _("Title natural") },
+    }
+    for _i, option in ipairs(options) do
+        local active = current == option.key
+        buttons[#buttons + 1] = {{
+            text = option.text .. (active and "  \u{2713}" or ""),
+            align = "left",
+            enabled = not active,
+            callback = function()
+                UIManager:close(sort_dialog)
+                set_group_collate(tab_id, option.key)
+                rebuild()
+            end,
+        }}
+    end
+    buttons[#buttons + 1] = {{
+        text = "\u{F0DC}  " .. _("Order") .. "  " .. submenu_arrow,
+        align = "left",
+        callback = function()
+            UIManager:close(sort_dialog)
+            fm.file_chooser:showSortOrderDialog({
+                title = title,
+                current_reverse = current_reverse,
+                on_select = function(reverse)
+                    set_group_reverse(tab_id, reverse)
+                    rebuild()
+                end,
+            })
         end,
-    })
+    }}
+    sort_dialog = ButtonDialog:new{
+        title = title,
+        title_align = "center",
+        buttons = buttons,
+    }
+    UIManager:show(sort_dialog)
 end
 
 -------------------------------------------------------------------------------
@@ -766,9 +784,37 @@ local function sortDetailFiles(files, collate, reverse)
     return sorted
 end
 
--- Filter a file list to only those matching FileChooser.show_filter.status.
--- Returns the original list unchanged when no filter is active.
-local function apply_status_filter(files)
+local function group_tag_book_items(items, tab_id)
+    local cfg = tab_id == "tags" and load_zen_config()
+    if not (cfg and cfg.features and cfg.features.automatic_series_grouping ~= false) then
+        return items
+    end
+    local file_paths, by_path = {}, {}
+    for _i, item in ipairs(items) do
+        file_paths[#file_paths + 1] = item.path
+        by_path[item.path] = item
+    end
+    local db = require("common/db_bookinfo")
+    local grouped = db.groupPathsBySeries(file_paths, db.getLightMetadata())
+    local result = {}
+    for _i, entry in ipairs(grouped) do
+        if type(entry) == "table" then
+            result[#result + 1] = {
+                text = entry.series,
+                mandatory = tostring(#entry.files) .. " \u{F016}",
+                _zen_files = entry.files,
+                is_series_group = true,
+            }
+        else
+            result[#result + 1] = by_path[entry]
+        end
+    end
+    return result
+end
+
+-- Status-scoped tabs already define their own filter.
+local function apply_status_filter(files, tab_id)
+    if tab_id == "status" or tab_id == "to_be_read" then return files end
     local ok_fc, FileChooser = pcall(require, "ui/widget/filechooser")
     if not ok_fc then return files end
     local status_filter = FileChooser.show_filter and FileChooser.show_filter.status
@@ -792,6 +838,7 @@ end
 -- menu: the Menu instance to refresh after sort change
 -- files: list of file paths
 -------------------------------------------------------------------------------
+local showDetailView
 local function showDetailSortDialog(group_name, tab_id, menu, files, reload_files)
     local _ = require("gettext")
     local ButtonDialog = require("ui/widget/buttondialog")
@@ -822,7 +869,7 @@ local function showDetailSortDialog(group_name, tab_id, menu, files, reload_file
 
         local sorted_files = reload_files and reload_files(collate, reverse)
             or sortDetailFiles(files, collate, reverse)
-        sorted_files = apply_status_filter(sorted_files)
+        sorted_files = apply_status_filter(sorted_files, tab_id)
 
         local lfs_mod  = require("libs/libkoreader-lfs")
         local util_mod = require("util")
@@ -841,6 +888,7 @@ local function showDetailSortDialog(group_name, tab_id, menu, files, reload_file
             })
         end
 
+        book_items = group_tag_book_items(book_items, tab_id)
         if should_show_up_folder() then
             table.insert(book_items, 1, { text = "\u{2B06} ..", is_go_up = true, mandatory = "" })
         end
@@ -869,7 +917,7 @@ local function showDetailSortDialog(group_name, tab_id, menu, files, reload_file
 
     -- Order submenu
     table.insert(sort_buttons, {{
-        text     = "\u{F0DC}  " .. _("Order") .. "  ▶",
+        text     = "\u{F0DC}  " .. _("Order") .. "  " .. submenu_arrow,
         align    = "left",
         callback = function()
             UIManager:close(sort_dialog)
@@ -896,6 +944,16 @@ local function showDetailSortDialog(group_name, tab_id, menu, files, reload_file
                     end,
                 }},
             }
+            if tab_id == "to_be_read" then
+                order_buttons[#order_buttons + 1] = {{
+                    text = "\u{F0DC}  " .. _("Order TBR"),
+                    align = "left",
+                    callback = function()
+                        UIManager:close(order_dialog)
+                        require("common/tbr_index").showOrder({ plugin = _zen_plugin })
+                    end,
+                }}
+            end
             order_dialog = ButtonDialog:new{
                 title       = _("Sort order"),
                 title_align = "center",
@@ -979,11 +1037,12 @@ end
 -- showDetailView: book list for one author/series group
 -- Called from onMenuSelect on the group list menu
 -------------------------------------------------------------------------------
-local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
+showDetailView = function(group_item, injectNavbar, tab_id, navbar_tab_id)
     local _ = require("gettext")
     local UIManager = require("ui/uimanager")
 
-    local files      = group_item._zen_files or {}
+    local files      = type(group_item._zen_load_files) == "function"
+        and group_item._zen_load_files() or group_item._zen_files or {}
     local group_name = group_item.text or ""
     local detail_name
     if tab_id == "authors" then
@@ -992,8 +1051,10 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
         detail_name = "languages_detail"
     elseif tab_id == "tags" then
         detail_name = "tags_detail"
-    else
+    elseif tab_id == "series" then
         detail_name = "series_detail"
+    else
+        detail_name = tab_id .. "_detail"
     end
     for _i, active_menu in ipairs(_detail_menus) do
         if active_menu.name == detail_name then
@@ -1018,7 +1079,7 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
 
     -- Sort files based on current settings
     local sorted_files = sortDetailFiles(files, cur_collate, cur_reverse)
-    sorted_files = apply_status_filter(sorted_files)
+    sorted_files = apply_status_filter(sorted_files, tab_id)
 
     -- Build menu items from sorted files
     local lfs_mod  = require("libs/libkoreader-lfs")
@@ -1037,6 +1098,7 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
             mandatory = attr and util_mod.getFriendlySize(attr.size or 0) or "",
         })
     end
+    book_items = group_tag_book_items(book_items, tab_id)
     if #book_items == 0 then
         table.insert(book_items, {
             text                   = group_empty_message(tab_id),
@@ -1049,7 +1111,8 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
         table.insert(book_items, 1, { text = "\u{2B06} ..", is_go_up = true, mandatory = "" })
     end
 
-    local detail_menu = StandalonePage.create_menu{
+    local detail_menu
+    detail_menu = StandalonePage.create_menu{
         name = detail_name,
         title = group_name,
         item_table = book_items,
@@ -1057,6 +1120,17 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
             if item.is_go_up then
                 if menu_self.close_callback then menu_self.close_callback()
                 else UIManager:close(menu_self) end
+                return
+            end
+            if item.is_series_group then
+                local series_menu = showDetailView(
+                    item, injectNavbar, "series", navbar_tab_id or tab_id)
+                if series_menu then
+                    series_menu._zen_restore_parent = {
+                        group_name = group_name,
+                        page = menu_self.page,
+                    }
+                end
                 return
             end
             if item.path then
@@ -1072,7 +1146,21 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
         end,
         onMenuHold = function(menu_self, item)
             if show_select_mode_menu() then return true end
+            if item.is_series_group then
+                return M.showGroupContextMenu(item.text, item._zen_files,
+                    "series", menu_self)
+            end
             if not item.path then return end
+            local ok_kindle, Kindle = pcall(require,
+                "modules/filebrowser/patches/kindle_virtual_library")
+            if ok_kindle and type(Kindle.isBookPath) == "function"
+                    and Kindle.isBookPath(item.path)
+                    and type(Kindle.showBookContextMenu) == "function"
+                    and Kindle.showBookContextMenu(menu_self, item, function()
+                        menu_self:updateItems()
+                    end) then
+                return true
+            end
             local fm = get_file_manager()
             if fm and fm.file_chooser and fm.file_chooser.showFileDialog then
                 show_file_dialog_with_refresh(fm.file_chooser, menu_self, {
@@ -1082,6 +1170,11 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
                     _zen_select_cb = function()
                         return toggle_file_selection(menu_self, item)
                     end,
+                    _zen_after_status_change = group_item._zen_load_files and function(path)
+                        fm.file_chooser:refreshPath(path)
+                        detail_menu.close_callback()
+                        showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
+                    end or nil,
                 })
             end
         end,
@@ -1089,8 +1182,8 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
     }
     StandalonePage.prepare_shell(detail_menu)
 
-    -- Install same display mode as the library (mosaic/list/classic)
-    local mode_type = setup_display_mode(detail_menu, false, tab_id)
+    -- Install this group's display mode (mosaic/list/classic)
+    local mode_type = setup_display_mode(detail_menu, false, tab_id, group_name)
     if mode_type == "classic" or not mode_type then
         local Menu_class = require("ui/widget/menu")
         detail_menu.updateItems = Menu_class.updateItems
@@ -1120,7 +1213,7 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
             parent = _languages_menu
         elseif tab_id == "tags" then
             parent = _tags_menu
-        else
+        elseif tab_id == "series" then
             parent = _series_menu
         end
         if parent then
@@ -1128,7 +1221,7 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
             if tab_id == "authors" then _authors_menu = nil
             elseif tab_id == "languages" then _languages_menu = nil
             elseif tab_id == "tags" then _tags_menu = nil
-            else _series_menu = nil end
+            elseif tab_id == "series" then _series_menu = nil end
         end
     end
 
@@ -1170,12 +1263,12 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
                 fm.file_chooser:showFileDialog({
                     _zen_group_files       = sorted_files,
                     _zen_group_name        = group_name,
-                    _zen_is_folder_view    = true,
+                    _zen_is_folder_view    = tab_id ~= "status",
                     _zen_sort_cb           = function()
                         showDetailSortDialog(group_name, tab_id, self, files)
                     end,
                     _zen_display_cb        = function()
-                        showDisplayModeDialog(self, tab_id)
+                        showDisplayModeDialog(self, tab_id, group_name)
                     end,
                     _zen_filter_refresh_cb = function()
                         -- Rebuild item_table with new filter: close and reopen.
@@ -1196,15 +1289,7 @@ local function showDetailView(group_item, injectNavbar, tab_id, navbar_tab_id)
             _G.__ZEN_UI_LIBRARY_STATE = nil
         end
         detail_menu:updateItems()
-        -- Re-inject status row after updateItems (it may reset title_group).
-        local createSR2   = _zen_shared and _zen_shared.createStatusRowCustomBack
-        local repaintTB2  = _zen_shared and _zen_shared.repaintTitleBar
-        local tb2 = detail_menu.title_bar
-        if tb2 and createSR2 and tb2.title_group and #tb2.title_group >= 2 then
-            tb2.title_group[2] = createSR2(back_to_group, group_name)
-            tb2.title_group:resetLayout()
-            if repaintTB2 then repaintTB2(tb2) end
-        end
+        if detail_menu._zen_status_refresh then detail_menu:_zen_status_refresh() end
     end)
     return detail_menu, true
 end
@@ -1230,7 +1315,7 @@ function M.showGroupContextMenu(group_name, files, tab_id, menu, options)
             showDetailSortDialog(group_name, tab_id, nil, files)
         end or nil,
         _zen_display_cb = not hide_actions and function()
-            showDisplayModeDialog(menu, tab_id)
+            showDisplayModeDialog(menu, tab_id, group_name)
         end or nil,
     })
     return true
@@ -1255,7 +1340,7 @@ function M.showSourceContextMenu(tab_id, menu, options)
                 collate = get_detail_collate(tab_id, tab_id, "title"),
                 reverse = get_detail_reverse(tab_id, tab_id, false),
             })
-            files = apply_status_filter(files)
+            files = apply_status_filter(files, tab_id)
         end
         local count = tonumber(options.item_count) or #files
         fm.file_chooser:showFileDialog({
@@ -1436,16 +1521,7 @@ showGroupView = function(tab_id, injectNavbar, groups)
             _G.__ZEN_UI_LIBRARY_STATE = nil
         end
         menu:updateItems()
-        -- Re-inject status row after updateItems (it may reset title_group).
-        local createSR2 = _zen_shared and _zen_shared.createStatusRow
-        local repaintTB2 = _zen_shared and _zen_shared.repaintTitleBar
-        local tb2 = menu.title_bar
-        if tb2 and createSR2 and tb2.title_group and #tb2.title_group >= 2 then
-            local FileManager2 = require("apps/filemanager/filemanager")
-            tb2.title_group[2] = createSR2(nil, FileManager2.instance)
-            tb2.title_group:resetLayout()
-            if repaintTB2 then repaintTB2(tb2) end
-        end
+        if menu._zen_status_refresh then menu:_zen_status_refresh() end
         -- Re-open the specific group folder that was open before reader.
         -- Guard: showFiles post-hook may have already opened it synchronously.
         if restore_detail then
@@ -1519,14 +1595,30 @@ function M.showTagDetail(tag_name, injectNavbar, navbar_tab_id)
         { text = tag_name, _zen_files = files }, injectNavbar, "tags", navbar_tab_id)
 end
 
+function M.showStatusView(status, label, injectNavbar, navbar_tab_id)
+    if type(status) ~= "string" or status == "" then return end
+    refresh_shared_state()
+    local ok, index = pcall(require, "common/tbr_index")
+    if not ok or type(index.getByStatuses) ~= "function" then return end
+    return showDetailView({
+        text = label or status,
+        _zen_load_files = function()
+            return index.getByStatuses({ [status] = true })
+        end,
+    }, injectNavbar, "status", navbar_tab_id)
+end
+
 -------------------------------------------------------------------------------
 -- M.showTBRView: flat view of the To Be Read collection plus optional new books
 -------------------------------------------------------------------------------
 function M.showTBRView(injectNavbar)
-    if _tbr_menu then return _tbr_menu, false end
-    refresh_shared_state()
     local _          = require("gettext")
     local UIManager  = require("ui/uimanager")
+    if _tbr_menu then
+        if UIManager:isWidgetShown(_tbr_menu) then return _tbr_menu, false end
+        _tbr_menu = nil
+    end
+    refresh_shared_state()
 
     local tab_id     = "to_be_read"
     local SORT_GROUP = "to_be_read"
@@ -1544,7 +1636,7 @@ function M.showTBRView(injectNavbar)
             collate = cur_collate,
             reverse = cur_reverse,
         })
-        return apply_status_filter(loaded)
+        return apply_status_filter(loaded, tab_id)
     end
 
     local files = loadFiles()
@@ -1552,6 +1644,8 @@ function M.showTBRView(injectNavbar)
     local buildItems
 
     local function refreshCollectionView()
+        cur_collate = get_detail_collate(tab_id, SORT_GROUP, "title")
+        cur_reverse = get_detail_reverse(tab_id, SORT_GROUP, false)
         tbr_index.collectionChanged(tbr_index.collectionName())
         files = loadFiles()
         if menu then
@@ -1645,6 +1739,7 @@ function M.showTBRView(injectNavbar)
 
     -- Tag TBR as a library menu for Zen's renderer and preload pipeline.
     menu._zen_tab_id = tab_id
+    menu._zen_tbr_refresh = refreshCollectionView
 
     local mode_type = setup_display_mode(menu, true, tab_id)
     if mode_type == "classic" or not mode_type then
@@ -1717,17 +1812,20 @@ function M.showTBRView(injectNavbar)
             _G.__ZEN_UI_LIBRARY_STATE = nil
         end
         menu:updateItems()
-        local createSR2  = _zen_shared and _zen_shared.createStatusRow
-        local repaintTB2 = _zen_shared and _zen_shared.repaintTitleBar
-        local tb2 = menu.title_bar
-        if tb2 and createSR2 and tb2.title_group and #tb2.title_group >= 2 then
-            local FileManager2 = require("apps/filemanager/filemanager")
-            tb2.title_group[2] = createSR2(nil, FileManager2.instance)
-            tb2.title_group:resetLayout()
-            if repaintTB2 then repaintTB2(tb2) end
-        end
+        if menu._zen_status_refresh then menu:_zen_status_refresh() end
     end)
     return menu, true
+end
+
+function M.refreshTBRView()
+    local UIManager = require("ui/uimanager")
+    if not (_tbr_menu and UIManager:isWidgetShown(_tbr_menu)
+            and type(_tbr_menu._zen_tbr_refresh) == "function") then
+        _tbr_menu = nil
+        return false
+    end
+    _tbr_menu._zen_tbr_refresh()
+    return true
 end
 
 -- Open a detail view synchronously by group name (used by navbar.showFiles post-hook).
@@ -1756,6 +1854,13 @@ end
 function M.getActiveDetail()
     if #_detail_menus > 0 then
         local m = _detail_menus[#_detail_menus]
+        if m._zen_restore_parent then
+            return {
+                group_name = m._zen_restore_parent.group_name,
+                tab_id = "tags",
+                page = m._zen_restore_parent.page or 1,
+            }
+        end
         return { group_name = m._zen_group_name, tab_id = m._zen_tab_id, page = m.page or 1 }
     end
 end
@@ -1778,8 +1883,8 @@ end
 -- Close all open group/detail menus to prevent UIManager stack pollution
 function M.closeAll()
     local UIManager2 = require("ui/uimanager")
-    for _i, m in ipairs(_detail_menus) do
-        UIManager2:close(m)
+    for index = #_detail_menus, 1, -1 do
+        UIManager2:close(_detail_menus[index])
     end
     _detail_menus = {}
     if _authors_menu then UIManager2:close(_authors_menu); _authors_menu = nil end

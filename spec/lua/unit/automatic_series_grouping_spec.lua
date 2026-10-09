@@ -5,7 +5,9 @@ describe("automatic series grouping patch", function()
     local original_select_calls
     local cached_rows
     local doc_props_lookups
+    local directory_prefetches
     local original_refresh_calls
+    local statuses
 
     local function item(path, title, access)
         return {
@@ -35,7 +37,9 @@ describe("automatic series grouping patch", function()
         original_select_calls = 0
         cached_rows = {}
         doc_props_lookups = 0
+        directory_prefetches = 0
         original_refresh_calls = 0
+        statuses = {}
         G_reader_settings = ZenSpec.memorySettings({
             reverse_collate = false,
             collate_mixed = false,
@@ -43,7 +47,7 @@ describe("automatic series grouping patch", function()
         })
         _G.__ZEN_UI_PLUGIN = {
             config = {
-                features = { automatic_series_grouping = true },
+                features = { automatic_series_grouping = true, hide_grouped_series = false },
                 browser_cover_badges = { dim_finished_books = false },
             },
         }
@@ -102,6 +106,7 @@ describe("automatic series grouping patch", function()
         })
         ZenSpec.replace("bookinfomanager", {
             openDbConnection = function(self)
+                directory_prefetches = directory_prefetches + 1
                 self.db_conn = {
                     prepare = function()
                         local position = 0
@@ -124,6 +129,9 @@ describe("automatic series grouping patch", function()
                 doc_props_lookups = doc_props_lookups + 1
                 return metadata[path]
             end,
+        })
+        ZenSpec.replace("common/book_status", {
+            getDisplayStatusFromFile = function(path) return statuses[path] or "new" end,
         })
         ZenSpec.replace("apps/filemanager/filemanager", {
             instance = { _updateStatusBar = function(self) self.updated = true end },
@@ -260,8 +268,10 @@ describe("automatic series grouping patch", function()
                 nil, nil, nil, nil, 104, "Loose", "Zen Author", nil, nil, "en", "" },
         }
         local fc = chooser()
+        alpha.doc_props = { title = "Alpha", series = "Series A", series_index = 1 }
 
-        FileChooser.switchItemTable(fc, nil, { finale, loose, alpha, no_cover })
+        local items = { alpha, finale, loose, no_cover }
+        FileChooser.switchItemTable(fc, nil, items)
 
         assert.are.equal(2, #fc.item_table)
         local group = fc.item_table[1]
@@ -269,6 +279,12 @@ describe("automatic series grouping patch", function()
         assert.are.same({ alpha, no_cover, finale }, group.series_items)
         assert.are.equal("Alpha", alpha.doc_props.title)
         assert.are.equal("Zen Author", finale.doc_props.authors)
+        assert.are.equal(0, doc_props_lookups)
+        assert.are.equal(1, directory_prefetches)
+
+        FileChooser.switchItemTable(fc, nil, items)
+        assert.are.same({ alpha, no_cover, finale }, fc.item_table[1].series_items)
+        assert.are.equal(1, directory_prefetches)
         assert.are.equal(0, doc_props_lookups)
     end)
 
@@ -282,6 +298,62 @@ describe("automatic series grouping patch", function()
         FileChooser.switchItemTable(fc, nil, { first, second })
 
         assert.are.same({ first, second }, fc.item_table)
+    end)
+
+    it("hides a series group when none of its books match the status filter", function()
+        local first = item("/library/One.epub", "One")
+        local second = item("/library/Two.epub", "Two")
+        local reading = item("/library/Reading.epub", "Reading")
+        metadata[first.path] = { series = "Finished", series_index = 1 }
+        metadata[second.path] = { series = "Finished", series_index = 2 }
+        statuses[first.path] = "complete"
+        statuses[second.path] = "complete"
+        statuses[reading.path] = "reading"
+        FileChooser.show_filter = { status = { reading = true } }
+        local fc = chooser()
+
+        FileChooser.switchItemTable(fc, nil, { first, second, reading })
+
+        assert.are.same({ reading }, fc.item_table)
+    end)
+
+    it("hides multi-book grouped series while retaining loose and single-series books", function()
+        local first = item("/library/One.epub", "One")
+        local second = item("/library/Two.epub", "Two")
+        local single = item("/library/Single.epub", "Single")
+        local loose = item("/library/Loose.epub", "Loose")
+        local folder = { text = "Folder", path = "/library/Folder", is_directory = true,
+            attr = { mode = "directory" } }
+        local up = { text = "..", is_go_up = true, is_directory = true,
+            attr = { mode = "directory" } }
+        metadata[first.path] = { series = "Saga", series_index = 1 }
+        metadata[second.path] = { series = "Saga", series_index = 2 }
+        metadata[single.path] = { series = "Solo", series_index = 1 }
+        _G.__ZEN_UI_PLUGIN.config.features.hide_grouped_series = true
+        local fc = chooser()
+
+        FileChooser.switchItemTable(fc, nil, { up, first, second, single, loose, folder })
+
+        assert.are.equal(4, #fc.item_table)
+        local visible = {}
+        for _i, entry in ipairs(fc.item_table) do visible[entry] = true end
+        assert.is_true(visible[loose])
+        assert.is_true(visible[folder])
+        assert.is_true(visible[single])
+        assert.is_true(visible[up])
+    end)
+
+    it("hides the only series in a folder", function()
+        local first = item("/library/One.epub", "One")
+        local second = item("/library/Two.epub", "Two")
+        metadata[first.path] = { series = "Only", series_index = 1 }
+        metadata[second.path] = { series = "Only", series_index = 2 }
+        _G.__ZEN_UI_PLUGIN.config.features.hide_grouped_series = true
+        local fc = chooser()
+
+        FileChooser.switchItemTable(fc, nil, { first, second })
+
+        assert.are.same({}, fc.item_table)
     end)
 
     it("does not add virtual folders to path picker dialogs", function()

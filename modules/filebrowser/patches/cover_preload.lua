@@ -15,6 +15,7 @@ local function apply_cover_preload()
     local render_cache = require("common/cover_render_cache")
     local memory_policy = require("common/memory_policy")
     local CoverUtils = require("common/cover_utils")
+    local FolderCoverFiles = require("common/folder_cover_files")
     local FolderCover = require("modules/filebrowser/folder_cover")
     local zen_logger = require("common/zen_logger")
     local logger = zen_logger.new("cover_preload")
@@ -147,6 +148,23 @@ local function apply_cover_preload()
                     or widget._zen_home_show_status_bar ~= nil) then
                 return true
             end
+        end
+        return false
+    end
+
+    local function fullscreen_overlay_covers_filemanager(menu)
+        local parent = menu and menu.show_parent
+        local stack = UIManager._window_stack
+        if not parent or type(stack) ~= "table" then return false end
+        local parent_index
+        for index = 1, #stack do
+            local widget = stack[index] and stack[index].widget
+            if widget == parent or widget == menu then parent_index = index end
+        end
+        if not parent_index then return false end
+        for index = parent_index + 1, #stack do
+            local widget = stack[index] and stack[index].widget
+            if widget and widget.covers_fullscreen then return true end
         end
         return false
     end
@@ -387,6 +405,10 @@ local function apply_cover_preload()
     local function defer_extraction_launch(menu, original, ...)
         local original_nextTick = UIManager.nextTick
         UIManager.nextTick = function(ui, fn, ...)
+            local files_to_index = get_upvalue(fn, "files_to_index")
+            if type(files_to_index) ~= "table" then
+                return original_nextTick(ui, fn, ...)
+            end
             local args = { ... }
             return original_nextTick(ui, function()
                 local queued_at = now()
@@ -567,6 +589,17 @@ local function apply_cover_preload()
         return region, grid
     end
 
+    local function kindle_color_light_mode()
+        return Device.isKindle and Device:isKindle()
+            and Device.hasColorScreen and Device:hasColorScreen()
+            and Device.screen and not Device.screen.night_mode
+    end
+
+    local function cover_refresh_dither(dither)
+        -- TODO: remove once upstream fixes https://github.com/koreader/koreader/issues/14729.
+        return dither and not kindle_color_light_mode()
+    end
+
     local function call_with_scoped_dirty(menu, region, reveal, fn, ...)
         local args = { ... }
         local original_setDirty = UIManager.setDirty
@@ -578,7 +611,7 @@ local function apply_cover_preload()
                     local original_refresh = refreshtype
                     refreshtype = function()
                         local refresh = { original_refresh() }
-                        return refresh[1], region, refresh[3]
+                        return refresh[1], region, cover_refresh_dither(refresh[3])
                     end
                 end
                 if reveal then
@@ -637,13 +670,14 @@ local function apply_cover_preload()
             refresh_dither = refresh_dither or dither == true
         end
         local combined_refresh = #reveal.dirty_calls > 0 and menu.show_parent ~= nil
+            and not fullscreen_overlay_covers_filemanager(menu)
         if combined_refresh then
-            if hydrated > 0 then menu.show_parent.dithered = true end
+            menu.show_parent.dithered = cover_refresh_dither(hydrated > 0 or menu.show_parent.dithered)
             local final_region = copy_region(reveal.refresh_region)
             if not final_region and not full_region then final_region = refresh_region end
             UIManager:setDirty(menu.show_parent, function()
-                return refresh_mode or "ui", final_region,
-                    refresh_dither or hydrated > 0
+                local dither = refresh_dither or hydrated > 0 or menu.show_parent.dithered == true
+                return refresh_mode or "ui", final_region, cover_refresh_dither(dither)
             end)
         end
         local revealed_at = now()
@@ -695,7 +729,8 @@ local function apply_cover_preload()
     local function submit_hydration_refresh(menu, generation, region, hydrated, failed)
         if not (region and menu.show_parent)
                 or menu._zen_cover_hydration_generation ~= generation
-                or cover_work_block_reason(menu) then
+                or cover_work_block_reason(menu)
+                or fullscreen_overlay_covers_filemanager(menu) then
             return false
         end
         -- Extraction waves are accumulated before this point; never add a
@@ -708,15 +743,21 @@ local function apply_cover_preload()
             return false
         end
         menu._zen_cover_refresh_submitted_generation = generation
-        if hydrated > 0 then menu.show_parent.dithered = true end
+        menu.show_parent.dithered = cover_refresh_dither(hydrated > 0 or menu.show_parent.dithered)
+        local full_color_refresh = hydrated > 0
+            and Device.hasColorScreen and Device:hasColorScreen()
+            and not (Device.isKobo and Device:isKobo())
+            and not kindle_color_light_mode()
+        local refresh_region = region
+        if full_color_refresh then refresh_region = nil end
         UIManager:setDirty(menu.show_parent, function()
             local refreshtype = BookInfoManager:getSetting("flash_ui_cover_images")
                 and "flashui" or "ui"
-            return refreshtype, region, hydrated > 0
+            return refreshtype, refresh_region, cover_refresh_dither(hydrated > 0)
         end)
         local full_area = menu.dimen and menu.dimen.w and menu.dimen.h
             and menu.dimen.w * menu.dimen.h or 0
-        local region_pct = full_area > 0
+        local region_pct = full_color_refresh and 100 or full_area > 0
             and math.floor(region.w * region.h * 1000 / full_area + 0.5) / 10 or 100
         local revealed_at = menu._zen_cover_initial_reveal_generation == generation
             and menu._zen_cover_initial_reveal_at or nil
@@ -1052,7 +1093,7 @@ local function apply_cover_preload()
             state.processed = state.processed + 1
             if ok and item._has_cover_image then
                 state.warmed = state.warmed + 1
-                if menu.show_parent then menu.show_parent.dithered = true end
+                if menu.show_parent then menu.show_parent.dithered = cover_refresh_dither(true) end
             else
                 state.failed = state.failed + 1
                 item._zen_cover_hydration_queued = true
@@ -1304,10 +1345,16 @@ local function apply_cover_preload()
             deferred_stack_jobs)
         if folder_max_covers <= 0 or not FolderCover.isSupported(item, menu) then return end
         if max_jobs and #jobs + #gallery_jobs >= max_jobs then return end
+        local virtual = item._zen_files or item.series_items or item.is_series_group
+            or (menu and menu._zen_coll_list and item.name)
+        if not virtual and type(item.path) == "string"
+                and FolderCoverFiles.has(item.path, folder_mode) then
+            return
+        end
         local entries, physical, count, descriptor_cache_hit, enumeration_ms,
             descriptor_exact =
             FolderCover.previewEntries(menu, item, folder_max_covers)
-        if folder_mode == "gallery" and #entries > 0 then
+        if folder_mode == "gallery" and #entries > 1 then
             gallery_jobs[#gallery_jobs + 1] = {
                 kind = "gallery",
                 menu = menu,
@@ -1330,6 +1377,8 @@ local function apply_cover_preload()
             }
             return
         end
+        local full_size_preview = folder_mode == "normal" or folder_mode == "stack"
+            or #entries == 1
         for entry_index = 1, #entries do
             if max_jobs and #jobs + #gallery_jobs >= max_jobs then break end
             local grouped_item = entries[entry_index]
@@ -1347,9 +1396,8 @@ local function apply_cover_preload()
                 height = job_height,
                 render_width = folder_render_w,
                 render_height = folder_render_h,
-                final_render = folder_mode == "normal" or folder_mode == "stack",
-                preserve_aspect = (folder_mode == "normal" or folder_mode == "stack")
-                    and preserve_aspect,
+                final_render = full_size_preview,
+                preserve_aspect = full_size_preview and preserve_aspect,
             }
             if folder_mode == "stack" and entry_index > 1
                     and type(deferred_stack_jobs) == "table" then
@@ -2070,12 +2118,6 @@ local function apply_cover_preload()
 
     local function measured_updateItems(menu, original, ...)
         if menu._zen_cover_measure_active then return original(menu, ...) end
-        cancel_cover_page_warm(menu, "page_update")
-        cancel(menu)
-        cancel_hydration(menu)
-        cancel_extraction_launch(menu)
-        menu._zen_cover_hydration_generation =
-            (menu._zen_cover_hydration_generation or 0) + 1
         menu._zen_request_cover_hydration = schedule_hydration
         menu._zen_resume_visible_cover_work = resume_visible_cover_work
         menu._zen_start_hidden_folder_prewarm = start_hidden_folder_prewarm
@@ -2136,6 +2178,10 @@ local function apply_cover_preload()
                 menu, refresh_region, reveal, defer_extraction_launch, menu, original, ...)
         else
             result = defer_extraction_launch(menu, original, ...)
+        end
+        -- UIManager inherits this hint before it runs refresh callbacks.
+        if menu.show_parent then
+            menu.show_parent.dithered = cover_refresh_dither(menu.show_parent.dithered)
         end
         local resolved_region, current_grid = page_refresh_region(menu, previous_grid)
         menu._zen_cover_last_grid_region = current_grid
@@ -2296,16 +2342,64 @@ local function apply_cover_preload()
         return result
     end
 
+    local function cancel_page_update(menu)
+        if menu._zen_cover_page_update_fn then
+            UIManager:unschedule(menu._zen_cover_page_update_fn)
+            menu._zen_cover_page_update_fn = nil
+        end
+    end
+
+    local function updateItems(menu, original, ...)
+        if menu._zen_cover_measure_active then return original(menu, ...) end
+        cancel_page_update(menu)
+        cancel_cover_page_warm(menu, "page_update")
+        cancel(menu)
+        cancel_hydration(menu)
+        cancel_extraction_launch(menu)
+        menu._zen_cover_hydration_generation =
+            (menu._zen_cover_hydration_generation or 0) + 1
+        if not (menu._zen_cover_turn_active and menu.display_mode_type == "mosaic"
+                and menu.show_parent and not cover_work_block_reason(menu)) then
+            return measured_updateItems(menu, original, ...)
+        end
+        -- Coalesce this input batch without delaying a single page turn.
+        local args = table.pack(...)
+        local turn_measure = menu._zen_cover_turn_measure
+        local direct_jump = menu._zen_cover_direct_jump_active
+        local update
+        update = function()
+            if menu._zen_cover_page_update_fn ~= update then return end
+            local input = Device.input
+            local detector = input and input.gesture_detector
+            for _k, contact in pairs(detector and detector.active_contacts or {}) do
+                if contact.down then
+                    -- Let the next tap/swipe finish before committing this page.
+                    UIManager:scheduleIn(0.05, update)
+                    return
+                end
+            end
+            menu._zen_cover_page_update_fn = nil
+            menu._zen_cover_turn_active = true
+            menu._zen_cover_direct_jump_active = direct_jump
+            menu._zen_cover_turn_measure = turn_measure
+            measured_updateItems(menu, original, unpack(args, 1, args.n))
+            menu._zen_cover_direct_jump_active = nil
+            menu._zen_cover_turn_active = nil
+        end
+        menu._zen_cover_page_update_fn = update
+        UIManager:scheduleIn(0, update)
+    end
+
     local original_updateItems = CoverMenu.updateItems
     CoverMenu.updateItems = function(menu, ...)
-        return measured_updateItems(menu, original_updateItems, ...)
+        return updateItems(menu, original_updateItems, ...)
     end
 
     local original_filechooser_updateItems = FileChooser.updateItems
     if original_filechooser_updateItems ~= original_updateItems then
         FileChooser.updateItems = function(menu, ...)
             if menu._updateItemsBuildUI and menu.display_mode_type then
-                return measured_updateItems(menu, original_filechooser_updateItems, ...)
+                return updateItems(menu, original_filechooser_updateItems, ...)
             end
             return original_filechooser_updateItems(menu, ...)
         end
@@ -2379,6 +2473,7 @@ local function apply_cover_preload()
 
     local original_onCloseWidget = CoverMenu.onCloseWidget
     local function onCloseWidget(menu, ...)
+        cancel_page_update(menu)
         cancel_cover_page_warm(menu, "menu_closed")
         cancel(menu)
         cancel_hydration(menu)

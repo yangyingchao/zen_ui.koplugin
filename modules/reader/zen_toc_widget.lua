@@ -24,7 +24,7 @@ local Geom           = require("ui/geometry")
 local IconWidget     = require("ui/widget/iconwidget")
 local TextWidget     = require("ui/widget/textwidget")
 local UIManager      = require("ui/uimanager")
-local DataStorage    = require("datastorage")
+local lfs            = require("libs/libkoreader-lfs")
 local Screen         = Device.screen
 local pager          = require("common/ui/zen_pager")
 local LibraryFont    = require("modules/filebrowser/patches/library_font")
@@ -34,7 +34,7 @@ local utils          = require("common/utils")
 local _              = require("gettext")
 
 local function resolve_stock_icon(name)
-    return utils.resolveLocalIcon(DataStorage:getDataDir() .. "/resources/icons/mdlight/", name)
+    return utils.resolveLocalIcon(lfs.currentdir() .. "/resources/icons/mdlight/", name)
 end
 
 local BACK_ICON_PATH = resolve_stock_icon("chevron.left")
@@ -106,6 +106,7 @@ local ZenTocWidget = InputContainer:extend{
     on_goto    = nil,   -- callback(page_num) when entry tapped
     close_all_callback = nil,
     focus_page = 1,     -- current page; used to highlight active chapter
+    font_size  = nil,
 }
 
 function ZenTocWidget:init()
@@ -150,8 +151,9 @@ function ZenTocWidget:init()
     end
     self._entries = entries
 
-    local reader_font_size = ReaderFont.getInfo(self.ui, 18).size
-    self._text_face = LibraryFont.getFace(reader_font_size)
+    local text_font_size = tonumber(self.font_size)
+        or ReaderFont.getInfo(self.ui, 18).size
+    self._text_face = LibraryFont.getFace(text_font_size)
 
     -- -----------------------------------------------------------------------
     -- Layout constants (all screen-scaled)

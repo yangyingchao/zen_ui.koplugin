@@ -6,15 +6,19 @@
 
 local JSON = require("json")
 local _ = require("gettext")
-local logger = require("common/zen_logger").new("zen_bugreporter")
+local ZenLogger = require("common/zen_logger")
+local logger = ZenLogger.new("zen_bugreporter")
 local UIManager = require("ui/uimanager")
 local restart = require("common/restart")
 local zen_utils = require("common/utils")
 local updater = require("modules/settings/zen_updater")
 
-local PROXY_URL       = "https://zen-reporter-dev.misty-mud-afb2.workers.dev/"
+local PROXY_URL       = "https://zen-reporter.misty-mud-afb2.workers.dev/"
 local UPLOAD_URL = PROXY_URL .. "upload"
 local MAX_CRASH_LOG = 60000
+local MAX_UPLOAD_LOG = 512000
+local MAX_NETWORK_LOG = 64000
+local MAX_BLUETOOTH_LOG = 24000
 local MAX_TITLE     = 500
 local MAX_BODY      = 65536
 
@@ -59,13 +63,44 @@ local function upload_crash_log(log_data)
     return nil
 end
 
---- Read the full content of a file. Returns string or nil.
+--- Read a bounded tail of the crash log, retaining earlier radio diagnostics.
 local function read_file_content(path)
     local f = io.open(path, "rb")
     if not f then return nil end
-    local data = f:read("*a")
+    local size = f:seek("end")
+    local network_log, bluetooth_log = "", ""
+    if size > MAX_CRASH_LOG then
+        f:seek("set", 0)
+        while f:seek() < size - MAX_CRASH_LOG - 3 do
+            local earlier_network = f:seek() < size - MAX_UPLOAD_LOG - 3
+            local line = f:read("*l")
+            if not line then break end
+            if line:lower():find("bluetooth", 1, true) or line:find("org.bluez", 1, true) then
+                bluetooth_log = zen_utils.utf8SafeSuffix(bluetooth_log .. line .. "\n", MAX_BLUETOOTH_LOG)
+            elseif earlier_network and (line:find("ZenOS: [network_switcher]", 1, true)
+                    or line:find("NetworkMgr:", 1, true)
+                    or line:find("WpaSupplicant:", 1, true)) then
+                network_log = zen_utils.utf8SafeSuffix(network_log .. line .. "\n", MAX_NETWORK_LOG)
+            end
+        end
+    end
+    local tail_size = size > MAX_UPLOAD_LOG
+        and MAX_UPLOAD_LOG - #network_log - #bluetooth_log or MAX_UPLOAD_LOG
+    f:seek("set", math.max(0, size - tail_size - 3))
+    local data = f:read(tail_size + 3)
     f:close()
-    return (data and data ~= "") and data or nil
+    if not data or data == "" then return nil end
+    if bluetooth_log ~= "" then
+        bluetooth_log = "[earlier bluetooth diagnostics]\n" .. bluetooth_log .. "\n"
+    end
+    if size > MAX_UPLOAD_LOG then
+        if network_log ~= "" then
+            network_log = "[earlier network diagnostics]\n" .. network_log .. "\n"
+        end
+        return bluetooth_log .. network_log .. "[truncated - showing last " .. tail_size .. " bytes of " .. size .. " total]\n"
+            .. zen_utils.utf8SafeSuffix(data, tail_size), bluetooth_log
+    end
+    return data, bluetooth_log
 end
 
 -- ---------------------------------------------------------------------------
@@ -112,9 +147,9 @@ end
 -- Network submission
 -- ---------------------------------------------------------------------------
 
-local function submit_issue(title, body)
+local function submit_issue(title, body, version)
     local labels = { "bug" }
-    if updater.get_channel() == "beta" then
+    if updater.get_channel() == "beta" or version:find("-alpha", 1, true) then
         labels[#labels + 1] = "beta"
     end
     local payload = JSON.encode({ title = title, body = body, labels = labels })
@@ -125,7 +160,7 @@ local function submit_issue(title, body)
 
     if code == 201 then
         local url = resp and resp:match('"url"%s*:%s*"([^"]+)"')
-        return url or "https://github.com/AnthonyGress/zen_ui.koplugin/issues"
+        return url or "https://github.com/xZenLabs/zen-os/issues"
     elseif code == 429 then
         return nil, _("Too many requests. Please try again later.")
     else
@@ -141,17 +176,25 @@ end
 -- ---------------------------------------------------------------------------
 
 function M.show_dialog(ctx)
+    local isolation_notice = _("Before reporting, please disable other plugins and patches to see if this is actually a ZenOS issue.")
     -- Require debug logging to be on so crash.log is useful.
-    if not (G_reader_settings and G_reader_settings:isTrue("debug_verbose")) then
+    if not (G_reader_settings
+            and G_reader_settings:isTrue("debug")
+            and G_reader_settings:isTrue("debug_verbose")) then
         local ConfirmBox = require("ui/widget/confirmbox")
         UIManager:show(ConfirmBox:new{
             text        = _("Debug logging must be enabled to submit bug reports.")
                        .. "\n\n"
-                       .. _("Enabling debug logging, restart required. Please reproduce the issue, then submit the report."),
+                       .. _("Enabling debug logging, restart required. Please reproduce the issue, then submit the report.")
+                       .. "\n\n" .. isolation_notice,
             ok_text     = _("Restart now"),
             cancel_text = _("Cancel"),
             ok_callback = function()
+                local dbg = require("dbg")
+                G_reader_settings:saveSetting("debug", true)
                 G_reader_settings:saveSetting("debug_verbose", true)
+                dbg:turnOn()
+                dbg:setVerbose(true)
                 G_reader_settings:flush()
                 restart.request()
             end,
@@ -173,7 +216,8 @@ function M.show_dialog(ctx)
 
     local ConfirmBox = require("ui/widget/confirmbox")
     UIManager:show(ConfirmBox:new{
-        text    = _("crash.log will be embedded in a public GitHub issue. It may contain file paths and book titles.") .. ("\n\n") .. ("Continue?"),
+        text    = isolation_notice .. "\n\n"
+               .. _("crash.log will be embedded in a public GitHub issue. It may contain file paths and book titles.") .. ("\n\n") .. ("Continue?"),
         ok_text = _("Continue"),
         ok_callback = function()
             M._ask_title(ctx)
@@ -310,15 +354,21 @@ function M._do_submit(ctx, bug_title, description, github_username)
         -- Read crash.log from the KOReader data directory.
         local ok_ds, DataStorage = pcall(require, "datastorage")
         local data_dir = ok_ds and DataStorage:getDataDir() or nil
-        local crash_log_full = data_dir and read_file_content(data_dir .. "/crash.log")
+        local crash_log_full, bluetooth_log
+        if data_dir then crash_log_full, bluetooth_log = read_file_content(data_dir .. "/crash.log") end
+        if crash_log_full then
+            crash_log_full = ZenLogger.redactNetworkLog(crash_log_full)
+            bluetooth_log = ZenLogger.redactNetworkLog(bluetooth_log)
+        end
 
-        -- Upload the full log; only truncate if upload fails and we need inline embedding.
+        -- Upload the bounded log; shorten it further for inline fallback.
         local log_url = crash_log_full and upload_crash_log(crash_log_full)
         local crash_log_inline
         if not log_url and crash_log_full then
             if #crash_log_full > MAX_CRASH_LOG then
-                crash_log_inline = "[truncated - showing last " .. MAX_CRASH_LOG .. " chars of " .. #crash_log_full .. " total]\n"
-                                 .. zen_utils.utf8SafeSuffix(crash_log_full, MAX_CRASH_LOG)
+                local tail_size = MAX_CRASH_LOG - #bluetooth_log
+                crash_log_inline = bluetooth_log .. "[truncated - showing last " .. tail_size .. " chars of " .. #crash_log_full .. " total]\n"
+                                 .. zen_utils.utf8SafeSuffix(crash_log_full, tail_size)
             else
                 crash_log_inline = crash_log_full
             end
@@ -330,7 +380,7 @@ function M._do_submit(ctx, bug_title, description, github_username)
             issue_body = zen_utils.truncateUtf8Bytes(issue_body, MAX_BODY, "\n...[truncated]")
         end
 
-        local issue_url, err = submit_issue(issue_title, issue_body)
+        local issue_url, err = submit_issue(issue_title, issue_body, zen_ver)
 
         UIManager:close(spinner)
 

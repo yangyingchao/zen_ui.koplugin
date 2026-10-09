@@ -10,7 +10,9 @@ describe("Zen mode settings apply", function()
         "ui/widget/confirmbox",
         "common/restart",
         "common/shared_state",
+        "common/tbr_index",
         "ui/widget/touchmenu",
+        "apps/filemanager/filemanager",
         "apps/reader/readerui",
         "modules/reader/patches/reader_top_status_bar",
         "modules/menu/patches/zen_mode",
@@ -35,6 +37,7 @@ describe("Zen mode settings apply", function()
         })
         ZenSpec.replace("ui/uimanager", {
             setDirty = function() end,
+            forceRePaint = function() end,
             nextTick = function(_self, callback) callback() end,
         })
         ZenSpec.replace("ui/widget/confirmbox", {
@@ -42,6 +45,7 @@ describe("Zen mode settings apply", function()
         })
         ZenSpec.replace("common/restart", {})
         ZenSpec.replace("ui/widget/touchmenu", {})
+        ZenSpec.replace("apps/filemanager/filemanager", {})
         ZenSpec.replace("apps/reader/readerui", { instance = nil })
         ZenSpec.unload("modules/settings/zen_settings_apply")
     end)
@@ -82,9 +86,14 @@ describe("Zen mode settings apply", function()
     it("disables KOReader's alt status bar when enabling the Zen reader bar", function()
         local applied = 0
         local handled_event
+        local margin_applies = 0
         local reader = {
             document = { configurable = { status_line = 0 } },
             rolling = {},
+            typeset = {
+                unscaled_margins = { 1, 2, 3, 4 },
+                onSetPageMargins = function() margin_applies = margin_applies + 1 end,
+            },
             handleEvent = function(_self, event) handled_event = event end,
         }
         package.loaded["apps/reader/readerui"].instance = reader
@@ -104,6 +113,7 @@ describe("Zen mode settings apply", function()
         assert.are.equal(1, reader.document.configurable.status_line)
         assert.are.equal("onSetStatusLine", handled_event.handler)
         assert.are.equal(1, handled_event.args[1])
+        assert.are.equal(1, margin_applies)
     end)
 
     it("defers navbar reinjection until the Zen settings page closes", function()
@@ -144,5 +154,61 @@ describe("Zen mode settings apply", function()
         assert.are.equal(1, reinjections)
         assert.are.equal(1, home_invalidations)
         _G.__ZEN_UI_REINJECT_NAVBARS = nil
+    end)
+
+    it("repaints TBR surfaces only after settings closes", function()
+        local repaints = 0
+        local queued = {}
+        local UIManager = require("ui/uimanager")
+        UIManager.nextTick = function(_self, callback)
+            queued[#queued + 1] = callback
+        end
+        UIManager.forceRePaint = function()
+            repaints = repaints + 1
+        end
+        _G.__ZEN_UI_SETTINGS_PAGE = {}
+
+        local settings_apply = require("modules/settings/zen_settings_apply")
+        settings_apply.refresh_tbr_on_menu_close()
+
+        assert.are.equal(0, repaints)
+        require("ui/widget/touchmenu"):onCloseWidget()
+        assert.are.equal(0, #queued)
+        _G.__ZEN_UI_SETTINGS_PAGE = nil
+        settings_apply.flush_deferred_on_settings_close()
+        assert.are.equal(1, #queued)
+
+        queued[1]()
+        assert.are.equal(1, repaints)
+    end)
+
+    it("runs coalesced refresh work from the TouchMenu close hook without polling", function()
+        local callbacks = 0
+        local scheduled = {}
+        local UIManager = require("ui/uimanager")
+        local TouchMenu = require("ui/widget/touchmenu")
+        local menu_container = {}
+        TouchMenu.menu_container = menu_container
+        require("apps/filemanager/filemanager").instance = { menu = TouchMenu }
+        UIManager._window_stack = { { widget = menu_container } }
+        UIManager.scheduleIn = function(_self, delay, callback)
+            scheduled[#scheduled + 1] = { delay = delay, callback = callback }
+        end
+
+        local settings_apply = require("modules/settings/zen_settings_apply")
+        settings_apply.defer_until_settings_close("home_rebuild", function()
+            callbacks = callbacks + 1
+        end)
+        settings_apply.defer_until_settings_close("home_rebuild", function()
+            callbacks = callbacks + 10
+        end)
+
+        assert.are.equal(0, #scheduled)
+        TouchMenu:onCloseWidget()
+        assert.are.equal(1, #scheduled)
+        assert.are.equal(0, scheduled[1].delay)
+
+        scheduled[1].callback()
+        assert.are.equal(10, callbacks)
     end)
 end)

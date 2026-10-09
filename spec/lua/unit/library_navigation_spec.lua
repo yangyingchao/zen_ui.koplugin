@@ -85,6 +85,33 @@ describe("library navigation", function()
         assert.are.equal("history", _G.__ZEN_UI_OPEN_TARGET_TAB)
     end)
 
+    it("runs a post-close action after releasing the document and before opening its folder", function()
+        local order = {}
+        ZenSpec.replace("MangaReader", {
+            is_showing = true,
+            onReturn = function() error("archive must close ReaderUI") end,
+        })
+        local ui = reader("/library/Fiction/Book.epub")
+        function ui:onClose()
+            order[#order + 1] = "close"
+            self.document = nil
+        end
+        function ui:showFileManager()
+            order[#order + 1] = "open"
+        end
+
+        Navigation.showFromReader(ui, nil, {
+            target_folder = "/library/Fiction/",
+            after_close = function()
+                assert.is_nil(ui.document)
+                order[#order + 1] = "move"
+            end,
+        })
+
+        assert.are.same({ "close", "move", "open" }, order)
+        assert.are.equal("/library/Fiction/", _G.__ZEN_UI_OPEN_TARGET_FOLDER)
+    end)
+
     it("returns to the file manager with a requested specific tag", function()
         local ui = reader()
         local plugin = { config = { features = { restore_library_view = true } } }
@@ -122,6 +149,26 @@ describe("library navigation", function()
         assert.is_nil(_G.__ZEN_UI_OPEN_TARGET_TAG)
     end)
 
+    it("treats a dispatched Archive folder as a direct root without Navbar", function()
+        local chooser = {
+            changeToPath = function(self, path) self.path = path end,
+        }
+        ZenSpec.replace("apps/filemanager/filemanager", { instance = {
+            file_chooser = chooser,
+        } })
+        local Paths = require("common/paths")
+        Paths.getArchiveDir = function() return "/archive" end
+        Paths.isArchiveRoot = function(path) return path == "/archive" end
+
+        Navigation.showFromReader(reader(), {
+            config = { features = { restore_library_view = true } },
+        }, { target_folder = "/archive" })
+
+        assert.are.equal("/archive", chooser.path)
+        assert.are.equal("/archive", chooser._zen_direct_archive_root)
+        assert.is_true(chooser._zen_opening_archive_root)
+    end)
+
     it("uses Navbar folder navigation when FileManager survives Reader teardown", function()
         local direct_changes = {}
         local navbar_opens = {}
@@ -156,6 +203,18 @@ describe("library navigation", function()
         assert.is_nil(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
     end)
 
+    it("restores Home after opening an outside PDF from Continue", function()
+        local ui = reader("/outside/Book.pdf")
+        _G.__ZEN_UI_LIBRARY_STATE = { tab = "home" }
+
+        Navigation.showFromReader(ui, {
+            config = { features = { restore_library_view = true } },
+        })
+
+        assert.is_nil(_G.__ZEN_UI_KEEP_BOOK_LOCATION)
+        assert.are.equal("home", _G.__ZEN_UI_LIBRARY_STATE.tab)
+    end)
+
     it("uses KOReader's Android home when no explicit home is stored", function()
         _G.G_reader_settings = ZenSpec.memorySettings({
             allow_commaneer_filemanager = true,
@@ -166,23 +225,69 @@ describe("library navigation", function()
             config = { features = { restore_library_view = true } },
         })
 
-        assert.is_true(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
+        assert.is_nil(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
         assert.is_nil(_G.__ZEN_UI_KEEP_BOOK_LOCATION)
     end)
 
-    it("closes Reader and rebuilds the configured default view", function()
-        local ui = reader()
+    it("preserves a physical folder return when restore is enabled", function()
+        local ui = reader("/library/Fiction/Book.epub")
 
         Navigation.showFromReader(ui, {
             config = { features = { restore_library_view = true } },
         })
 
         assert.is_true(ui.closed)
-        assert.are.equal("/library/Book.epub", ui.shown)
-        assert.is_true(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
+        assert.are.equal("/library/Fiction/Book.epub", ui.shown)
+        assert.is_nil(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
     end)
 
-    it("arms the configured default before Reader teardown", function()
+    it("hides the passive focused underline after restoring a physical folder", function()
+        local item = {
+            _underline_container = { color = "black" },
+            onUnfocus = function(self)
+                self._underline_container.color = "white"
+            end,
+        }
+        local chooser = {
+            layout = { { item } },
+            selected = { x = 1, y = 1 },
+            prev_itemnumber = 4,
+        }
+        ZenSpec.replace("apps/filemanager/filemanager", {
+            instance = { file_chooser = chooser },
+        })
+
+        Navigation.showFromReader(reader("/library/Fiction/Book.epub"), {
+            config = { features = {
+                restore_library_view = true,
+                browser_hide_underline = true,
+            } },
+        })
+
+        assert.are.equal("white", item._underline_container.color)
+        assert.are.equal(4, chooser.prev_itemnumber)
+    end)
+
+    it("preserves captured group state when restore is enabled", function()
+        local ui = reader("/library/Fiction/Book.epub")
+        local state = {
+            tab = "series",
+            page = 3,
+            detail_group = "Saga",
+            detail_page = 2,
+        }
+        _G.__ZEN_UI_LIBRARY_STATE = state
+
+        Navigation.showFromReader(ui, {
+            config = { features = { restore_library_view = true } },
+        })
+
+        assert.is_true(ui.closed)
+        assert.is_nil(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
+        assert.are.equal(state, _G.__ZEN_UI_LIBRARY_STATE)
+    end)
+
+    it("arms the configured default before Reader teardown when restore is disabled", function()
         local ui = reader()
         local original_close = ui.onClose
         function ui:onClose()
@@ -191,7 +296,7 @@ describe("library navigation", function()
         end
 
         Navigation.showFromReader(ui, {
-            config = { features = { restore_library_view = true } },
+            config = { features = { restore_library_view = false } },
         })
 
         assert.is_true(ui.closed)
@@ -220,6 +325,23 @@ describe("library navigation", function()
         Navigation.showFromReader(ui, {
             config = { features = { restore_library_view = true } },
         }, { force_default = true })
+
+        assert.are.equal(1, default_opens)
+        assert.is_nil(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)
+        assert.is_nil(_G.__ZEN_UI_LIBRARY_STATE)
+    end)
+
+    it("opens the default after a surviving teardown when restore is disabled", function()
+        local ui = reader()
+        local default_opens = 0
+        _G.__ZEN_UI_LIBRARY_STATE = { tab = "authors", page = 3 }
+        _G.__ZEN_UI_NAVBAR_OPEN_DEFAULT_TAB = function()
+            default_opens = default_opens + 1
+        end
+
+        Navigation.showFromReader(ui, {
+            config = { features = { restore_library_view = false } },
+        })
 
         assert.are.equal(1, default_opens)
         assert.is_nil(_G.__ZEN_UI_FORCE_DEFAULT_LIBRARY_TAB)

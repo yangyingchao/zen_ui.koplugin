@@ -54,9 +54,55 @@ end
 
 local M = {}
 
+local function choose_sleep_screen_image()
+    local images_dir = require("datastorage"):getFullDataDir() .. "/resources/screensavers"
+    local current_path = G_reader_settings:readSetting("screensaver_document_cover")
+    local path = images_dir
+    if type(current_path) == "string" and current_path ~= "" then
+        local current_dir = select(1, require("util").splitFilePathName(current_path))
+        if current_dir ~= "" then path = current_dir end
+    end
+    UIManager:show(utils.newImagePathChooser{
+        select_directory = false,
+        select_file = true,
+        show_files = true,
+        file_filter = function(filename)
+            return require("document/documentregistry"):hasProvider(filename)
+        end,
+        path = path,
+        goHome = function(chooser)
+            chooser:changeToPath(images_dir)
+            return true
+        end,
+        onConfirm = function(file_path)
+            G_reader_settings:saveSetting("screensaver_document_cover", file_path)
+        end,
+    })
+end
+
+local function install_sleep_screen_image_picker(items)
+    local stock_callback = require("ui/screensaver").chooseFile
+    local function replace(item_table)
+        for _i, item in ipairs(item_table) do
+            if type(item) == "table" then
+                if item.callback == stock_callback then
+                    item.callback = choose_sleep_screen_image
+                    return true
+                end
+                if type(item.sub_item_table) == "table" and replace(item.sub_item_table) then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+    replace(items)
+end
+
 function M.build(ctx)
     local config = ctx.config
     local plugin = ctx.plugin
+    local settings_apply = ctx.settings_apply
 
     local function mode_value_label(mode, setting)
         return mode .. " " .. setting:lower()
@@ -179,6 +225,22 @@ function M.build(ctx)
         }
     end
 
+    local function sleep_screen_state_matches(expected)
+        local current = capture_sleep_screen_state()
+        for _i, key in ipairs({
+            "screensaver_type",
+            "screensaver_message",
+            "screensaver_show_message",
+            "screensaver_img_background",
+            "screensaver_document_cover",
+            "screensaver_stretch_images",
+            "screensaver_stretch_limit_percentage",
+        }) do
+            if current[key] ~= expected[key] then return false end
+        end
+        return true
+    end
+
     local function apply_sleep_screen_preset(preset)
         if type(preset) ~= "table" then return end
         if preset.screensaver_type then
@@ -222,6 +284,10 @@ function M.build(ctx)
     local function build_preset_items()
         local all = get_all_presets()
         local preset_items = {}
+        if PresetStore.getActivePreset("screensaver")
+                and not sleep_screen_state_matches(PresetStore.getSettings("screensaver")) then
+            PresetStore.setActivePreset("screensaver", nil)
+        end
 
         table.insert(preset_items, {
             text = _("Save current settings as preset"),
@@ -269,10 +335,10 @@ function M.build(ctx)
             local is_builtin = preset.builtin == true
             local is_last = (i == #all)
             table.insert(preset_items, {
-                text_func = function()
-                    local active = PresetStore.getActivePreset("screensaver")
-                    local prefix = (active == pname) and "\u{2713} " or ""
-                    return prefix .. pname
+                text = pname,
+                radio = true,
+                checked_func = function()
+                    return PresetStore.getActivePreset("screensaver") == pname
                 end,
                 callback = function(touchmenu_instance)
                     apply_sleep_screen_preset(preset)
@@ -310,12 +376,28 @@ function M.build(ctx)
     local items = {}
 
     -- Search section
-    table.insert(items, {
-        text = _("Search"),
+    local search_item = {
+        text = _("Zen Search"),
+        help_text = _("Use Zen Search in the file browser and reader. Disable to use KOReader's default search."),
+        checked_func = function()
+            return type(config.features) ~= "table"
+                or config.features.search ~= false
+        end,
+        callback = function(touchmenu_instance)
+            if type(config.features) ~= "table" then config.features = {} end
+            config.features.search = config.features.search == false
+            plugin:saveConfig()
+            if touchmenu_instance then touchmenu_instance:updateItems() end
+            settings_apply.prompt_restart()
+        end,
         sub_item_table = {
             {
                 text = _("Match whole words"),
                 help_text = _("When enabled, search matches whole words only. When disabled, substring matching is used (e.g., 'fish' matches 'fishing')."),
+                enabled_func = function()
+                    return type(config.features) ~= "table"
+                        or config.features.search ~= false
+                end,
                 checked_func = function()
                     return type(config.search) == "table" and config.search.substring == false
                 end,
@@ -326,7 +408,9 @@ function M.build(ctx)
                 end,
             },
         },
-    })
+    }
+    search_item.checkmark_callback = search_item.callback
+    table.insert(items, search_item)
 
     -- Night mode schedule
     table.insert(items, {
@@ -719,6 +803,7 @@ function M.build(ctx)
         sub_item_table_func = function()
             local ok, screen_items = pcall(dofile, "frontend/ui/elements/screensaver_menu.lua")
             local sub = (ok and type(screen_items) == "table") and screen_items or {}
+            if ok then install_sleep_screen_image_picker(sub) end
             table.insert(sub, {
                 text = _("Presets"),
                 sub_item_table_func = build_preset_items,
@@ -855,6 +940,9 @@ function M.build(ctx)
 end
 
 function M.build_extras_items(ctx)
+    local config = ctx.config
+    local plugin = ctx.plugin
+    local settings_apply = ctx.settings_apply
     local global_items = M.build(ctx)
     local search_item = global_items[1]
     local night_schedule_item = global_items[2]
@@ -880,10 +968,26 @@ function M.build_extras_items(ctx)
         },
         sleep_item,
         lockdown_item,
+        {
+            text = _("Zen Keyboard"),
+            help_text = _("Enable ZenOS keyboard improvements."),
+            checked_func = function()
+                return type(config.features) ~= "table"
+                    or config.features.zen_keyboard ~= false
+            end,
+            callback = function(touchmenu_instance)
+                if type(config.features) ~= "table" then config.features = {} end
+                config.features.zen_keyboard = config.features.zen_keyboard == false
+                plugin:saveConfig()
+                if touchmenu_instance then touchmenu_instance:updateItems() end
+                settings_apply.prompt_restart()
+            end,
+        },
     }
     IconItem.decorate(items[1], icons.search)
     IconItem.decorate(items[2], icons.tbr)
     IconItem.decorate(items[4], icons.settings_lockdown)
+    IconItem.decorate(items[5], icons.keyboard)
     return items
 end
 

@@ -35,6 +35,7 @@ local _plugin_root = require("common/plugin_root") or ""
 local TITLE_FONT_SIZE = 28
 
 local ZenScreen = InputContainer:extend{
+    covers_fullscreen = true,
     title             = nil,   -- string shown in top bar; nil hides the title bar entirely
     title_icon        = false, -- force inline Zen icon to the left of title text
     hide_logo         = false, -- hide the large center logo while keeping the rest of the layout
@@ -221,7 +222,11 @@ function ZenScreen:_ensure_scroll_widget(width, height)
         dialog    = self,
         alignment = "left",
         justified = false,
+        -- onShow owns the initial refresh.
+        for_measurement_only = true,
     }
+    self._scroll_text_w.for_measurement_only = false
+    self._scroll_text_w.text_widget.for_measurement_only = false
     self._scroll_top_line_num = nil
 end
 

@@ -44,6 +44,56 @@ describe("reading goals settings", function()
         assert.are.equal("Books", monthly[4].text)
         assert.are.equal("Monthly books goal: 1", monthly[7].text_func())
     end)
+
+    it("shares one CBZ/CBR exclusion toggle", function()
+        local Goals = require("common/reading_goals")
+        local goals = { periods = { "daily" } }
+        local saves = 0
+        local item = Goals.settingsItems(goals, function() saves = saves + 1 end)[5]
+
+        assert.are.equal("Exclude CBZ/CBR files", item.text)
+        assert.is_false(item.checked_func())
+        item.callback()
+        assert.is_true(goals.exclude_cbz_cbr)
+        assert.is_true(item.checked_func())
+        assert.are.equal(1, saves)
+    end)
+
+    it("refreshes every target label after changing its value", function()
+        local shown
+        ZenSpec.replace("ui/uimanager", {
+            show = function(_self, widget) shown = widget end,
+        })
+        ZenSpec.replace("ui/widget/spinwidget", {
+            new = function(_self, widget) return widget end,
+        })
+        ZenSpec.unload("common/reading_goals")
+
+        local Goals = require("common/reading_goals")
+        local items = Goals.settingsItems({ periods = { "daily" } }, function() end)
+        local update_count = 0
+        local touchmenu = {
+            updateItems = function() update_count = update_count + 1 end,
+        }
+        local target_indexes = {
+            { 4, 5 },
+            { 4, 5 },
+            { 5, 6, 7 },
+            { 5, 6, 7 },
+        }
+
+        for period_index, indexes in ipairs(target_indexes) do
+            local period_items = items[period_index].sub_item_table_func()
+            for _i, target_index in ipairs(indexes) do
+                local target_item = period_items[target_index]
+                target_item.callback(touchmenu)
+                shown.callback({ value = 7 })
+                assert.matches(": 7$", target_item.text_func())
+            end
+        end
+
+        assert.are.equal(10, update_count)
+    end)
 end)
 
 describe("reading goals widget", function()
@@ -60,6 +110,9 @@ describe("reading goals widget", function()
                     h = values.height or 10,
                 }
                 values.getSize = values.getSize or function(self) return self.dimen end
+                values.getBaseline = values.getBaseline or function(self)
+                    return math.floor(((self.face and self.face.size) or 10) * 0.75)
+                end
                 created[#created + 1] = values
                 return values
             end,
@@ -85,6 +138,14 @@ describe("reading goals widget", function()
             end,
         })
         ZenSpec.replace("ui/font", { getFace = function(_, name, size) return { name = name, size = size } end })
+        ZenSpec.replace("ui/rendertext", {
+            sizeUtf8Text = function(_, _x, _width, face)
+                return {
+                    y_top = math.floor((face.size or 10) * 0.6),
+                    y_bottom = math.max(1, math.floor((face.size or 10) * 0.15)),
+                }
+            end,
+        })
         ZenSpec.replace("device", { screen = {
             scaleBySize = function(_, value) return value end,
             getWidth = function() return 800 end,
@@ -144,6 +205,7 @@ describe("reading goals widget", function()
                     metrics = { daily = "pages", weekly = "time", monthly = "pages", yearly = "time" },
                 },
             },
+            module_cfg = { font_size = 14 },
             data = { stats = {
                 today_pages = 1, week_pages = 2, month_pages = 3, year_pages = 4,
                 year_duration = 240,
@@ -165,6 +227,13 @@ describe("reading goals widget", function()
         assert.is_true(found["Yearly"])
         assert.is_true(found["1 / 30 pages (3%)"])
         assert.is_true(found["4 / 1000 min (0%)"])
+        local row_gaps = 0
+        for _i, item in ipairs(created) do
+            if item.kind == "ui/widget/verticalspan" and item.width == 2 then
+                row_gaps = row_gaps + 1
+            end
+        end
+        assert.are.equal(3, row_gaps)
 
         goal_widget.dimen.x, goal_widget.dimen.y = 0, 0
         assert.is_true(goal_widget:onTapReadingGoals(nil, { pos = { x = 20, y = 20 } }))
@@ -182,7 +251,7 @@ describe("reading goals widget", function()
         assert.is_true(popup_texts[string.format("Yearly goal (%s)", os.date("%Y"))])
     end)
 
-    it("uses its configured font size when it fits", function()
+    it("caps its configured font size", function()
         local widget = require("modules/filebrowser/patches/home/widgets/reading_goals")
         widget.build({
             width = 600,
@@ -193,12 +262,63 @@ describe("reading goals widget", function()
         })
 
         for _i, item in ipairs(created) do
-            if item.text == "Daily" and item.face and item.face.size == 20 then return end
+            if item.text == "Daily" and item.face and item.face.size == 16 then return end
         end
-        assert.fail("Reading goals did not use its configured font size")
+        assert.fail("Reading goals did not cap its configured font size")
     end)
 
-    it("uses an eleven-point default font size", function()
+    it("keeps larger text by tightening multi-goal row spacing", function()
+        ZenSpec.replace("ui/widget/textwidget", {
+            new = function(_, values)
+                values.kind = "ui/widget/textwidget"
+                values.dimen = {
+                    w = type(values.text) == "string" and #values.text * 6 or 20,
+                    h = values.face.size,
+                }
+                function values:getSize() return self.dimen end
+                function values:getBaseline() return math.floor(self.face.size * 0.75) end
+                created[#created + 1] = values
+                return values
+            end,
+        })
+        ZenSpec.unload("modules/filebrowser/patches/home/widgets/reading_goals")
+        local widget = require("modules/filebrowser/patches/home/widgets/reading_goals")
+        widget.build({
+            width = 600,
+            height = 36,
+            config = { goals = { periods = { "daily", "weekly", "monthly" } } },
+            module_cfg = { font_size = 12 },
+            data = { stats = { today_pages = 1 } },
+        })
+
+        for _i, item in ipairs(created) do
+            if item.text == "Daily" and item.face.size == 12 then return end
+        end
+        assert.fail("Reading goals unnecessarily reduced the multi-goal font size")
+    end)
+
+    it("truncates narrow rows without shrinking below ten points", function()
+        local widget = require("modules/filebrowser/patches/home/widgets/reading_goals")
+        widget.build({
+            width = 120,
+            height = 120,
+            config = { goals = { periods = { "daily", "weekly", "monthly" } } },
+            module_cfg = { font_size = 8 },
+            data = { stats = { today_pages = 1 } },
+        })
+
+        for _i, item in ipairs(created) do
+            if item.text == "1 / 30 pages (3%)" then
+                assert.are.equal(10, item.face.size)
+                assert.is_true(item.truncate_with_ellipsis)
+                assert.is_true(item.max_width > 0)
+                return
+            end
+        end
+        assert.fail("Reading goals value was not rendered")
+    end)
+
+    it("uses the eleven-point 3.3 default font size", function()
         local widget = require("modules/filebrowser/patches/home/widgets/reading_goals")
         widget.build({
             width = 600,

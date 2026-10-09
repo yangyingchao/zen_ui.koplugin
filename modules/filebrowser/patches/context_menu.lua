@@ -1,7 +1,7 @@
 local function apply_context_menu()
     --[[
         Replaces the long-hold file/folder context menu with a minimal layout.
-        Always active; delegates to stock KOReader outside home_dir.
+        Always active; delegates to stock KOReader outside themed directories.
     ]]
 
     local BD           = require("ui/bidi")
@@ -13,8 +13,12 @@ local function apply_context_menu()
     local UIManager    = require("ui/uimanager")
     local _            = require("gettext")
     local C_           = _.pgettext
+    local archive_actions = require("common/archive_actions")
     local book_status  = require("common/book_status")
     local ConfigManager = require("config/manager")
+    local FolderCoverFiles = require("common/folder_cover_files")
+    local FolderCoverPicker = require("common/ui/folder_cover_picker")
+    local BookWalker   = require("common/book_walker")
     local paths        = require("common/paths")
     local SharedState  = require("common/shared_state")
     local icons        = require("common/inline_icon_map")
@@ -32,6 +36,13 @@ local function apply_context_menu()
     local Geom            = require("ui/geometry")
     local Blitbuffer      = require("ffi/blitbuffer")
     local library_font    = require("modules/filebrowser/patches/library_font")
+
+    local function archive_context_row(fm, file, is_file)
+        local config = zen_plugin and zen_plugin.config
+        local context_menu = type(config) == "table" and config.context_menu
+        if type(context_menu) ~= "table" or context_menu.show_archive ~= true then return end
+        return archive_actions.contextRow(fm, file, is_file)
+    end
 
     local function apply_button_group_font(button_rows, nominal_size)
         if type(button_rows) ~= "table" then return button_rows end
@@ -128,25 +139,67 @@ local function apply_context_menu()
     end
 
     local function new_context_menu_dialog(options)
-        return align_button_dialog_icons(ButtonDialog:new(options))
+        local dialog = align_button_dialog_icons(ButtonDialog:new(options))
+        local cover = options._zen_cover_widget
+        if cover then
+            local orig_onShow = dialog.onShow
+            function dialog:onShow()
+                orig_onShow(self)
+                -- Wait for the opening repaint so only the cover flashes.
+                UIManager:tickAfterNext(function()
+                    if UIManager:getTopmostVisibleWidget() == self then
+                        UIManager:setDirty(nil, "full", cover.dimen, true)
+                    end
+                end)
+            end
+        end
+        return dialog
     end
 
-    -- Keep Zen's path-keyed folder settings aligned with successful moves.
+    -- Keep every PathChooser navigable above a locked home folder.
+    if not PathChooser._zen_navigation_patched
+            and type(PathChooser.genItemTableFromPath) == "function" then
+        PathChooser._zen_navigation_patched = true
+        local orig_pathchooser_gen_items = PathChooser.genItemTableFromPath
+
+        function PathChooser:genItemTableFromPath(path)
+            local items = orig_pathchooser_gen_items(self, path)
+            local parent = type(path) == "string" and require("ffi/util").dirname(path)
+            if type(parent) ~= "string" or parent == path then
+                return items
+            end
+            for _i, item in ipairs(items) do
+                if item.is_go_up then return items end
+            end
+            table.insert(items, self.show_current_dir_for_hold and 2 or 1, {
+                text = BD.mirroredUILayout() and BD.ltr("../ \u{2B06}") or "\u{2B06} ../",
+                path = path .. "/..",
+                is_go_up = true,
+            })
+            return items
+        end
+    end
+
+    -- Keep path-keyed settings and cover references aligned with successful moves.
     local orig_FileManager_moveFile = FileManager.moveFile
     FileManager.moveFile = function(self, from, to, ...)
         local ffiUtil = require("ffi/util")
         local lfs = require("libs/libkoreader-lfs")
-        local source_is_folder = lfs.attributes(from, "mode") == "directory"
-        local source = source_is_folder and (ffiUtil.realpath(from) or from)
+        local source = ffiUtil.realpath(from) or from
+        local source_is_directory = lfs.attributes(source, "mode") == "directory"
         local destination = to
-        if source_is_folder and lfs.attributes(to, "mode") == "directory" then
+        if lfs.attributes(to, "mode") == "directory" then
             destination = ffiUtil.joinPath(to, ffiUtil.basename(source))
         end
 
         local moved = orig_FileManager_moveFile(self, from, to, ...)
-        if moved and source_is_folder then
+        if moved then
             destination = ffiUtil.realpath(destination) or destination
-            pcall(ConfigManager.moveFolderPathSettings, source, destination)
+            pcall(ConfigManager.movePathSettings, source, destination)
+            pcall(function()
+                require("common/tbr_index").moveOrderPath(
+                    source, destination, source_is_directory)
+            end)
         end
         if moved then
             UIManager:nextTick(function()
@@ -169,6 +222,39 @@ local function apply_context_menu()
         _zen_renderer = true,
     }
 
+    local function under_root(path, root)
+        return type(root) == "string" and root:sub(1, 1) == "/"
+            and (root == "/" or path == root
+                or path:sub(1, #root + 1) == root .. "/")
+    end
+
+    local function in_move_roots(self, path)
+        local ffiUtil = require("ffi/util")
+        local real = path and ffiUtil.realpath(path)
+        if not real then return false end
+        local roots = self._zen_move_roots
+        if not roots then
+            roots = {}
+            if self.home_root then
+                roots[#roots + 1] = ffiUtil.realpath(self.home_root) or self.home_root
+            end
+            for _i, root in ipairs(self.extra_roots or {}) do
+                roots[#roots + 1] = ffiUtil.realpath(root) or root
+            end
+            self._zen_move_roots = roots
+        end
+        for _i, root in ipairs(roots) do
+            if under_root(real, root) then return true end
+        end
+        return false
+    end
+
+    function MoveChooser:changeToPath(path, ...)
+        if in_move_roots(self, path) then
+            return PathChooser.changeToPath(self, path, ...)
+        end
+    end
+
     function MoveChooser:genItemTableFromPath(path)
         local ffiUtil3 = require("ffi/util")
         local lfs3     = require("libs/libkoreader-lfs")
@@ -176,6 +262,16 @@ local function apply_context_menu()
         local root     = ffiUtil3.realpath(path) or path
         local MAX_DEPTH = 3
         local items    = {}
+        local parent = ffiUtil3.dirname(root)
+        if not in_move_roots(self, root) then return items end
+
+        if parent and parent ~= root and in_move_roots(self, parent) then
+            table.insert(items, {
+                text = BD3.mirroredUILayout() and BD3.ltr("../ \u{2B06}") or "\u{2B06} ../",
+                path = parent,
+                is_go_up = true,
+            })
+        end
 
         if not self.src_dir or self.src_dir ~= root then
             table.insert(items, {
@@ -196,8 +292,10 @@ local function apply_context_menu()
             for fname in iter3, dir_obj3 do
                 if fname ~= "." and fname ~= ".."
                         and not fname:match("^%.")
+                        and not BookWalker.shouldSkipDir(dir_path, fname)
                         and self:show_dir(fname) then
-                    local fpath = dir_path .. "/" .. fname
+                    local fpath = dir_path == "/" and "/" .. fname
+                        or dir_path .. "/" .. fname
                     if lfs3.attributes(fpath, "mode") == "directory" then
                         table.insert(subdirs, { name = fname, path = fpath })
                     end
@@ -206,7 +304,8 @@ local function apply_context_menu()
             table.sort(subdirs, function(a, b) return a.name < b.name end)
             for _i, sub in ipairs(subdirs) do
                 local sub_real = ffiUtil3.realpath(sub.path) or sub.path
-                if not (skip_set and skip_set[sub_real]) then
+                if in_move_roots(self, sub_real)
+                        and not (skip_set and skip_set[sub_real]) then
                     local rel = sub.path:sub(#base + 2)
                     local display = prefix and (prefix .. "/" .. rel) or rel
                     table.insert(items, {
@@ -226,6 +325,19 @@ local function apply_context_menu()
 
         scan(root, 1)
 
+        local home = self.home_root and ffiUtil3.realpath(self.home_root)
+        if home and not under_root(root, home) then
+            table.insert(items, {
+                text           = _("Home") .. ": " .. ffiUtil3.basename(home),
+                path           = home,
+                is_go_up       = true,
+                is_file        = false,
+                is_directory   = true,
+                bidi_wrap_func = BD3.directory,
+                mandatory      = self:getMenuItemMandatory({ path = home }),
+            })
+        end
+
         if type(self.extra_roots) == "table" then
             local skip_set = { [root] = true }
             for _i, er_path in ipairs(self.extra_roots) do
@@ -235,7 +347,7 @@ local function apply_context_menu()
 
             for _i, er_path in ipairs(self.extra_roots) do
                 local er = ffiUtil3.realpath(er_path) or er_path
-                if er ~= root then
+                if er ~= root and in_move_roots(self, er) then
                     local er_name = ffiUtil3.basename(er)
                     if not self.src_dir or self.src_dir ~= er then
                         table.insert(items, {
@@ -260,18 +372,30 @@ local function apply_context_menu()
         if not path then return true end
         local ffiUtil2 = require("ffi/util")
         local real = ffiUtil2.realpath(path)
-        if not real then return true end
+        if not in_move_roots(self, real) then return true end
         local lfs2 = require("libs/libkoreader-lfs")
         if lfs2.attributes(real, "mode") == "directory" then
-            if self.onConfirm then self.onConfirm(real) end
-            UIManager:close(self)
+            if item.is_go_up then
+                self:changeToPath(real)
+            else
+                if self.onConfirm then self.onConfirm(real) end
+                UIManager:close(self)
+            end
         end
         return true
     end
 
-    function MoveChooser:onMenuHold() return true end
+    function MoveChooser:onMenuHold(item)
+        local path = item and item.path
+        if in_move_roots(self, path)
+                and require("libs/libkoreader-lfs").attributes(path, "mode") == "directory" then
+            self:changeToPath(path)
+        end
+        return true
+    end
 
     function MoveChooser:init()
+        self.height = Device.screen:getHeight()
         local CoverMenu = require("covermenu")
         local MosaicMenu = require("mosaicmenu")
         self.display_mode_type = "mosaic"
@@ -301,9 +425,13 @@ local function apply_context_menu()
 
     if type(FileChooser.show_file) == "function" and not FileChooser._zen_status_filter_patched then
         local orig_show_file = FileChooser.show_file
+        local orig_getList = FileChooser.getList
         FileChooser._zen_status_filter_patched = true
 
         function FileChooser:show_file(filename, fullpath)
+            if self.name == "filemanager" and FolderCoverFiles.isManaged(filename) then
+                return false
+            end
             if self.name ~= "filemanager" then
                 return orig_show_file(self, filename, fullpath)
             end
@@ -324,6 +452,166 @@ local function apply_context_menu()
             local display_status = book_status.getDisplayStatusFromFile(fullpath)
             return status_filter[display_status] and true or false
         end
+
+        if type(orig_getList) == "function" then
+            function FileChooser:getList(path, collate)
+                local dirs, files = orig_getList(self, path, collate)
+                local status_filter = FileChooser.show_filter and FileChooser.show_filter.status
+                if self.name == "filemanager" and collate and status_filter then
+                    for index = #dirs, 1, -1 do
+                        local mandatory = dirs[index] and dirs[index].mandatory
+                        local count = type(mandatory) == "string"
+                            and tonumber(mandatory:match("(%d+)%s*\xef\x80\x96"))
+                        if count == 0 then table.remove(dirs, index) end
+                    end
+                end
+                return dirs, files
+            end
+        end
+    end
+
+    local orig_copyFile = FileManager.copyFile
+    local orig_cutFile = FileManager.cutFile
+    function FileManager:copyFile(file)
+        self._zen_selected_clipboard = nil
+        return orig_copyFile(self, file)
+    end
+    function FileManager:cutFile(file)
+        self._zen_selected_clipboard = nil
+        return orig_cutFile(self, file)
+    end
+
+    local function selected_files_copy(files)
+        local copy = {}
+        local ffiUtil = require("ffi/util")
+        for file, selected in pairs(files or {}) do
+            if selected then copy[ffiUtil.realpath(file) or file] = true end
+        end
+        return copy
+    end
+
+    local function paste_selected_files(file_manager, folder)
+        local pending = file_manager._zen_selected_clipboard
+        if not pending or not next(pending.files) then return end
+        if folder and require("libs/libkoreader-lfs").attributes(folder, "mode") == "file" then
+            folder = require("ffi/util").dirname(folder)
+        end
+        local ConfirmBox = require("ui/widget/confirmbox")
+        local CheckButton = require("ui/widget/checkbutton")
+        local check_button
+        local confirmbox = ConfirmBox:new{
+            text = pending.cut and _("Move selected files?") or _("Copy selected files?"),
+            ok_text = pending.cut and _("Move") or C_("File", "Copy"),
+            ok_callback = function()
+                local previous = file_manager.selected_files
+                if not previous then file_manager:onToggleSelectMode() end
+                file_manager.selected_files = selected_files_copy(pending.files)
+                file_manager.cutfile = pending.cut
+                file_manager:pasteSelectedFiles(check_button.checked, folder)
+                pending.files = selected_files_copy(file_manager.selected_files)
+                if not next(pending.files) then file_manager._zen_selected_clipboard = nil end
+                if previous then
+                    if not file_manager.selected_files then file_manager:onToggleSelectMode() end
+                    file_manager.selected_files = previous
+                    file_manager.file_chooser:refreshPath()
+                elseif file_manager.selected_files then
+                    file_manager:onToggleSelectMode(true)
+                end
+            end,
+        }
+        check_button = CheckButton:new{
+            text = _("overwrite existing files"),
+            checked = false,
+            parent = confirmbox,
+        }
+        confirmbox:addWidget(check_button)
+        UIManager:show(confirmbox)
+    end
+    FileManager.pasteSelectedFilesFromZenClipboard = paste_selected_files
+
+    local function show_collection_picker(files, on_done)
+        local ReadCollection = require("readcollection")
+        local TBRIndex = require("common/tbr_index")
+        local Menu = require("ui/widget/menu")
+        local names = {}
+        for name in pairs(ReadCollection.coll) do names[#names + 1] = name end
+        table.sort(names, function(a, b)
+            if a == ReadCollection.default_collection_name then return true end
+            if b == ReadCollection.default_collection_name then return false end
+            return a < b
+        end)
+        local items = {}
+        for _i, name in ipairs(names) do
+            local already_in = true
+            for file in pairs(files) do
+                if not ReadCollection:isFileInCollection(file, name) then
+                    already_in = false
+                    break
+                end
+            end
+            items[#items + 1] = {
+                text = (name == ReadCollection.default_collection_name and _("Favorites") or name)
+                    .. (already_in and "  \u{2713}" or ""),
+                mandatory = already_in and _("added") or nil,
+                dim = already_in,
+                _cn = name,
+            }
+        end
+        local picker
+        picker = Menu:new{
+            title = _("Add to collection"),
+            item_table = items,
+            is_borderless = true,
+            is_popout = false,
+            onMenuSelect = function(_self_m, picked)
+                if picked.dim then return true end
+                UIManager:close(picker)
+                if picked._cn == TBRIndex.collectionName() then
+                    for file in pairs(files) do TBRIndex.setExplicit(file, true) end
+                else
+                    ReadCollection:addItemsMultiple(files, { [picked._cn] = true })
+                    ReadCollection:write({ [picked._cn] = true })
+                end
+                pcall(TBRIndex.collectionChanged, picked._cn)
+                if on_done then on_done() end
+                return true
+            end,
+            close_callback = function() UIManager:close(picker) end,
+        }
+        UIManager:show(picker)
+    end
+
+    local function set_selected_status(files, status)
+        local DocSettings = require("docsettings")
+        local BookList = require("ui/widget/booklist")
+        local filemanagerutil = require("apps/filemanager/filemanagerutil")
+        local TBRIndex = require("common/tbr_index")
+        for file in pairs(files) do
+            if status == "tbr" then
+                TBRIndex.setExplicit(file, true)
+            else
+                local doc_settings = DocSettings:open(file)
+                local summary = doc_settings:readSetting("summary") or {}
+                book_status.acknowledgeNewVersion(doc_settings)
+                TBRIndex.setExplicit(file, false)
+                summary.status = status
+                if status == nil then
+                    doc_settings:delSetting("percent_finished")
+                    doc_settings:delSetting("last_page")
+                    doc_settings:delSetting("last_xpointer")
+                end
+                filemanagerutil.saveSummary(doc_settings, summary)
+                BookList.setBookInfoCacheProperty(file, "status", status)
+                book_status.invalidate(file)
+                TBRIndex.refreshPath(file, doc_settings)
+                if status == nil then
+                    local pages = BookList.book_info_cache and BookList.book_info_cache[file]
+                        and BookList.book_info_cache[file].pages
+                    BookList.setBookInfoCacheProperty(file, "been_opened", false)
+                    if pages then BookList.book_info_cache[file].pages = pages end
+                end
+            end
+        end
     end
 
     FileManager.setupLayout = function(self)
@@ -336,6 +624,201 @@ local function apply_context_menu()
 
         local orig_showFileDialog = file_chooser.showFileDialog
         local orig_onFileSelect = file_chooser.onFileSelect
+
+        local function show_selected_actions()
+            local files = selected_files_copy(file_manager.selected_files)
+            local items = {}
+            for file in pairs(files) do
+                items[#items + 1] = { path = file, is_file = true }
+            end
+            table.sort(items, function(a, b) return a.path < b.path end)
+            local count = #items
+            local title = count == 1 and _("1 file")
+                or require("ffi/util").template(_("%1 files"), count)
+            local enabled = count > 0
+            local context_menu = zen_plugin and zen_plugin.config
+                and zen_plugin.config.context_menu
+            local allow_delete = context_menu and context_menu.allow_delete == true
+            local action_dialog
+            local function close_actions()
+                UIManager:close(action_dialog)
+            end
+            local function stage_copy()
+                close_actions()
+                file_manager._zen_selected_clipboard = { files = files, cut = false }
+                file_manager.clipboard = nil
+                file_manager:onToggleSelectMode(true)
+            end
+            local function move_selected()
+                close_actions()
+                local cfg = ConfigManager.get()
+                local extra_roots = type(cfg) == "table"
+                    and type(cfg.additional_home_dirs) == "table"
+                    and cfg.additional_home_dirs or nil
+                local move_home_dir = paths.getHomeDir() or file_chooser.path
+                UIManager:show(MoveChooser:new{
+                    select_directory = true,
+                    select_file = false,
+                    show_files = true,
+                    title = _("Move to…"),
+                    path = move_home_dir,
+                    home_root = move_home_dir,
+                    extra_roots = extra_roots,
+                    onConfirm = function(destination)
+                        file_manager.cutfile = true
+                        file_manager:pasteSelectedFiles(false, destination)
+                    end,
+                })
+            end
+            local function show_status_menu()
+                close_actions()
+                local status_dialog
+                local statuses = {
+                    { icons.status, _("Unread"), nil },
+                    { icons.reading, _("Reading"), "reading" },
+                    { icons.tbr, _("To Be Read"), "tbr" },
+                    { icons.on_hold, _("On hold"), "abandoned" },
+                    { icons.finished, _("Finished"), "complete" },
+                }
+                local rows = {}
+                for _i, option in ipairs(statuses) do
+                    rows[#rows + 1] = {{
+                        text = option[1] .. "  " .. option[2],
+                        align = "left",
+                        callback = function()
+                            UIManager:close(status_dialog)
+                            set_selected_status(files, option[3])
+                            file_chooser:refreshPath()
+                        end,
+                    }}
+                end
+                status_dialog = new_context_menu_dialog{
+                    title = _("Read status"),
+                    title_align = "center",
+                    buttons = apply_button_group_font(rows),
+                }
+                UIManager:show(status_dialog)
+            end
+            local buttons = {
+                {{
+                    text = icons.copy .. "  " .. C_("File", "Copy"),
+                    align = "left",
+                    enabled = enabled,
+                    callback = stage_copy,
+                }},
+                {{
+                    text = icons.move .. "  " .. _("Move"),
+                    align = "left",
+                    enabled = enabled,
+                    callback = move_selected,
+                }},
+                {{
+                    text = icons.delete .. "  " .. _("Delete"),
+                    align = "left",
+                    enabled = enabled and allow_delete,
+                    callback = function()
+                        close_actions()
+                        local ConfirmBox = require("ui/widget/confirmbox")
+                        local confirmbox = ConfirmBox:new{
+                            text = _("Delete selected files?\nIf you delete a file, it is permanently lost.") .. "\n",
+                            ok_text = _("Delete"),
+                            ok_callback = function()
+                                file_manager:deleteSelectedFiles()
+                            end,
+                        }
+                        file_manager.addMetadataArcCheckButton(confirmbox)
+                        UIManager:show(confirmbox)
+                    end,
+                }},
+                {{
+                    text = icons.read_status .. "  " .. _("Read status") .. "  " .. submenu_arrow,
+                    align = "left",
+                    enabled = enabled,
+                    callback = show_status_menu,
+                }},
+                {{
+                    text = "\u{F04CE}  " .. _("Add to collection") .. "  " .. submenu_arrow,
+                    align = "left",
+                    enabled = enabled,
+                    callback = function()
+                        close_actions()
+                        show_collection_picker(files, function()
+                            file_chooser:refreshPath()
+                            local home = zen_plugin and SharedState.get(zen_plugin, "home")
+                            if home and home.invalidateLibraryCache then
+                                home.invalidateLibraryCache()
+                            end
+                        end)
+                    end,
+                }},
+                {{
+                    text = icons.clear .. "  " .. _("Exit select mode"),
+                    align = "left",
+                    callback = function()
+                        close_actions()
+                        file_manager:onToggleSelectMode()
+                    end,
+                }},
+            }
+            local cover_h = Device.screen:scaleBySize(140)
+            local cover_w = math.floor(cover_h * Cover.getRatio())
+            local folder_cover = Cover.makeCover("zen-selected://", {
+                genItemTableFromPath = function() return items end,
+            }, {
+                is_folder = true,
+                max_w = cover_w,
+                max_h = cover_h,
+                folder_name = title,
+            })
+            local header
+            if folder_cover then
+                require("modules/filebrowser/patches/home/widgets/cover_common")
+                    .decorate_cover_frame(folder_cover)
+                local Size = require("ui/size")
+                local dialog_w = math.floor(math.min(
+                    Device.screen:getWidth(), Device.screen:getHeight()) * 0.9)
+                local available_w = dialog_w - 2 * (Size.border.window + Size.padding.button)
+                    - 2 * (Size.padding.default + Size.margin.default)
+                local gap = Device.screen:scaleBySize(8)
+                local text_w = math.max(available_w - cover_w - 2 * Cover.BORDER_SIZE - gap,
+                    Device.screen:scaleBySize(60))
+                header = LeftContainer:new{
+                    dimen = Geom:new{ w = available_w, h = cover_h + 2 * Cover.BORDER_SIZE },
+                    HorizontalGroup:new{
+                        align = "center",
+                        folder_cover,
+                        HorizontalSpan:new{ width = gap },
+                        VerticalGroup:new{
+                            align = "left",
+                            TextWidget:new{
+                                text = title,
+                                face = library_font.getFace(20),
+                                bold = true,
+                                max_width = text_w,
+                            },
+                        },
+                    },
+                }
+            end
+            action_dialog = new_context_menu_dialog{
+                title = not header and title or nil,
+                title_align = "center",
+                buttons = apply_button_group_font(buttons),
+                _added_widgets = header and { header } or nil,
+                _zen_cover_widget = folder_cover,
+            }
+            UIManager:show(action_dialog)
+        end
+
+        file_manager.showSelectedFilesList = show_selected_actions
+
+        file_manager.onShowPlusMenu = function()
+            if file_manager.selected_files == nil then
+                return FileManager.onShowPlusMenu(file_manager)
+            end
+            file_manager:showSelectedFilesList()
+            return true
+        end
 
         local function resolveItemKey(item)
             if type(item) ~= "table" then return nil end
@@ -449,14 +932,10 @@ local function apply_context_menu()
                     end
                     widget.dim = item.dim
 
-                    -- List layout bakes the dim/selection state into its widget
-                    -- subtree at update() time (listmenu.lua: self.file_deleted =
-                    -- self.entry.dim), unlike mosaic which reads self.dim live in
-                    -- paintTo. Without re-running update() the list repaints its
-                    -- stale tree, so the highlight only appears after a page turn
-                    -- rebuilds all items. Re-baking one item is cheaper than the
-                    -- stock full updateItems(1, true).
-                    if type(widget.update) == "function" then
+                    -- Keep mosaic covers intact; list rows need their selection styling rebuilt.
+                    if widget._zen_cover_frame then
+                        widget._zen_cover_frame.dim = nil
+                    elseif type(widget.update) == "function" then
                         pcall(function() widget:update() end)
                     end
 
@@ -763,6 +1242,10 @@ local function apply_context_menu()
                     }})
                 end
 
+                local archive_row = archive_context_row(
+                    FileManager.instance, item.path, item.is_file)
+                if archive_row then table.insert(buttons, archive_row) end
+
                 if item._zen_extra_buttons then
                     for _i, row in ipairs(item._zen_extra_buttons) do
                         table.insert(buttons, row)
@@ -772,6 +1255,7 @@ local function apply_context_menu()
                 self_fc.file_dialog = new_context_menu_dialog{
                     buttons = apply_button_group_font(buttons),
                     _added_widgets = { header_widget },
+                    _zen_cover_widget = framed_gallery,
                 }
                 UIManager:show(self_fc.file_dialog)
                 return true
@@ -780,13 +1264,15 @@ local function apply_context_menu()
             local home_dir = paths.getHomeDir()
             local cur_path = self_fc.path or ""
             if home_dir and not item._zen_collection_name and not item._zen_home_context then
-                if not paths.isInHomeDir(cur_path) then
+                if not paths.isInThemedDir(cur_path) then
                     return orig_showFileDialog(self_fc, item)
                 end
             end
 
             local file               = item.path
             local is_file            = item.is_file
+            local is_kindle_book     = item._zen_kindle_book == true
+            local is_kindle_processed = item._zen_kindle_processed == true
             local is_not_parent_folder = not item.is_go_up
             local is_home_dir = (not is_file) and paths.isHomeRoot(file)
             -- Only the primary library root uses global sort/display; additional
@@ -860,7 +1346,21 @@ local function apply_context_menu()
                 end
             end
 
-            local dialog_title, dialog_cover_widget
+            local function refresh_after_folder_cover_change(folder_path)
+                UIManager:nextTick(function()
+                    refresh_after_sort_change(folder_path)
+                    local plug = zen_plugin or rawget(_G, "__ZEN_UI_PLUGIN")
+                    local home = plug and SharedState.get(plug, "home")
+                    if home and type(home.invalidateLibraryCache) == "function" then
+                        home.invalidateLibraryCache()
+                    end
+                    if home and type(home.rebuildActive) == "function" then
+                        home.rebuildActive()
+                    end
+                end)
+            end
+
+            local dialog_title, dialog_cover_widget, book_props, kindle_series_str
 
             local function showCoverFullscreen(cover_path)
                 local ok2, bim2 = pcall(require, "bookinfomanager")
@@ -969,6 +1469,15 @@ local function apply_context_menu()
                             max_width = text_col_w,
                         })
                     end
+                    if is_kindle_book then
+                        table.insert(vstack, VerticalSpan:new{ width = Screen:scaleBySize(2) })
+                        table.insert(vstack, TextWidget:new{
+                            text = _("Kindle Library"),
+                            face = library_font.getFace(fs_tags),
+                            fgcolor = Blitbuffer.COLOR_GRAY_3,
+                            max_width = text_col_w,
+                        })
+                    end
                     if series_str_arg then
                         table.insert(vstack, VerticalSpan:new{ width = Screen:scaleBySize(2) })
                         table.insert(vstack, TextWidget:new{
@@ -1058,6 +1567,7 @@ local function apply_context_menu()
                     local title_str, authors_str, tags_str_local, series_str_local
                     if ok then
                         local bookinfo = BookInfoManager:getBookInfo(file, true)
+                        book_props = bookinfo
                         if bookinfo then
                             if not bookinfo.ignore_meta then
                                 if bookinfo.title then
@@ -1066,11 +1576,8 @@ local function apply_context_menu()
                                 end
                                 if bookinfo.series then
                                     local s = BD.auto(bookinfo.series)
-                                    if bookinfo.series_index then
-                                        series_str_local = string.format("%s #%.4g", s, bookinfo.series_index)
-                                    else
-                                        series_str_local = s
-                                    end
+                                    local index = tonumber(bookinfo.series_index)
+                                    series_str_local = index and string.format("%s #%.4g", s, index) or s
                                 end
                                 if bookinfo.keywords and bookinfo.keywords ~= "" then
                                     tags_str_local = bookinfo.keywords
@@ -1117,7 +1624,11 @@ local function apply_context_menu()
                     if title_str then
                         text_str = title_str
                         if authors_str then text_str = text_str .. "\n" .. authors_str end
-                        if series_str_local then text_str = text_str .. "\n" .. series_str_local end
+                        if is_kindle_book then
+                            kindle_series_str = series_str_local
+                        elseif series_str_local then
+                            text_str = text_str .. "\n" .. series_str_local
+                        end
                     end
                     dialog_title = text_str or BD.filename(file:match("([^/]+)$"))
                 else
@@ -1384,6 +1895,24 @@ local function apply_context_menu()
                             max_width = text_col_w,
                         })
                     end
+                    if is_kindle_book then
+                        table.insert(vstack, VerticalSpan2:new{ width = Screen:scaleBySize(2) })
+                        table.insert(vstack, TextWidget2:new{
+                            text = _("Kindle Library"),
+                            face = library_font.getFace(14),
+                            fgcolor = Blitbuffer2.COLOR_GRAY_3,
+                            max_width = text_col_w,
+                        })
+                    end
+                    if kindle_series_str then
+                        table.insert(vstack, VerticalSpan2:new{ width = Screen:scaleBySize(2) })
+                        table.insert(vstack, TextWidget2:new{
+                            text = kindle_series_str,
+                            face = library_font.getFace(17),
+                            fgcolor = Blitbuffer2.COLOR_GRAY_3,
+                            max_width = text_col_w,
+                        })
+                    end
                     if pages_str then
                         table.insert(vstack, VerticalSpan2:new{ width = Screen:scaleBySize(3) })
                         table.insert(vstack, TextWidget2:new{
@@ -1411,42 +1940,106 @@ local function apply_context_menu()
                 if is_virtual_folder then return end
                 close_dialog()
                 local edit_dialog
-                local has_selected_files = file_manager.selected_files
-                    and next(file_manager.selected_files) ~= nil
-
-                local function showSelectedFilesPasteDialog()
-                    local action_dialog
-                    local function paste_selected(cutfile)
-                        UIManager:close(action_dialog)
-                        file_manager.cutfile = cutfile
-                        file_manager:showCopyMoveSelectedFilesDialog(function() end, file)
-                    end
-                    action_dialog = new_context_menu_dialog{
-                        title = _("Paste selected files"),
-                        title_align = "center",
-                        buttons = apply_button_group_font({{
-                            {
-                                text = icons.copy .. "  " .. C_("File", "Copy"),
-                                align = "left",
-                                callback = function() paste_selected(false) end,
-                            },
-                            {
-                                text = icons.move .. "  " .. _("Move"),
-                                align = "left",
-                                callback = function() paste_selected(true) end,
-                            },
-                        }}),
-                    }
-                    UIManager:show(action_dialog)
-                end
-
                 local function paste()
                     UIManager:close(edit_dialog)
-                    if file_manager.clipboard then
+                    if file_manager._zen_selected_clipboard then
+                        file_manager:pasteSelectedFilesFromZenClipboard(file)
+                    elseif file_manager.clipboard then
                         file_manager:pasteFileFromClipboard(file)
-                    elseif has_selected_files then
-                        showSelectedFilesPasteDialog()
                     end
+                end
+
+                local function showFolderCoverDialog()
+                    UIManager:close(edit_dialog)
+                    local mode = Cover.getMode()
+                    local slot_count = FolderCoverFiles.slotCount(mode)
+                    if slot_count < 1 then return end
+
+                    local existing = FolderCoverFiles.find(file, mode) or {}
+                    local DocumentRegistry = require("document/documentregistry")
+                    local active_config = zen_plugin and zen_plugin.config
+                        or ConfigManager.get() or {}
+                    local features = type(active_config.features) == "table"
+                        and active_config.features or {}
+                    local mosaic_specs
+                    if self_fc.display_mode_type == "mosaic" then
+                        mosaic_specs = self_fc._zen_file_cover_specs
+                        if type(mosaic_specs) ~= "table" then
+                            mosaic_specs = self_fc.cover_specs
+                        end
+                        if type(mosaic_specs) ~= "table" then mosaic_specs = nil end
+                    end
+                    local mosaic_uniform = features.browser_cover_mosaic_uniform == true
+                    if mosaic_specs and type(mosaic_specs.uniform) == "boolean" then
+                        mosaic_uniform = mosaic_specs.uniform
+                    end
+                    local mosaic_portrait
+                    if mosaic_specs then
+                        mosaic_portrait = Device.screen:getWidth()
+                            <= Device.screen:getHeight()
+                    end
+                    FolderCoverPicker.show{
+                        title = _("Set folder cover"),
+                        path = file,
+                        slot_count = slot_count,
+                        covers = existing,
+                        cover_ratio = Cover.getRatio(),
+                        border = Cover.BORDER_SIZE,
+                        uniform = mosaic_uniform,
+                        mosaic_cover_width = mosaic_specs
+                            and mosaic_specs.max_cover_w or nil,
+                        mosaic_cover_height = mosaic_specs
+                            and mosaic_specs.max_cover_h or nil,
+                        mosaic_portrait = mosaic_portrait,
+                        mosaic_cols_portrait = self_fc.nb_cols_portrait,
+                        mosaic_rows_portrait = self_fc.nb_rows_portrait,
+                        mosaic_cols_landscape = self_fc.nb_cols_landscape,
+                        mosaic_rows_landscape = self_fc.nb_rows_landscape,
+                        on_select = function(slot, update_preview)
+                            UIManager:show(PathChooser:new{
+                                select_directory = false,
+                                select_file = true,
+                                show_files = true,
+                                path = file,
+                                file_filter = function(filename)
+                                    return FolderCoverFiles.isSupportedImage(filename)
+                                        and DocumentRegistry:isImageFile(filename)
+                                end,
+                                onConfirm = function(source)
+                                    local selected_path, err = FolderCoverFiles.set(
+                                        file, mode, slot, source)
+                                    if not selected_path then
+                                        logger.warn("Failed to set folder cover",
+                                            "folder=", file, "slot=", slot,
+                                            "error=", tostring(err or "unknown"))
+                                        local InfoMessage = require("ui/widget/infomessage")
+                                        UIManager:show(InfoMessage:new{
+                                            text = _("Failed to set folder cover."),
+                                        })
+                                        return
+                                    end
+                                    update_preview(selected_path)
+                                    refresh_after_folder_cover_change(file)
+                                end,
+                            }, "full")
+                        end,
+                        on_clear = function(slot, update_preview)
+                            local cleared, err = FolderCoverFiles.clear(
+                                file, mode, slot)
+                            if not cleared then
+                                logger.warn("Failed to clear folder cover",
+                                    "folder=", file, "slot=", slot,
+                                    "error=", tostring(err or "unknown"))
+                                local InfoMessage = require("ui/widget/infomessage")
+                                UIManager:show(InfoMessage:new{
+                                    text = _("Failed to clear folder cover."),
+                                })
+                                return
+                            end
+                            update_preview(nil)
+                            refresh_after_folder_cover_change(file)
+                        end,
+                    }
                 end
 
                 if is_home_dir then
@@ -1455,7 +2048,7 @@ local function apply_context_menu()
                             {{
                                 text = "\u{F0192}  " .. C_("File", "Paste"),
                                 align = "left",
-                                enabled = (file_manager.clipboard or has_selected_files) and true or false,
+                                enabled = (file_manager.clipboard or file_manager._zen_selected_clipboard) and true or false,
                                 callback = paste,
                             }},
                         }),
@@ -1491,12 +2084,14 @@ local function apply_context_menu()
                         {
                             text = "\u{F0192}  " .. C_("File", "Paste"),
                             align = "left",
-                            enabled = (file_manager.clipboard or has_selected_files) and true or false,
+                            enabled = (file_manager.clipboard or file_manager._zen_selected_clipboard) and true or false,
                             callback = paste,
                         },
                     },
                 }
-                if not item._zen_collection_name and not item._zen_disable_select then
+                if is_kindle_processed then edit_buttons = {} end
+                if not is_kindle_processed and not item._zen_collection_name
+                        and not item._zen_disable_select then
                     table.insert(edit_buttons, 1, {
                         {
                             text = "\u{F0489}  " .. _("Select"),
@@ -1524,13 +2119,52 @@ local function apply_context_menu()
                             end,
                         },
                     })
+                else
+                    local mode = Cover.getMode()
+                    if FolderCoverFiles.slotCount(mode) > 0 then
+                        table.insert(edit_buttons, {
+                            {
+                                text = icons.settings_covers .. "  " .. _("Set folder cover")
+                                    .. "  " .. submenu_arrow,
+                                align = "left",
+                                callback = showFolderCoverDialog,
+                            },
+                        })
+                    end
+                end
+
+                if is_file then
+                    table.insert(edit_buttons, {
+                        {
+                            text = icons.edit .. "  " .. _("Edit metadata"),
+                            align = "left",
+                            callback = function()
+                                UIManager:close(edit_dialog)
+                                local bookinfo = file_manager.bookinfo
+                                if not bookinfo.showFromBookDetails then
+                                    bookinfo:show(file)
+                                    return
+                                end
+                                local function refresh_metadata(updated_file)
+                                    file = updated_file or file
+                                    require("modules/filebrowser/metadata/service")
+                                        .refreshLibrary(file_manager, file)
+                                end
+                                bookinfo:showFromBookDetails(file, nil, {
+                                    on_renamed = refresh_metadata,
+                                    on_saved = refresh_metadata,
+                                    on_restored = refresh_metadata,
+                                })
+                            end,
+                        },
+                    })
                 end
 
                 local allow_delete = zen_plugin
                     and type(zen_plugin.config) == "table"
                     and type(zen_plugin.config.context_menu) == "table"
                     and zen_plugin.config.context_menu.allow_delete == true
-                if allow_delete then
+                if allow_delete and not is_kindle_processed then
                     table.insert(edit_buttons, {
                         {
                             text = "\u{F0156}  " .. _("Delete"),
@@ -1550,6 +2184,47 @@ local function apply_context_menu()
                 UIManager:show(edit_dialog)
             end
 
+            local plugin_action_rows
+            local added_plugin_buttons = file_manager.file_dialog_added_buttons
+                or FileManager.file_dialog_added_buttons
+            local context_menu_config = zen_plugin
+                and type(zen_plugin.config) == "table"
+                and type(zen_plugin.config.context_menu) == "table"
+                and zen_plugin.config.context_menu
+            if context_menu_config and context_menu_config.show_plugin_actions == true
+                    and not is_virtual_folder and type(added_plugin_buttons) == "table" then
+                local rows = {}
+                local hidden_index = added_plugin_buttons.index
+                    and added_plugin_buttons.index.coverbrowser_2
+                for _i = 1, #added_plugin_buttons do
+                    local ok, row
+                    if _i ~= hidden_index then
+                        ok, row = pcall(added_plugin_buttons[_i], file, is_file, book_props)
+                    end
+                    if ok and type(row) == "table" and #row > 0 then
+                        for _j, button in ipairs(row) do
+                            if type(button) == "table" then
+                                local clean_button = {}
+                                for key, value in pairs(button) do clean_button[key] = value end
+                                clean_button.align = "left"
+                                clean_button.icon = nil
+                                clean_button.icon_func = nil
+                                table.insert(rows, { clean_button })
+                            end
+                        end
+                    end
+                end
+                if #rows > 0 then plugin_action_rows = rows end
+            end
+
+            local function showPluginActionsSubmenu()
+                close_dialog()
+                self_fc.file_dialog = new_context_menu_dialog{
+                    buttons = apply_button_group_font(plugin_action_rows),
+                }
+                UIManager:show(self_fc.file_dialog)
+            end
+
             -- Main dialog buttons
             local buttons = {}
 
@@ -1562,21 +2237,8 @@ local function apply_context_menu()
                             close_dialog()
                             require("modules/reader/book_details").showFile(file, {
                                 config = zen_plugin and zen_plugin.config,
-                                edit_callback = function(details_widget)
-                                    local bookinfo = file_manager.bookinfo
-                                    if bookinfo.showFromBookDetails then
-                                        bookinfo:showFromBookDetails(file, nil, {
-                                            close_parent_callback = function()
-                                                if details_widget
-                                                        and type(details_widget.onClose) == "function" then
-                                                    details_widget:onClose()
-                                                end
-                                            end,
-                                        })
-                                    else
-                                        bookinfo:show(file)
-                                    end
-                                end,
+                                plugin = zen_plugin,
+                                home_context = item._zen_home_context == true,
                             })
                         end,
                     },
@@ -1637,6 +2299,7 @@ local function apply_context_menu()
                                 show_files = true,
                                 title = _("Move to…"),
                                 path = move_home_dir,
+                                home_root = move_home_dir,
                                 src_dir = src_dir,
                                 extra_roots = _extra,
                                 onConfirm = function(dest_dir_real)
@@ -1734,58 +2397,12 @@ local function apply_context_menu()
                             align = "left",
                             callback = function()
                                 close_dialog()
-                                local Menu_cp = require("ui/widget/menu")
-                                local default_coll = ReadCollection.default_collection_name
-                                local all_colls = {}
-                                for cn, _v in pairs(ReadCollection.coll) do
-                                    table.insert(all_colls, cn)
-                                end
-                                table.sort(all_colls, function(a, b)
-                                    if a == default_coll then return true end
-                                    if b == default_coll then return false end
-                                    return a < b
+                                show_collection_picker({ [file] = true }, function()
+                                    if item._zen_collection_refresh then
+                                        UIManager:nextTick(item._zen_collection_refresh)
+                                    end
+                                    UIManager:nextTick(invalidate_home_book)
                                 end)
-                                local items = {}
-                                for _i, cn in ipairs(all_colls) do
-                                    local display = cn == default_coll and _("Favorites") or cn
-                                    local already_in = ReadCollection:isFileInCollection(file, cn)
-                                    table.insert(items, {
-                                        text = display .. (already_in and "  \u{2713}" or ""),
-                                        mandatory = already_in and _("added") or nil,
-                                        dim = already_in,
-                                        _cn = cn,
-                                    })
-                                end
-                                local coll_picker
-                                coll_picker = Menu_cp:new{
-                                    title = _("Add to collection"),
-                                    item_table = items,
-                                    is_borderless = true,
-                                    is_popout = false,
-                                    onMenuSelect = function(self_m, item_m)
-                                        if item_m.dim then return true end
-                                        UIManager:close(coll_picker)
-                                        local TBRIndex = require("common/tbr_index")
-                                        if item_m._cn == TBRIndex.collectionName() then
-                                            TBRIndex.setExplicit(file, true)
-                                        else
-                                            ReadCollection:addItem(file, item_m._cn)
-                                            ReadCollection:write({ [item_m._cn] = true })
-                                        end
-                                        pcall(function()
-                                            TBRIndex.collectionChanged(item_m._cn)
-                                        end)
-                                        if item._zen_collection_refresh then
-                                            UIManager:nextTick(item._zen_collection_refresh)
-                                        end
-                                        UIManager:nextTick(invalidate_home_book)
-                                        return true
-                                    end,
-                                    close_callback = function()
-                                        UIManager:close(coll_picker)
-                                    end,
-                                }
-                                UIManager:show(coll_picker)
                             end,
                         },
                     })
@@ -1909,7 +2526,11 @@ local function apply_context_menu()
                         align = "left",
                         callback = function()
                             close_dialog()
-                            refresh_book_info()
+                            if type(item._zen_refresh) == "function" then
+                                item._zen_refresh(file)
+                            else
+                                refresh_book_info()
+                            end
                         end,
                     },
                 })
@@ -1992,7 +2613,7 @@ local function apply_context_menu()
 
             if not is_file and is_not_parent_folder then
                 local SORT_OPTIONS = {
-                    { key = "title", text = "\u{F04BB}  " .. _("Title") },
+                    { key = "title", text = "\u{F031}  " .. _("Title") },
                     { key = "title_natural", text = "\u{F04BB}  " .. _("Title natural") },
                     { key = "strcoll", text = icons.filename .. "  " .. _("Filename") },
                     { key = "authors", text = "\u{F0013}  " .. _("Authors") },
@@ -2214,12 +2835,26 @@ local function apply_context_menu()
                 })
             end
 
-            if not item._zen_home_context and not is_virtual_folder then
+            if not is_virtual_folder and (not is_kindle_book or is_kindle_processed) then
                 table.insert(buttons, {
                     {
                         text = "\u{F090C}  " .. _("Edit") .. "  " .. submenu_arrow,
                         align = "left",
                         callback = showEditSubmenu,
+                    },
+                })
+            end
+
+            local archive_row = archive_context_row(
+                FileManager.instance, file, is_file)
+            if archive_row then table.insert(buttons, archive_row) end
+
+            if plugin_action_rows then
+                table.insert(buttons, {
+                    {
+                        text = icons.more .. "  " .. _("More") .. "  " .. submenu_arrow,
+                        align = "left",
+                        callback = showPluginActionsSubmenu,
                     },
                 })
             end
@@ -2279,6 +2914,7 @@ local function apply_context_menu()
                 title_align = "center",
                 buttons = apply_button_group_font(buttons),
                 _added_widgets = dialog_cover_widget and { dialog_cover_widget } or nil,
+                _zen_cover_widget = dialog_cover_widget and dialog_cover_widget[1][1],
             }
             UIManager:show(self_fc.file_dialog)
             return true
@@ -2304,7 +2940,7 @@ local function apply_context_menu()
                 local home_dir_bh = paths.getHomeDir()
                 local cur_path_bh = fc.path or ""
                 if home_dir_bh then
-                    if not paths.isInHomeDir(cur_path_bh) then return false end
+                    if not paths.isInThemedDir(cur_path_bh) then return false end
                 end
                 local ffiUtil_bh = require("ffi/util")
                 local cur_real = ffiUtil_bh.realpath(cur_path_bh) or cur_path_bh

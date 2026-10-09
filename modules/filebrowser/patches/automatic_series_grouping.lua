@@ -59,6 +59,12 @@ local function apply_automatic_series_grouping()
         return features.automatic_series_grouping ~= false
     end
 
+    local function is_hide_grouped_series_enabled()
+        local plugin = get_plugin()
+        local features = plugin and plugin.config and plugin.config.features
+        return type(features) == "table" and features.hide_grouped_series == true
+    end
+
     local function can_group_items(file_chooser)
         -- PathChooser inherits FileChooser, but its items must always map to
         -- real paths so callers can navigate or select them.
@@ -316,10 +322,22 @@ local function apply_automatic_series_grouping()
         if not file_chooser or not item_table then return end
         if file_chooser.show_current_dir_for_hold then return end
 
+        local status_filter = FileChooser.show_filter and FileChooser.show_filter.status
+        if status_filter then
+            local status_api = get_book_status()
+            for index = #item_table, 1, -1 do
+                local item = item_table[index]
+                if item.is_file and item.path
+                        and not status_filter[status_api.getDisplayStatusFromFile(item.path)] then
+                    table.remove(item_table, index)
+                end
+            end
+        end
+
         local current_dir_cache = {}
         local first_file_path
         for _i, item in ipairs(item_table) do
-            if item.is_file and item.path then
+            if item.is_file and item.path and type(item.doc_props) ~= "table" then
                 first_file_path = item.path
                 break
             end
@@ -352,6 +370,7 @@ local function apply_automatic_series_grouping()
         local processed_list = {}
         local book_count = 0
         local non_series_book_count = 0
+        local hide_grouped_series = is_hide_grouped_series_enabled()
 
         for _i, item in ipairs(item_table) do
             if item.is_go_up then
@@ -429,7 +448,7 @@ local function apply_automatic_series_grouping()
             if series_count > 1 then break end
         end
 
-        if series_count == 1 and non_series_book_count == 0 and book_count > 0 then
+        if not hide_grouped_series and series_count == 1 and non_series_book_count == 0 and book_count > 0 then
             return
         end
 
@@ -443,6 +462,17 @@ local function apply_automatic_series_grouping()
                 set_series_status(group)
                 self:sortSeriesItems(group.series_items, group, file_chooser)
             end
+        end
+
+        if hide_grouped_series then
+            local visible = {}
+            for _i, item in ipairs(processed_list) do
+                if not (item.is_series_group and type(item.series_items) == "table"
+                        and #item.series_items > 1) then
+                    table.insert(visible, item)
+                end
+            end
+            processed_list = visible
         end
 
         local final_table = {}

@@ -25,9 +25,13 @@ local function featured_defaults()
             left = "percent",
             right = "total_pages",
         },
+        show_author = true,
+        show_series = true,
         show_progress = true,
         show_description = true,
         wrap_description_text = false,
+        justify_description_text = false,
+        format_description_html = false,
         show_status_bar = true,
         status_bar_bold_text = true,
         status_bar_show_bottom_border = true,
@@ -70,6 +74,7 @@ local function strip_defaults(opts)
         interactive = true,
         order = "default",
         show_badges = false,
+        show_page_indicator = true,
         show_strip_titles = false,
         sources = {
             custom = { paths = {} },
@@ -131,6 +136,7 @@ local DEFAULT_HOME_PAGE = {
         yearly_books_target = 12,
     },
     show_status_bar = false,
+    edit_mode = true,
     modules = {
         datetime = {
             automatic_font_size = true,
@@ -143,7 +149,7 @@ local DEFAULT_HOME_PAGE = {
         stats_triplet = {
             automatic_font_size = true,
             font_size = 16,
-            max_font_size = 22,
+            max_font_size = 18,
             stat_style = "divider",
         },
         strip = strip_defaults{ controls = true },
@@ -216,7 +222,7 @@ local BOOKSHELF_HOME_PAGE = {
         reading_goals = {},
         stats_triplet = {
             automatic_font_size = true,
-            max_font_size = 22,
+            max_font_size = 18,
             stat_style = "divider",
         },
         strip = strip_defaults{ count = 8, controls = true, two_rows = true },
@@ -444,13 +450,13 @@ end
 local LEGACY_STRIP_MODULE_IDS = { "strip_recent", "strip_custom", "strip_tag", "strip_tbr" }
 local STRIP_COMMON_KEYS = {
     "center_books", "count", "interactive", "order", "show_badges",
-    "show_strip_titles", "two_rows",
+    "show_page_indicator", "show_strip_titles", "two_rows",
 }
 
 local VALID_CONTROL_IDS = {
     recent = true, favorites = true, to_be_read = true, authors = true,
     series = true, languages = true, tags = true, collections = true,
-    books = true, manga = true,
+    books = true, kindle = true, manga = true,
     news = true, continue = true, history = true, home = true,
     search = true, calibre_search = true, stats = true, exit = true, page_left = true,
     page_right = true, menu = true,
@@ -542,9 +548,11 @@ local function ensure_strip_shape(strip)
     local valid_sources = {
         recent = true, favorites = true, to_be_read = true, authors = true,
         series = true, languages = true, tags = true, collections = true, tag = true,
-        folder = true, custom = true,
+        status = true, folder = true, custom = true, kindle = true,
     }
-    if not valid_sources[strip.default_source.kind] then
+    if not valid_sources[strip.default_source.kind]
+            or strip.default_source.kind == "status"
+                and not ButtonModel.statusLabel(strip.default_source.value) then
         strip.default_source = { kind = "recent" }
         changed = true
     end

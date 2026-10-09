@@ -1,26 +1,42 @@
-name: Release Beta
+name: Release Alpha / Beta
 
 on:
   push:
     branches:
       - dev
   workflow_dispatch:
+    inputs:
+      channel:
+        description: Prerelease channel
+        required: true
+        default: beta
+        type: choice
+        options:
+          - beta
+          - alpha
 
 jobs:
   tests:
     name: Full test suite
+    needs: luacheck
     uses: ./.github/workflows/test.yml
     with:
       suite: full
+      ref: ${{ needs.luacheck.outputs.commit }}
 
   luacheck:
     name: LuaCheck
     runs-on: ubuntu-latest
     if: ${{ !contains(github.event.head_commit.message, 'ci-skip') }}
+    outputs:
+      commit: ${{ steps.checkout.outputs.commit }}
 
     steps:
       - name: Checkout
+        id: checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'dev' || github.sha }}
 
       - name: Run LuaCheck gate
         uses: ./.github/actions/luacheck-gate
@@ -38,6 +54,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.luacheck.outputs.commit }}
 
       - name: Read version from _meta.lua
         id: meta
@@ -50,17 +68,18 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve beta tag
+      - name: Resolve prerelease tag
         id: version_check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_CHANNEL: ${{ github.event_name == 'push' && 'alpha' || inputs.channel }}
         run: |
           META_VERSION="${{ steps.meta.outputs.version }}"
           BASE="v${META_VERSION}"
 
           # Get the latest release tag (including pre-releases)
           LATEST=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName \
-            --jq '.[0].tagName' 2>/dev/null | sed 's/^v//' | sed 's/-beta[0-9]*$//')
+            --jq '.[0].tagName' 2>/dev/null | sed 's/^v//' | sed -E 's/-(alpha|beta)[0-9]*$//')
 
           if [[ -n "$LATEST" ]]; then
             LOWER=$(printf '%s\n%s' "$META_VERSION" "$LATEST" | sort -V | head -1)
@@ -72,27 +91,46 @@ jobs:
           fi
 
           N=1
-          while gh release view "${BASE}-beta${N}" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; do
+          while gh release view "${BASE}-${RELEASE_CHANNEL}${N}" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; do
             N=$((N + 1))
           done
-          BETA_TAG="${BASE}-beta${N}"
-          BETA_VERSION="${META_VERSION}-beta${N}"
-          echo "tag=$BETA_TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$BETA_VERSION" >> "$GITHUB_OUTPUT"
+          PRERELEASE_TAG="${BASE}-${RELEASE_CHANNEL}${N}"
+          PRERELEASE_VERSION="${META_VERSION}-${RELEASE_CHANNEL}${N}"
+          echo "tag=$PRERELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$PRERELEASE_VERSION" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
 
-      - name: Stamp beta version in _meta.lua
+      - name: Stamp prerelease version in _meta.lua
         if: steps.version_check.outputs.skip == 'false'
         run: |
-          BETA_VERSION="${{ steps.version_check.outputs.version }}"
-          sed -i "s/version = \"[^\"]*\"/version = \"${BETA_VERSION}\"/" _meta.lua
+          PRERELEASE_VERSION="${{ steps.version_check.outputs.version }}"
+          sed -i "s/version = \"[^\"]*\"/version = \"${PRERELEASE_VERSION}\"/" _meta.lua
 
       - name: Install fonttools
         if: steps.version_check.outputs.skip == 'false'
         run: pip install fonttools
 
+      - name: Download latest ZenOS Launcher
+        if: steps.version_check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE=$(gh api repos/xZenLabs/zen-reader-scriptlet/releases/latest)
+          TAG=$(jq -r '.tag_name' <<< "$RELEASE")
+          URL=$(jq -r '.assets[] | select(.name == "ZenReader.sh") | .browser_download_url' <<< "$RELEASE")
+          SHA=$(jq -r '.assets[] | select(.name == "ZenReader.sh") | .digest | sub("^sha256:"; "")' <<< "$RELEASE")
+          [[ "$URL" == "https://github.com/xZenLabs/zen-reader-scriptlet/releases/download/$TAG/ZenReader.sh" ]] || exit 1
+          [[ "$SHA" =~ ^[0-9a-fA-F]{64}$ ]] || exit 1
+          mkdir -p kindle-launcher
+          curl -fsSL "$URL" -o kindle-launcher/ZenReader.sh
+          echo "$SHA  kindle-launcher/ZenReader.sh" | sha256sum -c -
+          grep -Fqx "# Version: ${TAG#v}" kindle-launcher/ZenReader.sh
+          curl -fsSL "https://raw.githubusercontent.com/xZenLabs/zen-reader-scriptlet/$TAG/LICENSE" -o kindle-launcher/LICENSE
+
       - name: Build and verify plugin zips
         if: steps.version_check.outputs.skip == 'false'
+        env:
+          ZENOS_REQUIRE_KINDLE_LAUNCHER: "1"
         run: ./spec/run package-check
 
       - name: Build release notes
@@ -114,7 +152,7 @@ jobs:
             --title "ZenOS $TAG" \
             --notes-file release_notes.md \
             --prerelease \
-            --target "${{ github.sha }}"
+            --target "${{ needs.luacheck.outputs.commit }}"
 
       - name: Refresh ZenPM package
         if: steps.version_check.outputs.skip == 'false'

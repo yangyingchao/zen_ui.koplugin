@@ -58,7 +58,7 @@ local function title_back_range(title_bar)
         y = dimen.y,
         w = math.min(dimen.w, title_bar.title_widget:getSize().w),
         h = dimen.h,
-    }
+    }:combine(title_bar.back_button.dimen)
 end
 
 local function default_status_factory(plugin)
@@ -147,10 +147,12 @@ function ZenSettingsTitleBar:clearStatusRefresh()
 end
 
 function ZenSettingsTitleBar:onNetworkConnected()
+    if self.status_widget then self._zen_status_needs_refresh = true end
     refresh_status_on_device_event(self)
 end
 
 ZenSettingsTitleBar.onNetworkDisconnected = ZenSettingsTitleBar.onNetworkConnected
+ZenSettingsTitleBar.onNetworkStateChanged = ZenSettingsTitleBar.onNetworkConnected
 
 function ZenSettingsTitleBar:onCharging()
     if file_manager_dispatches_status_refresh() then return end
@@ -174,6 +176,7 @@ function ZenSettingsTitleBar:onSuspend()
 end
 
 function ZenSettingsTitleBar:init()
+    self._zen_status_needs_refresh = nil
     self.width = self.width or Screen:getWidth()
     self.show_parent = self.show_parent or self
     self:clearStatusRefresh()
@@ -186,35 +189,74 @@ function ZenSettingsTitleBar:init()
     local close_hitbox_left_inset = Screen:scaleBySize(4)
     local close_hitbox_bottom_inset = Screen:scaleBySize(12)
     local title_leading_padding = TitleStyle.TITLE_LEADING_PADDING
+        or IconItem.getSettingsIconGap()
     self.title_leading_padding = title_leading_padding
     local root_icon_size = math.min(button_size, Screen:scaleBySize(32))
     local root_icon_inset = button_size - root_icon_size
     local root_icon_inset_start = math.floor(root_icon_inset / 2)
     local root_icon_inset_end = root_icon_inset - root_icon_inset_start
-    local left_padding = TitleStyle.LEFT_PADDING
+    local leading_width = TitleStyle.LEADING_WIDTH or IconItem.SETTINGS_ICON_WIDTH
+    local left_padding = TitleStyle.LEFT_PADDING or IconItem.getSettingsLeftPadding()
     local right_padding = TitleStyle.RIGHT_PADDING
-    local back_width = button_size
+    local back_width = leading_width
     local show_search = self.search_expanded == true and self.search_visible ~= false
     local show_search_button = self.search_visible ~= false and not show_search
+    local show_action = self.action and not show_search
+    local show_toggle = self.toggle and not show_search
+    local show_close = self.close_visible ~= false
     local title_cap = math.min(Screen:scaleBySize(150), math.floor(self.width * 0.25))
     local title_width = title_cap
     self.action_button = nil
     local action_width = 0
-    if self.action then
+    if show_action then
         if self.action.text then
             self.action_button = Button:new{
                 text = self.action.text,
+                height = self.action.height,
                 bordersize = 0,
                 radius = 0,
-                padding_h = Size.padding.default,
+                padding_h = self.action.padding_h
+                    or TitleStyle.ACTION_PADDING_H or Size.padding.default,
                 padding_v = Size.padding.small,
                 text_font_face = "smallinfofont",
-                text_font_size = 18,
+                text_font_size = self.action.text_font_size
+                    or TitleStyle.ACTION_FONT_SIZE or 18,
                 text_font_bold = true,
                 allow_flash = false,
                 show_parent = self.show_parent,
                 callback = self.action.callback,
             }
+            if self.action.zen_button then
+                local ZenButton = require("common/ui/zen_button")
+                local radius = self.action.radius or Screen:scaleBySize(8)
+                local border = Screen:scaleBySize(1)
+                self.action_button._zen_filled = self.action.filled == true
+                self.action_button.paintTo = function(button, bb, x, y)
+                    button.dimen.x, button.dimen.y = x, y
+                    local filled = button._zen_filled ~= (button._zen_focused == true)
+                    local max_text_width = math.max(1,
+                        button.dimen.w - 2 * (button.padding_h or 0))
+                    if filled then
+                        ZenButton.paintFilled(bb, x, y, button.dimen.w, button.dimen.h,
+                            button.text, button.text_font_size, radius, max_text_width)
+                    else
+                        ZenButton.paintOutlined(bb, x, y, button.dimen.w, button.dimen.h,
+                            button.text, button.text_font_size, radius, border, max_text_width)
+                    end
+                end
+                self.action_button.onFocus = function(button)
+                    button._zen_focused = true
+                    UIManager:setDirty(button.show_parent, "fast", button.dimen)
+                    return true
+                end
+                self.action_button.onUnfocus = function(button)
+                    button._zen_focused = false
+                    UIManager:setDirty(button.show_parent, "fast", button.dimen)
+                    return true
+                end
+                self.action_button._doFeedbackHighlight = function() end
+                self.action_button._undoFeedbackHighlight = function() end
+            end
         else
             self.action_button = ZenIconButton:new{
                 file = self.action.file,
@@ -229,12 +271,31 @@ function ZenSettingsTitleBar:init()
         end
         action_width = self.action_button:getSize().w
     end
-    local trailing_controls = 1 + (self.action and 1 or 0)
+    self.toggle_button = nil
+    local toggle_width = 0
+    if show_toggle then
+        local toggle = require("common/ui/zen_toggle"):new{
+            width = IconItem.SETTINGS_TOGGLE_WIDTH,
+            height = IconItem.SETTINGS_TOGGLE_HEIGHT,
+            value_func = self.toggle.value_func,
+        }
+        self.toggle_button = Button:new{
+            text = "", width = toggle:getSize().w + 2 * button_padding,
+            height = icon_size, padding = button_padding, bordersize = 0, radius = 0,
+            show_parent = self.show_parent, callback = self.toggle.callback,
+        }
+        WidgetResources.free(self.toggle_button.label_widget)
+        self.toggle_button.label_container[1] = toggle
+        self.toggle_button.label_widget = toggle
+        toggle_width = self.toggle_button:getSize().w
+    end
+    local trailing_controls = (show_close and 1 or 0) + (show_action and 1 or 0)
+        + (show_toggle and 1 or 0)
         + (show_search_button and 1 or 0)
-    local trailing_gap = Screen:scaleBySize(4)
-    local trailing_width = button_size + action_width
+    local trailing_gap = TitleStyle.TRAILING_GAP or Screen:scaleBySize(4)
+    local trailing_width = (show_close and button_size or 0) + action_width + toggle_width
         + (show_search_button and button_size or 0)
-        + (trailing_controls - 1) * trailing_gap
+        + math.max(0, trailing_controls - 1) * trailing_gap
     local max_title_width = math.max(1,
         self.width - left_padding - right_padding - back_width - title_leading_padding
             - trailing_width)
@@ -300,9 +361,12 @@ function ZenSettingsTitleBar:init()
         show_parent = self.show_parent,
     }
     self.root_icon.skip_paint = self.back_visible == true
-    self.leading_container = OverlapGroup:new{
-        self.root_icon,
-        self.back_button,
+    self.leading_container = CenterContainer:new{
+        dimen = Geom:new{ w = leading_width, h = row_height },
+        OverlapGroup:new{
+            self.root_icon,
+            self.back_button,
+        },
     }
     table.insert(row, self.leading_container)
     table.insert(row, HorizontalSpan:new{ width = title_leading_padding })
@@ -351,9 +415,17 @@ function ZenSettingsTitleBar:init()
         }
         dismiss_keyboard_on_outside_tap(self.search_input)
         self.search_input.edit_callback = function(edited)
-            if edited and self.search_callback then
+            if edited and not self._setting_query and self.search_callback then
                 self.query = self.search_input:getText()
-                self.search_callback(self.query)
+                self:_cancelPendingSearch()
+                local query = self.query
+                self._pending_search = function()
+                    self._pending_search = nil
+                    if self.search_expanded and not (self.show_parent and self.show_parent._closed) then
+                        self.search_callback(query)
+                    end
+                end
+                UIManager:scheduleIn(0.15, self._pending_search)
             end
         end
         local orig_on_key_press = self.search_input.onKeyPress
@@ -415,7 +487,7 @@ function ZenSettingsTitleBar:init()
         }
     end
 
-    self.close_button = IconButton:new{
+    self.close_button = show_close and IconButton:new{
         icon = "close",
         width = icon_size,
         height = icon_size,
@@ -438,15 +510,18 @@ function ZenSettingsTitleBar:init()
             if self.close_callback then return self.close_callback() end
             return true
         end,
-    }
+    } or nil
     local trailing_buttons = {}
     if self.action_button then table.insert(trailing_buttons, self.action_button) end
+    if self.toggle_button then table.insert(trailing_buttons, self.toggle_button) end
     if self.search_button then table.insert(trailing_buttons, self.search_button) end
-    table.insert(trailing_buttons, OverlapGroup:new{
-        dimen = Geom:new{ w = button_size, h = button_size },
-        allow_mirroring = false,
-        self.close_button,
-    })
+    if self.close_button then
+        table.insert(trailing_buttons, OverlapGroup:new{
+            dimen = Geom:new{ w = button_size, h = button_size },
+            allow_mirroring = false,
+            self.close_button,
+        })
+    end
     for index, button in ipairs(trailing_buttons) do
         if index > 1 then table.insert(row, HorizontalSpan:new{ width = trailing_gap }) end
         table.insert(row, button)
@@ -536,6 +611,13 @@ function ZenSettingsTitleBar:closeSearchKeyboard()
     return keyboard_was_visible
 end
 
+function ZenSettingsTitleBar:_cancelPendingSearch()
+    if self._pending_search then
+        UIManager:unschedule(self._pending_search)
+        self._pending_search = nil
+    end
+end
+
 function ZenSettingsTitleBar:openSearch()
     if self.search_expanded or self.search_visible == false then return true end
     self.search_expanded = true
@@ -559,6 +641,7 @@ end
 
 function ZenSettingsTitleBar:collapseSearch()
     if not self.search_expanded then return false end
+    self:_cancelPendingSearch()
     self:closeSearchKeyboard()
     self.search_expanded = false
     self.query = ""
@@ -640,9 +723,12 @@ function ZenSettingsTitleBar:setTitle(title)
 end
 
 function ZenSettingsTitleBar:setQuery(query)
+    self:_cancelPendingSearch()
     self.query = query or ""
     if self.search_input and self.search_input:getText() ~= self.query then
+        self._setting_query = true
         self.search_input:setText(self.query)
+        self._setting_query = nil
     end
 end
 
@@ -650,6 +736,7 @@ function ZenSettingsTitleBar:setAction(action)
     local old_key = self.action and (self.action.text or self.action.file or self.action.icon)
     local new_key = action and (action.text or action.file or action.icon)
     self.action = action
+    if self.search_expanded then return end
     if old_key == new_key and (self.action_button or action == nil) then
         if self.action_button then self.action_button.callback = action.callback end
         return
@@ -658,7 +745,13 @@ function ZenSettingsTitleBar:setAction(action)
     self:init()
 end
 
+function ZenSettingsTitleBar:paintTo(bb, x, y)
+    if self._zen_status_needs_refresh then self:refreshStatus() end
+    InputContainer.paintTo(self, bb, x, y)
+end
+
 function ZenSettingsTitleBar:refreshStatus()
+    self._zen_status_needs_refresh = nil
     if type(self.status_factory) ~= "function" then return false end
     local ok, status_widget = pcall(self.status_factory, self.width)
     if not (ok and status_widget) then
@@ -683,8 +776,9 @@ local function focus_controls(title_bar)
     end
     append(title_bar.back_button)
     append(title_bar.search_input)
-    append(title_bar.search_button)
     append(title_bar.action_button)
+    append(title_bar.toggle_button)
+    append(title_bar.search_button)
     append(title_bar.close_button)
     return controls
 end

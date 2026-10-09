@@ -12,6 +12,7 @@ local defaults = {
         quickstart_shown_for_version = false,
         quickstart_completed = false,
         quickstart_menu_tour_pending = false,
+        quickstart_reader_tour_pending = false,
         reader_defaults_apply_on_next_open = false,
         sort_defaults_applied = false,
         bim_fbc_migrated = false,
@@ -20,6 +21,7 @@ local defaults = {
         library_font_hyperreadable_default_migrated = false,
         lookup_plugin_items_default_migrated = false,
         tbr_collection_migrated = false,
+        kindle_launcher_added = false,
     },
     updater = {
         just_updated_version = "",
@@ -29,7 +31,11 @@ local defaults = {
         update_auto_check = true,
     },
     rakuyomi = {
+        exclude_from_home = false,
         return_to_chapter_list_on_exit = false,
+    },
+    kindle = {
+        hide_library_folder = false,
     },
     custom_icons = {
         active_pack = "",
@@ -66,8 +72,10 @@ local defaults = {
         browser_cover_rounded_corners = true,
         browser_cover_mosaic_uniform = true,
         automatic_series_grouping = true,
+        hide_grouped_series = false,
         partial_page_repaint = false,
         reader_top_status_bar = true,
+        reader_status_bar_margins = true,
         reader_themes = false,
         reader_bottom_menu = false,
         night_mode_schedule = false,
@@ -81,17 +89,29 @@ local defaults = {
         lockdown_mode        = false,
         incognito_mode       = false,
         zen_opds             = true,
+        zen_keyboard         = true,
     },
     search = {
-        substring = false,
+        substring = not FontLanguage.supportsWholeWordSearch(),
+    },
+    metadata = {
+        hardcover_enabled = true,
+        google_books_enabled = true,
+        open_library_enabled = true,
+        hardcover_auto_match = true,
+        epub_backup = false,
     },
     developer = {
+        allow_modal_drag = false,
         double_tap_to_open_books = false,
+        single_tap_to_open_context_menu = false,
     },
     navbar = {
         show_tabs = {
             books = true,
+            archive = false,
             folder = false,
+            kindle = false,
             manga = false,
             news = false,
             continue = true,
@@ -100,7 +120,7 @@ local defaults = {
             collections = false,
             authors = true,
             series = true,
-            languages = true,
+            languages = false,
             home = true,
             stats = false,
             exit = false,
@@ -128,6 +148,10 @@ local defaults = {
         colored = false,
         active_tab_color = { 0x33, 0x99, 0xFF },
         active_tab_underline = true,
+        active_tab_filled = false,
+        filled_outline_color = { 0xFF, 0xFF, 0xFF },
+        filled_background_color = { 0x4F, 0x6F, 0x8F },
+        filled_background_opacity = 60,
         underline_above = false,
         show_top_border = false,
     },
@@ -155,16 +179,28 @@ local defaults = {
             notion = false,
             streak = false,
             opds = false,
+            airplanemode = false,
+            zen_settings = false,
+            launcher = false,
             tailscale = false,
             zenfm = false,
             filebrowser = false,
         },
+        background_hatching = false,
         show_labels = true,
         show_frontlight = true,
         show_warmth = true,
+        unified_light_slider = true,
         flip_lh_rh_icon = false,
+        gyro_label = "",
+        gyro_icon = "quick_rotate",
+        zen_settings_label = "",
+        zen_settings_icon = "zen_ui",
+        launcher_label = "",
+        launcher_icon = "app_launcher",
         rotate_action = "90",
         screenshot_timer_seconds = 3,
+        tailscale_toggle_wifi = false,
     },
     status_bar = {
         custom_text = " ",
@@ -172,12 +208,13 @@ local defaults = {
         custom_separator = "  ",
         left_order   = { "time" },
         center_order = {},
-        right_order  = { "wifi", "battery" },
+        right_order  = { "bluetooth", "wifi", "battery" },
         date_format = "short",
         time_12h = true,
         show_bottom_border = false,
         colored = false,
         bold_text = false,
+        wifi_hide_when_off = false,
         hide_browser_bar = true,
     },
     browser_hide_up_folder = {
@@ -189,9 +226,12 @@ local defaults = {
     },
     folder_sort = {},
     folder_display_mode = {},
+    folder_cover_paths = {},
     library_background = {
         enabled = false,
         path = "",  -- "" = none; absolute image path otherwise
+        opacity = 100,
+        invert_with_dark_mode = true,
     },
     additional_home_dirs = {},
     browser_list_item_layout = {
@@ -218,8 +258,11 @@ local defaults = {
     browser_series_badge = {
         show_series_badge = false,
     },
+    uniform_cover_ratio = "2:3",
     opds = {
         display_mode = "mosaic", -- "mosaic" | "list" | "classic"
+        default_url = "",
+        downloaded = {},
     },
     mosaic_title_strip = {
         show_title  = false,
@@ -229,6 +272,28 @@ local defaults = {
         font_face = library_font_default,
         font_size = 18,
     },
+    book_details = {
+        text_styles = {
+            description = { font_face = "default" },
+        },
+        order = {
+            "authors", "series", "tags", "language", "rating", "annotations",
+            "note", "pages", "progress", "read_time", "time_remaining",
+        },
+        authors = true,
+        series = true,
+        tags = true,
+        navigate_to_tag = false,
+        language = true,
+        rating = true,
+        annotations = true,
+        note = true,
+        pages = true,
+        progress = true,
+        read_time = false,
+        time_remaining = false,
+        description = true,
+    },
     zen_scroll_bar = {
         style              = "page_number",  -- "bar" | "dots" | "page_number"
         page_number_format = "total",  -- "current" | "total"
@@ -236,6 +301,8 @@ local defaults = {
     },
     context_menu = {
         allow_delete = true,
+        show_archive = false,
+        show_plugin_actions = false,
     },
     reader_top_status_bar = {
         font_face = "default",
@@ -243,11 +310,16 @@ local defaults = {
         left_order       = {},
         center_order     = { "time" },
         right_order      = {},
+        page_separator   = "slash",
+        page_count_scope = "book",
         separator_key    = "small-space",
         custom_separator = "  ",
         custom_text      = "",
         show_bottom_border = false,
         bottom_border_progress = false,
+        show_chapter_marks = false,
+        colored = false,
+        wifi_hide_when_off = false,
         hide_in_cbz = true,
     },
     reader_themes = {
@@ -260,8 +332,14 @@ local defaults = {
         chapter_time_format = "number",
         hide_in_cbz = true,
     },
+    page_browser = {
+        toc_font_size = 18,
+        bookmarks_font_size = 18,
+    },
     highlight_lookup = {
         allow_unknown_items = false,
+        color_names         = {},
+        color_codes         = {},
         show_wikipedia      = false,
         show_xray           = true,
         show_koassistant    = true,
@@ -295,6 +373,12 @@ local defaults = {
     },
     group_view = {
         include_new_in_tbr = false,
+        authors_collate = "authors",
+        group_collate = {
+            series = "title",
+            languages = "title",
+            tags = "title",
+        },
         display_mode = {
             authors = "list_image_meta",
             series = "list_image_meta",
@@ -302,10 +386,17 @@ local defaults = {
             tags = "list_image_meta",
             to_be_read = "list_image_meta",
         },
+        detail_display_mode = {
+            authors = {},
+            series = {},
+            languages = {},
+            tags = {},
+        },
         group_reverse = {
             authors = false,
             series = false,
             languages = false,
+            tags = false,
         },
         tags_global = {
             collate = "title",

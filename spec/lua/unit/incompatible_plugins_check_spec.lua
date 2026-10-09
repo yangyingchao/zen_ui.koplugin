@@ -6,8 +6,13 @@ describe("incompatible plugin and patch check", function()
     local original_settings
     local original_ptutil
     local original_sui_core
+    local original_vos
     local original_quickmenu
+    local original_burrow_util
+    local original_qui_utils
     local original_readermenuredesign_installer
+    local original_custom_shortcut_manager
+    local original_neo_i18n
     local original_suntime
     local original_appearance_setting
     local UIManager
@@ -17,11 +22,24 @@ describe("incompatible plugin and patch check", function()
     local patch_dir
 
     local patch_files = {
+        "2---stretched-covers.lua",
+        "2--disable-all-CB-widgets.lua",
+        "2--disable-all-PT-widgets.lua",
+        "2--rounded-covers.lua",
+        "2--stretched-rounded-covers.lua",
+        "2-navbar-vos.lua",
+        "2-new-collections-star.lua",
+        "2-new-progress-bar-colored.lua",
+        "2-new-progress-bar.lua",
+        "2-pages-badge.lua",
+        "2-percent-badge.lua",
+        "2-rounded-folder-covers.lua",
+        "2-series-indicator.lua",
+        "20-faded-finished-books.lua",
         "2-quick-settings.lua",
         "2-automatic-book-series.lua",
         "2-ui-font.lua",
         "2-custom-navbar.lua",
-        "2-page-scrubber.lua",
         "2-browser-double-tap.lua",
         "2-browser-hide-underline.lua",
         "2-browser-up-folder.lua",
@@ -30,6 +48,7 @@ describe("incompatible plugin and patch check", function()
         "2-filemanager-titlebar.lua",
         "2-menu-size.lua",
         "2-new-status-icons.lua",
+        "2-non-blocking-wifi.lua",
         "2-screensaver-chapter.lua",
         "2-screensaver-cover.lua",
         "2-series-badge-numbered.lua",
@@ -57,14 +76,24 @@ describe("incompatible plugin and patch check", function()
         original_settings = _G.G_reader_settings
         original_ptutil = package.loaded["ptutil"]
         original_sui_core = package.loaded["sui_core"]
+        original_vos = package.loaded["modules/vos"]
         original_quickmenu = package.loaded["quickmenu"]
+        original_burrow_util = package.loaded["burrow_util"]
+        original_qui_utils = package.loaded["qui_utils"]
         original_readermenuredesign_installer = package.loaded["readermenuredesign_installer"]
+        original_custom_shortcut_manager = package.loaded["custom_shortcut_manager"]
+        original_neo_i18n = package.loaded["neo_i18n"]
         original_suntime = package.loaded["suntime"]
         original_appearance_setting = package.loaded["lib/setting"]
         package.loaded["ptutil"] = nil
         package.loaded["sui_core"] = nil
+        package.loaded["modules/vos"] = nil
         package.loaded["quickmenu"] = nil
+        package.loaded["burrow_util"] = nil
+        package.loaded["qui_utils"] = nil
         package.loaded["readermenuredesign_installer"] = nil
+        package.loaded["custom_shortcut_manager"] = nil
+        package.loaded["neo_i18n"] = nil
         package.loaded["suntime"] = nil
         package.loaded["lib/setting"] = nil
         _G.__ZEN_UI_PLUGIN = nil
@@ -131,8 +160,13 @@ describe("incompatible plugin and patch check", function()
         end
         package.loaded["ptutil"] = original_ptutil
         package.loaded["sui_core"] = original_sui_core
+        package.loaded["modules/vos"] = original_vos
         package.loaded["quickmenu"] = original_quickmenu
+        package.loaded["burrow_util"] = original_burrow_util
+        package.loaded["qui_utils"] = original_qui_utils
         package.loaded["readermenuredesign_installer"] = original_readermenuredesign_installer
+        package.loaded["custom_shortcut_manager"] = original_custom_shortcut_manager
+        package.loaded["neo_i18n"] = original_neo_i18n
         package.loaded["suntime"] = original_suntime
         package.loaded["lib/setting"] = original_appearance_setting
         _G.__ZEN_UI_PLUGIN = original_plugin
@@ -247,30 +281,56 @@ describe("incompatible plugin and patch check", function()
     it("records installed incompatible plugins before their main modules load", function()
         local plugins_dir = data_dir .. "/plugins"
         local simpleui_dir = plugins_dir .. "/simpleui.koplugin"
+        local vos_dir = plugins_dir .. "/vos.koplugin"
         local quickmenu_dir = plugins_dir .. "/quickmenu.koplugin"
+        local appearance_dir = plugins_dir .. "/appearance.koplugin"
+        local burrow_dir = plugins_dir .. "/burrow.koplugin"
+        local quickui_dir = plugins_dir .. "/quickui.koplugin"
         local reader_menu_dir = plugins_dir .. "/zzz-readermenuredesign.koplugin"
+        local shortcuts_toolbar_dir = plugins_dir .. "/shortcutstoolbar.koplugin"
+        local neo_quicksettings_dir = plugins_dir .. "/neo_quicksetting.koplugin"
         assert.is_true(lfs.mkdir(plugins_dir))
         assert.is_true(lfs.mkdir(simpleui_dir))
+        assert.is_true(lfs.mkdir(vos_dir))
         assert.is_true(lfs.mkdir(quickmenu_dir))
+        assert.is_true(lfs.mkdir(appearance_dir))
+        assert.is_true(lfs.mkdir(burrow_dir))
+        assert.is_true(lfs.mkdir(quickui_dir))
         assert.is_true(lfs.mkdir(reader_menu_dir))
+        assert.is_true(lfs.mkdir(shortcuts_toolbar_dir))
+        assert.is_true(lfs.mkdir(neo_quicksettings_dir))
         settings.extra_plugin_paths = { plugins_dir }
         ZenSpec.replace("userpatch", { execution_status = {} })
 
         assert.is_true(require("modules/filebrowser/patches/incompatible_plugins_check")())
         assert.is_true(settings.disabled.simpleui)
+        assert.is_true(settings.disabled.vos)
         assert.is_true(settings.disabled.quickmenu)
+        assert.is_true(settings.disabled.appearance)
+        assert.is_true(settings.disabled.burrow)
+        assert.is_true(settings.disabled.quickui)
         assert.is_true(settings.disabled["zzz-readermenuredesign"])
+        assert.is_true(settings.disabled.shortcutstoolbar)
+        assert.is_true(settings.disabled.neo_quicksetting)
         assert.are.equal(1, settings.flushes)
 
         UIManager.scheduled[1].callback()
         assert.are.equal(
             "Incompatible plugins and patches have been disabled:\n"
-                .. "Simple UI\nQuickMenu\nReader Menu Redesign",
+                .. "Simple UI\nVisual Overhaul Suite (VOS)\nQuickMenu\nAppearance\n"
+                .. "Burrow\nQuickUI\nReader Menu Redesign\nShortcuts Toolbar\n"
+                .. "Neo QuickSettings",
             UIManager.shown[1].text)
 
         lfs.rmdir(simpleui_dir)
+        lfs.rmdir(vos_dir)
         lfs.rmdir(quickmenu_dir)
+        lfs.rmdir(appearance_dir)
+        lfs.rmdir(burrow_dir)
+        lfs.rmdir(quickui_dir)
         lfs.rmdir(reader_menu_dir)
+        lfs.rmdir(shortcuts_toolbar_dir)
+        lfs.rmdir(neo_quicksettings_dir)
         lfs.rmdir(plugins_dir)
     end)
 
